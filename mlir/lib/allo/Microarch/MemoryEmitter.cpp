@@ -62,6 +62,19 @@ static Value laneSelect(EmitContext &c, ArrayRef<Value> banks,
 Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
                                  const uarch::MemUnit::Access::Reduced &r,
                                  unsigned width) {
+  // The counters a delayed cone reads are fresh at cycle 0 of their iteration,
+  // so under a published phase the delay folds onto it like a model chain
+  // (`emitRegisters`): `ceil(addrDelay / ii)` registers instead of one per
+  // cycle of the access's stage.
+  auto delayed = [&](Value v) {
+    StallShell sh = shellFor(acc.region);
+    Value phase = controlOf.lookup(acc.region).phase;
+    unsigned ii = dp.regions[acc.region].ii.value_or(1);
+    return phase && acc.addrDelay > 1
+               ? c.foldedChain(v, acc.addrDelay, ii, phase, /*ready=*/0, sh)
+                     .last()
+               : c.shiftChain(v, acc.addrDelay, sh).last();
+  };
   Value addr;
   auto add = [&](Value v) {
     addr =
@@ -76,7 +89,7 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
     add(addrAt(c.b, c.loc, rc.scaledCounters[t.slot], width));
   }
   if (addr && acc.addrDelay)
-    addr = c.shiftChain(addr, acc.addrDelay, shellFor(acc.region)).last();
+    addr = delayed(addr);
   if (r.residual) {
     // A register the residual reads runs live like a counter, so each is
     // delayed on its own. Appended at the datapath width, which is what
@@ -90,11 +103,12 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
       const uarch::RegionControl &rc = controlOf.lookup(t.region);
       assert(t.slot < rc.scaledCounters.size() &&
              "a residual's digit has no scaled counter in its region");
-      Value v =
-          addrAt(c.b, c.loc, rc.scaledCounters[t.slot], kDatapathAddressWidth);
+      // Delayed at the counter's own width and widened after: the chain then
+      // costs the digit's bits, not the datapath's.
+      Value v = rc.scaledCounters[t.slot];
       if (acc.addrDelay)
-        v = c.shiftChain(v, acc.addrDelay, shellFor(acc.region)).last();
-      idx.push_back(v);
+        v = delayed(v);
+      idx.push_back(addrAt(c.b, c.loc, v, kDatapathAddressWidth));
     }
     add(evalAffine(c.b, c.loc, r.residual, idx, acc.addrMap.getNumDims(),
                    width));

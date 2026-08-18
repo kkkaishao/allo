@@ -671,3 +671,40 @@ def test_a_chain_report_carries_the_proven_range():
     out = np.zeros(16, np.int32)
     rtl.cosim(x, out)
     assert np.array_equal(out, x * 3 + np.arange(16))
+
+
+# An address cone delayed to a deep access stage holds one datum per in-flight
+# iteration, so at II > 1 it folds onto the region's phase like a model chain:
+# ceil(stage / II) enabled registers, never one per cycle of the stage.
+def test_a_deep_access_address_folds_onto_the_phase():
+    @kernel
+    def deepstore(A: f32[16], B: f32[16]):
+        acc: f32 = 1.0
+        for i in range(16):
+            acc = acc * A[i]  # recurrence: II = the multiplier's latency
+            t: f32 = acc + acc
+            t = t * t
+            t = t * t
+            B[i] = t  # lands stages past the II; its address rides a chain
+
+    s = deepstore.schedule()
+    s.pipeline(ii=1).apply()
+    rtl = s.export("rtl")
+    from allo.backend.rtl.reports.microarch import RegRole
+
+    f = rtl.microarch.func("deepstore")
+    deep = [c for c in f.regs if c.role == RegRole.VALUE and c.depth > 1]
+    assert deep, "the deep store's address must ride a multi-stage chain"
+    assert all(c.enable for c in deep), "an unfolded per-cycle address chain"
+
+    x = np.linspace(1.0, 1.3, 16, dtype=np.float32)
+    out = np.zeros(16, np.float32)
+    rtl.cosim(x, out)
+    acc, ref = np.float32(1.0), np.zeros(16, np.float32)
+    for i in range(16):
+        acc = acc * x[i]
+        t = acc + acc
+        t = t * t
+        t = t * t
+        ref[i] = t
+    assert np.array_equal(out, ref)
