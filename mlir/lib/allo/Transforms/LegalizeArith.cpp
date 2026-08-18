@@ -244,10 +244,11 @@ struct ReduceRemSI : OpRewritePattern<arith::RemSIOp> {
 //
 // Who expands is a fit question. An index op matches no device IP row (a row
 // is declared at concrete widths) and is priced as a full-width combinational
-// divider, one operator no register can split, so it expands regardless. A
-// typed op has a pipelined divider IP to fall back on, so it expands only
-// where the reciprocal's product multiply fits the stated clock period, and
-// keeps the IP everywhere else.
+// divider, one operator no register can split, so it expands regardless; one
+// the reciprocal cannot take moves to the typed width instead
+// (`IndexDivToTyped`). A typed op has a pipelined divider IP to fall back on,
+// so it expands only where the reciprocal's product multiply fits the stated
+// clock period, and keeps the IP everywhere else.
 //===----------------------------------------------------------------------===//
 
 /// Largest value the expression \p v can take, read as unsigned bits: walked
@@ -588,6 +589,50 @@ struct MagicRemSI : MagicBase<arith::RemSIOp> {
   }
 };
 
+// An `index` division no other pattern takes is rebuilt at `kIndexWidth`, the
+// width the datapath gives `index` anyway. At a concrete type it binds a
+// pipelined divider core; left at `index` it has no row to match and becomes
+// a full-width combinational divider that derates the whole module's clock.
+struct IndexDivToTyped : RewritePattern {
+  IndexDivToTyped(MLIRContext *ctx, bool expand, unsigned maxMulWidth)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx),
+        expand(expand), maxMulWidth(maxMulWidth) {}
+  bool expand;
+  unsigned maxMulWidth;
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    if (!isa<arith::DivUIOp, arith::RemUIOp, arith::DivSIOp, arith::RemSIOp>(
+            op) ||
+        !op->getResult(0).getType().isIndex())
+      return failure();
+    bool isSigned = isa<arith::DivSIOp, arith::RemSIOp>(op);
+    // A power-of-two divisor is a shift and a planned constant one a
+    // reciprocal; both lower without any divider.
+    if (powerOfTwoDivisor(op->getOperand(1)) ||
+        (expand && magicPlan(op, isSigned, maxMulWidth)))
+      return failure();
+    Location loc = op->getLoc();
+    Type ty = rewriter.getIntegerType(kIndexWidth);
+    auto shrink = [&](Value v) -> Value {
+      if (isSigned)
+        return arith::IndexCastOp::create(rewriter, loc, ty, v);
+      return arith::IndexCastUIOp::create(rewriter, loc, ty, v);
+    };
+    OperationState state(loc, op->getName());
+    state.addOperands({shrink(op->getOperand(0)), shrink(op->getOperand(1))});
+    state.addTypes(ty);
+    Value r = rewriter.create(state)->getResult(0);
+    Type ity = op->getResult(0).getType();
+    rewriter.replaceOp(
+        op, isSigned
+                ? arith::IndexCastOp::create(rewriter, loc, ity, r).getResult()
+                : arith::IndexCastUIOp::create(rewriter, loc, ity, r)
+                      .getResult());
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Constant tables and constant multiplies -> wiring and shift-adds.
 //===----------------------------------------------------------------------===//
@@ -755,6 +800,7 @@ struct LegalizeArithPass
     arith::populateArithExpandOpsPatterns(patterns);
     patterns.add<LowerBitGetSlice, LowerBitSetSlice, ReduceDivUI, ReduceRemUI,
                  ReduceDivSI, ReduceRemSI>(&getContext());
+    patterns.add<IndexDivToTyped>(&getContext(), expandConstArith, maxMulWidth);
     if (expandConstArith)
       patterns.add<MagicDivUI, MagicRemUI, MagicDivSI, MagicRemSI>(
           &getContext(), maxMulWidth);
@@ -776,18 +822,20 @@ struct LegalizeArithPass
                                  arith::MinNumFOp>(keepIfRealizable);
     // A power-of-two divisor makes the op a shift, so it does not survive
     // either; a constant one the reciprocal patterns plan for goes to them
-    // when the flag asks. Every other divisor stays and is bound to a device
-    // core or priced as a divider.
+    // when the flag asks; anything still at `index` moves to the typed width.
+    // Every other divisor stays and is bound to a device core.
     bool expand = expandConstArith;
     target.addDynamicallyLegalOp<arith::DivUIOp, arith::RemUIOp>(
         [expand, maxMulWidth](Operation *op) {
-          if (powerOfTwoDivisor(op->getOperand(1)))
+          if (powerOfTwoDivisor(op->getOperand(1)) ||
+              op->getResult(0).getType().isIndex())
             return false;
           return !(expand && magicPlan(op, /*isSigned=*/false, maxMulWidth));
         });
     target.addDynamicallyLegalOp<arith::DivSIOp, arith::RemSIOp>(
         [expand, maxMulWidth](Operation *op) {
-          if (powerOfTwoDivisor(op->getOperand(1)))
+          if (powerOfTwoDivisor(op->getOperand(1)) ||
+              op->getResult(0).getType().isIndex())
             return false;
           return !(expand && magicPlan(op, /*isSigned=*/true, maxMulWidth));
         });

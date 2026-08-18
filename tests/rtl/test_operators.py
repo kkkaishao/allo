@@ -2361,6 +2361,32 @@ def test_a_masked_counter_product_narrows_past_the_index_width():
     assert np.array_equal(out, taps[(i * j) % 16])
 
 
+# A division whose divisor is data reaches the backend at `index` width, where
+# no divider core is declared. Moved to the typed width the datapath builds
+# `index` at, it binds a pipelined divider and the module keeps its clock
+# instead of derating around a combinational one.
+def test_a_variable_index_division_binds_the_typed_divider():
+    @kernel
+    def linearize(n: i32, out: i32[64]):
+        for k in range(64):
+            out[k] = k % n + k // n
+
+    rtl = _to_rtl(linearize)
+    sched = rtl.schedule()
+    assert sched.cycle_ns == pytest.approx(PERIOD_NS)
+    rtl.compile()
+    kinds = {
+        op.impl.split("_", 1)[0]
+        for iface in rtl.interfaces.values()
+        for op in iface.operators
+    }
+    assert {"divui", "remui"} <= kinds or {"divsi", "remsi"} <= kinds
+    out = np.zeros(64, np.int32)
+    rtl.cosim(np.int32(7), out)
+    k = np.arange(64)
+    assert np.array_equal(out, k % 7 + k // 7)
+
+
 # The map is ONE operator: a division cone past the clock period has no seam a
 # register could land on, so the scheduler lowers the clock to fit it whole
 # and reports the achieved period.
