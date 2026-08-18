@@ -435,13 +435,11 @@ def test_integer_multiply_binds_its_ip_not_the_comb_row():
         for i in range(8):
             out[i] = x[i] * y[i]
 
-    # The fabric offers the multiply at more than one depth and ranks the
-    # shortest first, so that is the core to look for.
-    core = min(
-        (o for o in default_device.operators if o.symbol.startswith("mul_i32_")),
-        key=lambda o: o.timing.latency,
-    ).symbol
-    assert core in _impls(_to_rtl(imulk).schedule())
+    # The fabric offers the multiply at more than one depth; fit against the
+    # clock decides which, but whichever depth wins is an IP core, never the
+    # combinational row.
+    impls = _impls(_to_rtl(imulk).schedule())
+    assert any(s.startswith("mul_i32_") for s in impls), impls
 
 
 def test_advanced_math_sqrt_cosim():

@@ -1069,11 +1069,16 @@ def DCPathLoadOp : DCPath_Op<"dcp.load",
     I64Attr:$start,
     I64Attr:$latency,
     OptionalAttr<I64Attr>:$bank,
-    OptionalAttr<I64Attr>:$port);
+    OptionalAttr<I64Attr>:$port,
+    // The `fwd_id`s of the same-array stores whose data a shadow forwards into
+    // this read on a same-cycle, same-element collision. Stamped by the reify
+    // from the schedule's decision; the emitter builds one compare and mux arm
+    // per entry.
+    OptionalAttr<DenseI64ArrayAttr>:$fwd);
   let results = (outs AnyType:$result);
   let assemblyFormat = [{
     $memref `[` $indices `]` `map` $map `at` $start `lat` $latency
-    (`bank` $bank^)? (`port` $port^)? attr-dict
+    (`bank` $bank^)? (`port` $port^)? (`fwd` $fwd^)? attr-dict
     `:` type($memref) `->` type($result)
   }];
 }
@@ -1089,10 +1094,14 @@ def DCPathStoreOp : DCPath_Op<"dcp.store",
     I64Attr:$start,
     I64Attr:$latency,
     OptionalAttr<I64Attr>:$bank,
-    OptionalAttr<I64Attr>:$port);
+    OptionalAttr<I64Attr>:$port,
+    // This store's identity among its function's forwarded stores, referenced
+    // by the `fwd` list of each read its shadow serves. Absent on a store
+    // nothing forwards from.
+    OptionalAttr<I64Attr>:$fwdId);
   let assemblyFormat = [{
     $value `,` $memref `[` $indices `]` `map` $map `at` $start `lat` $latency
-    (`bank` $bank^)? (`port` $port^)? attr-dict
+    (`bank` $bank^)? (`port` $port^)? (`fwd_id` $fwdId^)? attr-dict
     `:` type($value) `,` type($memref)
   }];
 }

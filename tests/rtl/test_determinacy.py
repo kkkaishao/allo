@@ -222,8 +222,10 @@ def test_the_latency_oracle_fails_only_the_unsound_direction():
 
 
 # A guard publishes the deeper arm's span as a bound, so the kernel keeps a
-# waitable figure. The bound is tight: a run taking the deeper arm at every
-# guard lands exactly on it and any other run stays under it.
+# waitable figure. The bound arithmetic keeps every done-latch cycle, while
+# the hardware advances the enclosing loop on the guard's completion pulse
+# (one cycle each turnover), so a deeper-arm run lands one cycle per
+# iteration under the bound and a skipped run further still.
 @needs_verilator
 def test_a_guard_publishes_the_deeper_arms_span_as_a_bound():
     N, M = 8, 4
@@ -249,11 +251,43 @@ def test_a_guard_publishes_the_deeper_arms_span_as_a_bound():
     A = np.arange(N * M, dtype=np.int32).reshape(N, M)
     out = np.zeros(M, np.int32)
     taken = rtl.cosim(A, np.ones(M, np.int32), out)
-    assert taken.cycles == fn.latency  # every guard takes the deeper arm
+    # Every guard takes the deeper arm; the recovered latch per turnover is
+    # the only slack under the bound.
+    assert taken.cycles == fn.latency - M
     assert np.array_equal(out, A.sum(0))
     out = np.zeros(M, np.int32)
     skipped = rtl.cosim(A, np.zeros(M, np.int32), out)
-    assert skipped.cycles < fn.latency  # empty arms complete early
+    assert skipped.cycles < taken.cycles  # empty arms complete early
+
+
+# The two guard hand-offs compose within one iteration: a result-less guard
+# hands its successor its completion pulse, and the enclosing container
+# advances on its last child's pulse, latching the carried scalar from the
+# live result wire. Each iteration recovers two of the bound's latch cycles.
+@needs_verilator
+def test_a_result_less_guards_pulse_chains_through_the_iteration():
+    N, M = 5, 6
+
+    @kernel
+    def gseq(A: i32[N, M], out: i32[M]):
+        t: i32 = 1  # runtime-carried, so the guard cannot fold; always true
+        for j in range(M):
+            if t > 0:
+                acc: i32 = 0
+                for k in range(N):
+                    acc += A[k, j]
+                out[j] = acc
+            t = t + 1
+
+    rtl = _to_rtl(gseq)
+    fn = rtl.schedule().func(rtl.top)
+    assert fn.latency is not None and fn.latency_is_bound
+
+    A = np.arange(N * M, dtype=np.int32).reshape(N, M)
+    out = np.zeros(M, np.int32)
+    r = rtl.cosim(A, out)
+    assert r.cycles == fn.latency - 2 * M
+    assert np.array_equal(out, A.sum(0))
 
 
 # A bounded callee composes onward as a bound: the instance carries its

@@ -388,7 +388,7 @@ def build(part: Part) -> Device:
 
     for core, rows in IP.items():
         for row in (rows,) if isinstance(rows, IPRow) else rows:
-            operator = core.retimed(row.latency)
+            operator = core.retimed(row.latency, row.in_delay_ns)
             if row.mnemonic is not None:
                 operator.mnemonic = row.mnemonic
             d.add_operator(operator)

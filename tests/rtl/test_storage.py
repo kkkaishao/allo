@@ -1944,14 +1944,15 @@ def test_storage_impl_shifts_recurrence_ii():
     # The scheduler times a memory access by the array's real storage impl:
     # `bind_storage` (URAM) and complete partitioning (-> registers) both shift
     # the II of a memory-carried recurrence.
-    # The recurrence II is read + FADD + write. Default LUTRAM (1/1) gives
-    # FADD + 2; binding the accumulator to URAM (read 2, write 1) adds a cycle.
+    # The write's commit is shadowed by store->load forwarding, so the
+    # recurrence II is read + FADD. Default LUTRAM (read 1) gives FADD + 1;
+    # binding the accumulator to URAM (read 2) adds a cycle.
     lutram_ii = _matvec_recurrence_ii()
-    assert lutram_ii == FADD + 2
-    assert _matvec_recurrence_ii(bind=Schedule.URAM) == FADD + 3
-    # A complete partition scatters `y` into FFs: the read is combinational (0),
-    # but the FF write still costs a cycle, so the recurrence is FADD + 1 -- one
-    # below LUTRAM, not a full collapse to the bare add latency.
+    assert lutram_ii == FADD + 1
+    assert _matvec_recurrence_ii(bind=Schedule.URAM) == FADD + 2
+    # A complete partition scatters `y` into FFs, which no shadow serves: the
+    # read is combinational (0) and the FF write costs its cycle, so the
+    # recurrence is FADD + 1, level with the forwarded LUTRAM.
     assert _matvec_recurrence_ii(complete=True) == FADD + 1
 
 
@@ -3083,7 +3084,9 @@ def test_a_data_dependent_subscript_keeps_its_storage():
 def test_the_auto_partition_threshold_is_a_boundary(depth):
     # A register file with a runtime subscript costs a mux per read and a demux
     # per write, so the element-count threshold is what bounds the area the
-    # automatic partition can spend. It has to be a real boundary.
+    # automatic partition can spend. It has to be a real boundary. Three reads
+    # in one body is what qualifies the array at all: past any ported row's
+    # bandwidth, only the register file serves the block.
     if depth == 16:
 
         @kernel
@@ -3092,7 +3095,7 @@ def test_the_auto_partition_threshold_is_a_boundary(depth):
             for i in range(16):
                 buf[i] = A[i] * 2
             for i in range(16):
-                out[i] = buf[A[i] & 15]
+                out[i] = buf[A[i] & 15] + buf[(A[i] + 1) & 15] + buf[(A[i] + 2) & 15]
 
     else:
 
@@ -3102,7 +3105,7 @@ def test_the_auto_partition_threshold_is_a_boundary(depth):
             for i in range(16):
                 buf[i] = A[i] * 2
             for i in range(16):
-                out[i] = buf[A[i] & 15]
+                out[i] = buf[A[i] & 15] + buf[(A[i] + 1) & 15] + buf[(A[i] + 2) & 15]
 
     mod = _to_rtl(sized)
     registered = mod.microarch.mem("buf_").storage == "register"
@@ -3110,7 +3113,60 @@ def test_the_auto_partition_threshold_is_a_boundary(depth):
 
     out = np.zeros(16, np.int32)
     mod.cosim(A16, out)
+    doubled = A16 * 2
+    expect = (
+        doubled[A16 & 15] + doubled[(A16 + 1) & 15] + doubled[(A16 + 2) & 15]
+    )
+    assert np.array_equal(out, expect)
+
+
+def test_a_rolling_small_array_keeps_ported_storage():
+    # One or two touches per iteration is what a dual-ported row serves with
+    # no mux in sight, so a register file would spend its read mux and write
+    # decode on nothing: the array stays on the priced storage tables.
+    @kernel
+    def roll(A: i32[16], out: i32[16]):
+        buf: i32[16]
+        for i in range(16):
+            buf[i] = A[i] * 2
+        for i in range(16):
+            out[i] = buf[A[i] & 15]
+
+    mod = _to_rtl(roll)
+    assert mod.microarch.mem("buf_").storage != "register"
+
+    out = np.zeros(16, np.int32)
+    mod.cosim(A16, out)
     assert np.array_equal(out, (A16 * 2)[A16 & 15])
+
+
+def test_invariant_reads_preload_ahead_of_a_pipelined_loop():
+    # An unrolled body re-reading the same words of a ported array every
+    # iteration would pay its port count in II. Reads whose address does not
+    # change across iterations move in front of the loop instead, so the body
+    # meets held registers and the array's ports serve only the preload.
+    N, TAPS = 32, 8
+
+    @kernel
+    def fir(x: i32[N], taps: i32[TAPS], out: i32[N]):
+        for j in range(N):
+            xv: i32 = x[j]
+            acc: i32 = 0
+            for k in range(TAPS):
+                acc += xv * taps[k]
+            out[j] = acc
+
+    s = fir.schedule()
+    s.pipeline(s.loop("j"), ii=1)
+    mod = s.export("rtl")
+    assert _iis(mod.schedule().func("fir").regions) == [1]
+
+    rng = np.random.default_rng(0)
+    x = rng.integers(-16, 16, N, dtype=np.int32)
+    taps = rng.integers(-8, 8, TAPS, dtype=np.int32)
+    out = np.zeros(N, np.int32)
+    mod.cosim(x, taps, out)
+    assert np.array_equal(out, x * taps.sum())
 
 
 def test_an_array_handed_to_a_sub_kernel_is_not_partitioned():
@@ -3226,12 +3282,13 @@ def test_a_scattered_argument_read_folds_at_a_constant_index():
 
 def _four_read_ii(complete):
     """II of a body reading one argument four times, with and without the
-    Complete partition."""
+    Complete partition. The addresses roll with the iteration so no read is
+    loop-invariant and none can preload ahead of the loop."""
 
     @kernel
     def dot4(A: i32[8], out: i32[8]):
         for i in range(8):
-            out[i] = A[0] + A[1] + A[2] + A[3]
+            out[i] = A[i % 4] + A[(i + 1) % 4] + A[(i + 2) % 4] + A[(i + 3) % 4]
 
     s = dot4.schedule()
     if complete:

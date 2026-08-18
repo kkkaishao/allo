@@ -14,6 +14,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 
 namespace mlir::allo {
 #define GEN_PASS_DEF_SCALARIZEMEMORYPASS
@@ -66,6 +67,37 @@ struct ScalarizeMemoryPass
                         memref::LoadOp, memref::StoreOp>(user);
           }))
         continue;
+      // A register file pays a read mux and a write demux per variable
+      // subscript, so it must buy something a ported memory cannot: either
+      // every subscript is a constant (the accesses are wires), or one block
+      // issues more accesses than the widest ported row serves in a cycle,
+      // which is what an unrolled or pipelined body does. A rolling loop
+      // touching the array once or twice per iteration is served by the
+      // priced storage tables instead.
+      auto constantSubscripts = [](Operation *user) {
+        AffineMap map;
+        if (auto load = dyn_cast<affine::AffineLoadOp>(user))
+          map = load.getAffineMap();
+        else if (auto store = dyn_cast<affine::AffineStoreOp>(user))
+          map = store.getAffineMap();
+        else {
+          auto indices = isa<memref::LoadOp>(user)
+                             ? cast<memref::LoadOp>(user).getIndices()
+                             : cast<memref::StoreOp>(user).getIndices();
+          return llvm::all_of(indices, [](Value index) {
+            return matchPattern(index, m_Constant());
+          });
+        }
+        return llvm::all_of(map.getResults(), llvm::IsaPred<AffineConstantExpr>);
+      };
+      if (!llvm::all_of(op->getUsers(), constantSubscripts)) {
+        DenseMap<Block *, unsigned> perBlock;
+        unsigned most = 0;
+        for (Operation *user : op->getUsers())
+          most = std::max(most, ++perBlock[user->getBlock()]);
+        if (most <= 2) // a dual-ported row covers this without a mux in sight
+          continue;
+      }
 
       op->setAttr(kPartitionAttr, complete);
     }

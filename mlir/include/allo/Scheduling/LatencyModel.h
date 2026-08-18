@@ -33,11 +33,18 @@ struct BoundaryCost {
 };
 
 /// A `done` level is a latch, so a region's completion is visible one cycle
-/// after the pulse that sets it. Every family pays it.
+/// after the pulse that sets it. Every family pays it toward its own `done`.
+/// A successor of a CONDITIONAL region starts on the completion pulse itself
+/// (`HWEmitter::handoffSafe`), a cycle ahead of the level; no static span
+/// composes across a conditional region, so the arithmetic below never
+/// describes that boundary.
 inline constexpr unsigned kDoneLatchCycles = 1;
 
 /// A container's children read its counter as their own bound and sample it at
 /// their own start, so every launch is registered, the first one included.
+/// A container whose first child is conditional relaunches on the last
+/// child's completion pulse instead (`HWEmitter::chainsTurnover`); its body
+/// span never composes, so this constant does not describe it.
 inline constexpr BoundaryCost kContainerBoundary{/*arm=*/1, /*reArm=*/1};
 
 /// A call region's first pass launches on `start` itself through a start-cycle
@@ -46,7 +53,9 @@ inline constexpr BoundaryCost kCallNodeBoundary{/*arm=*/0, /*reArm=*/1};
 
 /// A sequential-wrapper while re-evaluates its condition on a CHECK pulse one
 /// cycle after `start` and after each body drain; the condition cone's own
-/// `tCond` is added on top by the controller.
+/// `tCond` is added on top by the controller. A chained one drains on the
+/// body's completion pulse, so the CHECK follows the last commit by one cycle;
+/// a while composes no span, so neither variant is ever priced.
 inline constexpr BoundaryCost kCheckedBoundary{/*arm=*/1, /*reArm=*/1};
 
 /// A guard checks its predicate one cycle after `start`. That also keeps a
@@ -54,20 +63,23 @@ inline constexpr BoundaryCost kCheckedBoundary{/*arm=*/1, /*reArm=*/1};
 /// would otherwise leave no rising edge.
 inline constexpr BoundaryCost kGuardBoundary{/*arm=*/1, /*reArm=*/1};
 
-/// A NESTED acyclic region arms one cycle after `start`: its container advances
-/// the outer counter on the child's start pulse, so the new index only settles
-/// the cycle after.
-inline constexpr BoundaryCost kAcyclicNestedBoundary{/*arm=*/1, /*reArm=*/1};
+/// A NESTED acyclic region arms on `start` directly: its container's counter
+/// and iter-args commit at least a cycle before the launch pulse, so the pass
+/// reads settled values in the launch cycle itself.
+inline constexpr BoundaryCost kAcyclicNestedBoundary{/*arm=*/0, /*reArm=*/0};
 
 /// A TOP-LEVEL acyclic region has no outer counter to wait for, so it arms on
 /// `start` directly.
 inline constexpr BoundaryCost kAcyclicTopBoundary{/*arm=*/0, /*reArm=*/0};
 
-/// A PIPELINED leaf's `running` is a register set by `start`, so its first
-/// iteration issues one cycle in. Iterations then overlap at the SOLVED `ii`,
-/// which `leafSpan` takes as a parameter, so `reArm` does not describe this
-/// family.
-inline constexpr BoundaryCost kPipelinedBoundary{/*arm=*/1, /*reArm=*/1};
+/// A PIPELINED leaf issues its first iteration on `start` itself: the counter,
+/// phase and scaled counters read their reload values through a start-cycle
+/// bypass. Iterations then overlap at the SOLVED `ii`, which `leafSpan` takes
+/// as a parameter, so `reArm` does not describe this family. Only the rigid
+/// counted family is built this way; a while first latches the iter-args its
+/// condition reads and an elastic region keeps a launch it can hold, but
+/// neither composes a static span, so this constant never describes them.
+inline constexpr BoundaryCost kPipelinedBoundary{/*arm=*/0, /*reArm=*/0};
 
 /// An EMPTY region, a runtime zero trip or a static `lb >= ub`, never launches
 /// a pass at all: `gateStart` masks the start launch and a register on

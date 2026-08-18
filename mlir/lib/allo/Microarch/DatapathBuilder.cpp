@@ -451,6 +451,39 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   rb.memAccesses.push_back({mid, aidx});
   if (!isWrite)
     producerOf[op->getResult(0)] = Source{Source::Kind::Mem, mid, aidx};
+  // Forwarding facts, resolved into `MemUnit::forwards` by `recordForwards`
+  // once every access of the array is bound.
+  if (auto s = dyn_cast<dcp::DCPathStoreOp>(op)) {
+    if (std::optional<int64_t> id = s.getFwdId())
+      fwdStoreOf[*id] = {mid, aidx};
+  } else if (auto l = dyn_cast<dcp::DCPathLoadOp>(op)) {
+    if (std::optional<ArrayRef<int64_t>> ids = l.getFwd())
+      fwdLoads.push_back(
+          {mid, aidx, llvm::SmallVector<int64_t, 1>(ids->begin(), ids->end())});
+  }
+}
+
+void DatapathBuilder::recordForwards() {
+  for (auto &[mid, load, ids] : fwdLoads) {
+    MemUnit &m = dp.mems[mid];
+    // The scheduler's own eligibility gate: an addressed, unskewed array whose
+    // write commits in one cycle into a registered read, both accesses in one
+    // region (one timeline, one stall shell).
+    assert(!m.scattered && !m.isRom && !m.skewed &&
+           "forwarding was decided for an array whose realization has no RAM "
+           "port to shadow");
+    assert(m.readLatency >= 1 && m.writeLatency == 1 &&
+           "forwarding shadows exactly the one-cycle write window of a "
+           "registered read");
+    for (int64_t id : ids) {
+      auto it = fwdStoreOf.find(id);
+      assert(it != fwdStoreOf.end() && it->second.first == mid &&
+             "a load's fwd list names a store of its own array");
+      assert(m.accesses[it->second.second].region == m.accesses[load].region &&
+             "a forwarded pair shares one region");
+      m.forwards.push_back({load, it->second.second});
+    }
+  }
 }
 
 void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
@@ -1779,6 +1812,7 @@ void DatapathBuilder::build() {
     forEachBodyOp(regionOp, [&](Operation *op) { bindResource(op, rb); });
     dp.regions.push_back(std::move(rb));
   }
+  recordForwards();
 
   // The allocation, settled here and not later: every pass below resolves
   // Values to Sources against the unit table (see `allocateUnits`).

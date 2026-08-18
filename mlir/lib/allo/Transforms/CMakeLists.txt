@@ -19,6 +19,7 @@ add_mlir_library(MLIRAlloTransforms
     ElideDeadInit.cpp
     RaiseToAffine.cpp
     ScalarizeMemory.cpp
+    HoistInvariantReads.cpp
     ReassociateReductions.cpp
     RotateReductions.cpp
     NarrowDemandedBits.cpp

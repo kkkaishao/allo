@@ -44,6 +44,12 @@ cmake.source-dir = "."
 build-dir = "build"
 wheel.packages = ["allo"]
 
+[tool.pytest.ini_options]
+addopts = "-n 24"
+# A cosim that beats its own exact latency contract is a finding, not a note:
+# a user's run keeps the warning, a test run fails on it.
+filterwarnings = ["error::allo.backend.rtl.core.LatencyModelWarning"]
+
 [tool.scikit-build.cmake.define]
 CMAKE_C_COMPILER = "clang"
 CMAKE_CXX_COMPILER = "clang++"

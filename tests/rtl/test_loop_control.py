@@ -755,9 +755,10 @@ def test_a_reversed_subscript_keeps_a_real_recurrence():
             A[j] = A[j + 1] * 2.0
 
     # `A[j + 1]` is what the PREVIOUS iteration wrote, so the raise must land on
-    # a proven distance-1 recurrence rather than on no edge at all.
+    # a proven distance-1 recurrence rather than on no edge at all. The write's
+    # commit is shadowed by store->load forwarding, so the II is read + mul.
     mod = _to_rtl(sweep)
-    assert _iis(mod.schedule().cyclic()) == [MEM + FMUL + MEM]
+    assert _iis(mod.schedule().cyclic()) == [MEM + FMUL]
 
     A = _f32(N)
     exp = A.copy()
@@ -1377,7 +1378,8 @@ def test_pipeline_disabled_runs_sequentially():
     npl = mod.schedule().cyclic()[0]
 
     assert npl.interval == npl.iteration_latency  # no overlap: II = body length
-    assert npl.latency == 8 * npl.iteration_latency  # trip * depth
+    # trip * depth, less the cycle the start-issued first iteration saves
+    assert npl.latency == 8 * npl.iteration_latency - 1
 
 
 def test_pipeline_directive_preserves_result_cosim():

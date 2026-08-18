@@ -58,6 +58,13 @@ struct DatapathBuilder {
   llvm::DenseMap<Value, Source> ioOf;
   llvm::DenseMap<Operation *, unsigned> regionIdxOf;
 
+  // Forwarding facts off the dcp attributes, resolved by `recordForwards` once
+  // every access is bound: `fwd_id` -> (mem, access), and each forwarded
+  // load's (mem, access, ids).
+  llvm::DenseMap<int64_t, std::pair<MemId, unsigned>> fwdStoreOf;
+  llvm::SmallVector<std::tuple<MemId, unsigned, llvm::SmallVector<int64_t, 1>>>
+      fwdLoads;
+
   // Interconnect-derivation scratch (transient; see resolveEdges).
   // A delay chain is keyed by (held value, consuming region): one value read in
   // several nested regions needs its own chain in each.
@@ -131,6 +138,9 @@ struct DatapathBuilder {
   /// two contracts this binding assumes: no store to a memory classified
   /// read-only, and the scheduled access latency equalling the device model's.
   void bindMemory(Operation *op, Value memref, RegionBlock &rb);
+  /// Resolve the `fwd` / `fwd_id` attributes into `MemUnit::forwards`. Runs
+  /// after the region walk, once every access index exists.
+  void recordForwards();
   /// A `dcp.compute` -> a FuncUnit, combinational or IP-realized, holding the
   /// op at its reservation slot (its issue cycle, modulo II when cyclic).
   void bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb);

@@ -9,6 +9,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -244,6 +245,19 @@ public:
     return it == regions.end() ? nullptr : &it->second;
   }
 
+  /// Record that the solved schedule satisfies the RAW dependence from
+  /// \p store to \p load only through a store->load forwarding network: the
+  /// two can issue in one cycle, and the reify stamps the pair onto the dcp
+  /// accesses so the emitter builds the shadow.
+  void addForward(Operation *load, Operation *store) {
+    forwards[load].push_back(store);
+  }
+  /// Every recorded (load -> stores) forwarding, for the reify to stamp.
+  const llvm::DenseMap<Operation *, llvm::SmallVector<Operation *, 1>> &
+  allForwards() const {
+    return forwards;
+  }
+
   /// Record that an `allo.assume.ssa` range bounds \p loop's iteration count at
   /// \p trip, for a loop whose exact count is not compile-time.
   void setTripBound(Operation *loop, int64_t trip) { tripBounds[loop] = trip; }
@@ -262,6 +276,7 @@ public:
     ops.erase(op);
     regions.erase(op);
     tripBounds.erase(op);
+    forwards.erase(op);
   }
 
   /// Read \p module's reified `allo.dcp.*` ops into `report`, and the prep
@@ -299,6 +314,7 @@ private:
   std::vector<AllocatedUnit> units;
   llvm::DenseMap<Operation *, RegionSolution> regions;
   llvm::DenseMap<Operation *, int64_t> tripBounds;
+  llvm::DenseMap<Operation *, llvm::SmallVector<Operation *, 1>> forwards;
 };
 
 } // namespace mlir::allo

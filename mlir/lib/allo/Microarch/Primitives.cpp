@@ -268,8 +268,8 @@ static Value divConst(OpBuilder &b, Location loc, Value v, int64_t d) {
   uint64_t magic = magicMultiplier(d, w, shift);
   Value wide = addrAt(b, loc, v, 2 * w + 1);
   Value prod = mulConst(b, loc, wide, static_cast<int64_t>(magic));
-  Value q = comb::ShrUOp::create(b, loc, prod, konstLike(b, loc, prod, shift),
-                                 false);
+  Value q =
+      comb::ShrUOp::create(b, loc, prod, konstLike(b, loc, prod, shift), false);
   return addrAt(b, loc, q, w);
 }
 
@@ -623,7 +623,7 @@ Value EmitContext::stallHold(Value in, const StallShell &sh) {
 }
 
 Value EmitContext::latchReg(Value init, Value next, Value load, Value advance,
-                            RegRole role) {
+                            RegRole role, Value *dWire) {
   assert(holdsReset(role) && "a latch is control state and keeps its reset");
   if (!inChainRun)
     ledger.add(role, datapathWidth(init.getType()), 1, /*reset=*/true,
@@ -633,7 +633,10 @@ Value EmitContext::latchReg(Value init, Value next, Value load, Value advance,
   llvm::SaveAndRestore charged(inChainRun, true);
   Backedge selfNext = bb.get(init.getType());
   Value self = reg(selfNext, konst(init.getType(), 0), role);
-  selfNext.setValue(mux(load, init, mux(advance, next, self)));
+  Value d = mux(load, init, mux(advance, next, self));
+  selfNext.setValue(d);
+  if (dWire)
+    *dWire = d;
   return self;
 }
 

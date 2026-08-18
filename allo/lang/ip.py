@@ -222,11 +222,16 @@ class OperatorIP(IP[P, R]):
         tags = [_dtype_tag(t) for t in (*self.parse_argument_annotations(), rets[0])]
         return f"{self.mnemonic}_{'_'.join(tags)}_l{self.timing.latency}"
 
-    def retimed(self, latency: int) -> "OperatorIP[P, R]":
+    def retimed(
+        self, latency: int, in_delay_ns: float | None = None
+    ) -> "OperatorIP[P, R]":
         """A copy of this core pipelined to ``latency``. The symbol follows the
-        new latency, so the same core at two depths gets two names."""
+        new latency, so the same core at two depths gets two names.
+        ``in_delay_ns`` overrides the archetype's input cone for this depth."""
         core = copy.copy(self)
         core.timing = replace(self.timing, latency=latency)
+        if in_delay_ns is not None:
+            core.timing = replace(core.timing, in_delay_ns=in_delay_ns)
         verify_timing(core.timing)
         return core
 

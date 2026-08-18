@@ -5,9 +5,11 @@
 
 #include "allo-c/Schedule.h" // kPipelineIIAttr
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/AddressModel.h" // addressDelayOf
 #include "allo/Scheduling/DependenceAnalysis.h"
 #include "allo/Scheduling/LatencyModel.h"
-#include "allo/Scheduling/MemoryModel.h" // kIndexWidth
+#include "allo/Scheduling/MemoryAccess.h" // asMemAccess
+#include "allo/Scheduling/MemoryModel.h"  // kIndexWidth
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Scheduling/ProblemBuilder.h"
 #include "allo/Scheduling/RegionGraph.h"
@@ -366,6 +368,276 @@ static int64_t pipelineDirective(Operation *loop, Operation *anchor) {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Store->load forwarding: relaxing the RAW round trip through storage.
+//
+// A store commits `writeLatency` cycles after it issues, so a RAW edge holds a
+// dependent load that far behind it and a memory recurrence pins the II at the
+// full storage round trip. A shadow register pair (the store's address compared
+// against the load's at issue, the select and the store's datum registered to
+// the read latency, a 2:1 mux at the load's data out) serves the one case the
+// RAM cannot: the two issuing in the same cycle. With it, the RAW edge needs
+// only issue order, i.e. latency zero; the WAR/WAW edges stay, and they are
+// exactly what excludes every collision the shadow must not serve.
+//===----------------------------------------------------------------------===//
+
+// The compare of the forward select: the two element addresses, at the
+// address width the array carries. Marginal over the register floor, like
+// every comb row.
+static double forwardCmpDelay(const OperatorLibrary &lib, Value root) {
+  auto shape = cast<MemRefType>(root.getType()).getShape();
+  int64_t words = 1;
+  for (int64_t s : shape)
+    words *= std::max<int64_t>(1, s);
+  int64_t width = std::max<int64_t>(1, llvm::Log2_64_Ceil(words));
+  if (std::optional<double> d = lib.measuredCombDelay(OpKind::Cmp, width))
+    return *d;
+  return lib.measuredCombDelay(OpKind::Cmp, 32).value_or(0.0);
+}
+
+// The auxiliary store->load edges of \p problem a forwarding network could
+// serve: both endpoints access one addressed, unskewed array whose write
+// commits in one cycle and whose read is registered (the shadow select and
+// datum ride that register), and both sit in one block, so they share a region
+// and its stall shell. The select's compare (each address cone plus one
+// equality, into the select register) must fit the period; the data mux is
+// priced in `relaxForwardableEdges`, where the arm count is known.
+static SmallVector<circt::scheduling::Problem::Dependence>
+forwardableEdges(ChainingModuloProblem &problem, const DeviceModel &dev,
+                 float cycleTime, float regFloor) {
+  using Dependence = circt::scheduling::Problem::Dependence;
+  SmallVector<Dependence> out;
+  for (Operation *op : problem.getOperations()) {
+    std::optional<MemAccess> load = asMemAccess(op);
+    if (!load || load->isWrite || load->kind != AccessKind::Array)
+      continue;
+    MemoryChar ch = characterize(load->root, dev.memory);
+    if (ch.unlimited() || ch.layout.skew())
+      continue;
+    MemKindTiming timing = dev.memory.timing(ch.storage);
+    if (timing.latency.read < 1 || timing.latency.write != 1)
+      continue;
+    double cmp = forwardCmpDelay(dev.operators, load->root);
+    if (regFloor + addressDelayOf(op, dev.operators) + cmp > cycleTime)
+      continue;
+    for (auto &dep : problem.getDependences(op)) {
+      if (!dep.isAuxiliary())
+        continue;
+      Operation *src = dep.getSource();
+      std::optional<MemAccess> store = asMemAccess(src);
+      if (!store || !store->isWrite || store->root != load->root ||
+          src->getBlock() != op->getBlock())
+        continue;
+      if (regFloor + addressDelayOf(src, dev.operators) + cmp > cycleTime)
+        continue;
+      out.push_back(dep);
+    }
+  }
+  return out;
+}
+
+// The smallest II no dependence circuit of \p problem excludes, with the edges
+// in \p relaxed weighed at zero latency: binary search over Bellman-Ford
+// positive-circuit detection on the same weights `bindingRecurrence` uses.
+// Chain breaks are not built yet, so this is a floor, which is all the gate
+// below compares.
+static unsigned recurrenceMinII(
+    ChainingModuloProblem &problem,
+    const llvm::DenseSet<circt::scheduling::Problem::Dependence> &relaxed) {
+  struct Edge {
+    unsigned src, dst;
+    int64_t lat, dist;
+  };
+  DenseMap<Operation *, unsigned> index;
+  for (Operation *op : problem.getOperations())
+    index.try_emplace(op, index.size());
+  SmallVector<Edge> edges;
+  int64_t latSum = 1;
+  for (Operation *op : problem.getOperations())
+    for (auto &dep : problem.getDependences(op)) {
+      int64_t lat =
+          relaxed.contains(dep) ? 0 : problem.latencyOf(dep.getSource());
+      edges.push_back(
+          {index[dep.getSource()], index[op], lat,
+           static_cast<int64_t>(problem.getDistance(dep).value_or(0))});
+      latSum += lat;
+    }
+  auto feasible = [&](int64_t ii) {
+    SmallVector<int64_t> dist(index.size(), 0);
+    for (unsigned round = 0; round < index.size(); ++round) {
+      bool moved = false;
+      for (Edge &e : edges) {
+        int64_t w = dist[e.src] + e.lat - ii * e.dist;
+        if (w > dist[e.dst]) {
+          dist[e.dst] = w;
+          moved = true;
+        }
+      }
+      if (!moved)
+        return true;
+    }
+    return false; // a positive circuit survives at this ii
+  };
+  // A zero-distance positive circuit is infeasible at every II; the solve will
+  // fail and report it, so any answer here is moot.
+  if (!feasible(latSum))
+    return static_cast<unsigned>(latSum);
+  int64_t lo = 1, hi = latSum;
+  while (lo < hi) {
+    int64_t mid = (lo + hi) / 2;
+    if (feasible(mid))
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return static_cast<unsigned>(lo);
+}
+
+// The resource-min II of \p problem: `ModuloSimplexScheduler::computeResMinII`'s
+// arithmetic, asked before any scheduler exists.
+static unsigned resourceMinII(ChainingModuloProblem &problem) {
+  using P = circt::scheduling::Problem;
+  unsigned resMinII = 1;
+  DenseMap<P::ResourceType, unsigned> uses;
+  for (Operation *op : problem.getOperations()) {
+    auto rsrcs = problem.getLinkedResourceTypes(op);
+    if (!rsrcs)
+      continue;
+    for (P::ResourceType rsrc : *rsrcs)
+      if (problem.getLimit(rsrc).value_or(0) > 0)
+        uses[rsrc] +=
+            problem.getResourceCycles(op) * problem.getResourceDemand(op);
+  }
+  for (auto &[rsrc, demand] : uses) {
+    unsigned limit = *problem.getLimit(rsrc);
+    resMinII = std::max(resMinII, (demand + limit - 1) / limit);
+  }
+  return resMinII;
+}
+
+// One relaxation: the edges it forwarded, and each re-linked load's original
+// operator type, so a failed solve can put everything back and run unrelaxed.
+struct ForwardRelaxation {
+  SmallVector<circt::scheduling::Problem::Dependence> edges;
+  SmallVector<std::pair<Operation *, circt::scheduling::Problem::OperatorType>>
+      originalTypes;
+};
+
+// The most pairs one problem may forward. Every pair costs a compare, a
+// select chain and a datum chain, so a heavily unrolled body whose may-alias
+// pairs number in the hundreds is a partitioning problem, not a forwarding
+// one; relaxing it also floods the modulo placement with same-cycle freedom
+// the greedy search chokes on.
+constexpr size_t kMaxForwardPairs = 16;
+
+// Relax the forwardable RAW edges of \p problem when, and only when, a storage
+// recurrence is what binds the II and relaxing moves that bound: anything less
+// keeps today's schedule byte-for-byte and builds no shadow. Each forwarded
+// load is re-linked onto a `.fwd` twin of its operator type whose outgoing
+// delay carries the data mux (the RAM datum plus one arm per paired store);
+// the compare ends in the select register and touches no port path, so
+// nothing else is re-priced. Returns the relaxed edges, empty when nothing
+// was.
+static ForwardRelaxation
+relaxForwardableEdges(ChainingModuloProblem &problem, const DeviceModel &dev,
+                      float cycleTime, float regFloor, unsigned minII) {
+  using Dependence = circt::scheduling::Problem::Dependence;
+  SmallVector<Dependence> cands =
+      forwardableEdges(problem, dev, cycleTime, regFloor);
+  if (cands.empty() || cands.size() > kMaxForwardPairs)
+    return {};
+  // The data-mux price per load, over its real arm count; a load whose bumped
+  // output no longer fits the period drops its pairs (an operator must fit a
+  // cycle of its own).
+  llvm::MapVector<Operation *, unsigned> armsOf;
+  for (Dependence dep : cands)
+    ++armsOf[dep.getDestination()];
+  llvm::DenseMap<Operation *, double> muxOf;
+  for (auto &[load, arms] : armsOf) {
+    double mux = muxCone(dev.operators, 1 + arms,
+                         datapathWidth(load->getResult(0).getType()));
+    NodeTiming t = accessCharacterization(load, dev.operators, dev.memory);
+    if (t.outDelay + mux <= cycleTime)
+      muxOf[load] = mux;
+  }
+  llvm::erase_if(cands, [&](Dependence dep) {
+    return !muxOf.count(dep.getDestination());
+  });
+  if (cands.empty())
+    return {};
+  llvm::DenseSet<Dependence> relaxed(cands.begin(), cands.end());
+  unsigned recOrig = recurrenceMinII(problem, {});
+  if (recOrig <= std::max(resourceMinII(problem), minII))
+    return {}; // the recurrence is not what binds the II
+  unsigned recRelaxed = recurrenceMinII(problem, relaxed);
+  if (recRelaxed >= recOrig)
+    return {}; // the bound runs through edges forwarding cannot serve
+  info(Stage::Sched, problem.getContainingOp())
+      << "Relaxing " << cands.size() << " store->load RAW edge(s) through a "
+      << "forwarding shadow: the recurrence floor drops from II=" << recOrig
+      << " to II=" << recRelaxed;
+  ForwardRelaxation out;
+  out.edges = std::move(cands);
+  for (Dependence dep : out.edges)
+    problem.setForwarded(dep);
+  // In `armsOf`'s (insertion) order, so the operator types the twins mint are
+  // created in a deterministic order.
+  for (auto &[load, arms] : armsOf) {
+    auto it = muxOf.find(load);
+    if (it == muxOf.end())
+      continue;
+    auto opr = *problem.getLinkedOperatorType(load);
+    // Keyed by the arm count too: two loads of one storage may fan differently.
+    auto nw = problem.getOrInsertOperatorType(
+        (opr.getValue() + ".fwd" + Twine(arms)).str());
+    problem.setLatency(nw, *problem.getLatency(opr));
+    problem.setIncomingDelay(nw, *problem.getIncomingDelay(opr));
+    problem.setOutgoingDelay(nw, *problem.getOutgoingDelay(opr) + it->second);
+    problem.setLinkedOperatorType(load, nw);
+    out.originalTypes.push_back({load, opr});
+  }
+  return out;
+}
+
+// Put a relaxation back: the forwarded set cleared and every re-linked load
+// returned to its original operator type, so a re-solve runs the unrelaxed
+// problem the previous release shipped.
+static void undoForwardRelaxation(ChainingModuloProblem &problem,
+                                  ForwardRelaxation &relax) {
+  problem.clearForwarded();
+  for (auto &[load, opr] : relax.originalTypes)
+    problem.setLinkedOperatorType(load, opr);
+  relax.edges.clear();
+  relax.originalTypes.clear();
+}
+
+// Record the relaxed pairs the SOLVED schedule actually leans on, i.e. the
+// ones that collide: the store issues a whole number of intervals after the
+// load, so some iteration pair shares a cycle and the RAM alone would hand the
+// load stale data. A pair the schedule keeps at the old spacing needs no
+// shadow and none is built. `delta == 0` is a collision only for a distance-0
+// (program-ordered, same-iteration) edge; at carried-only distances the same
+// cycle holds a load that precedes the store, a pair the analysis proved
+// address-disjoint.
+static void
+recordForwards(ChainingModuloProblem &problem,
+               ArrayRef<circt::scheduling::Problem::Dependence> edges,
+               unsigned ii, ScheduleModel &model) {
+  for (auto dep : edges) {
+    Operation *store = dep.getSource(), *load = dep.getDestination();
+    int64_t delta = static_cast<int64_t>(*problem.getStartTime(store)) -
+                    static_cast<int64_t>(*problem.getStartTime(load));
+    unsigned dist = problem.getDistance(dep).value_or(0);
+    if (delta < 0 || delta % ii != 0 || (delta == 0 && dist != 0))
+      continue;
+    model.addForward(load, store);
+    info(Stage::Sched, load)
+        << "Forwarding a store issued " << delta
+        << " cycle(s) later into this load's data path (distance " << dist
+        << ", II=" << ii << ")";
+  }
+}
+
 // Record what one region's solve cost, timed from \p since. Keyed by where the
 // region is rather than by the op that owned it: the schedule report is built
 // later off the reified dcp ops, by which time this problem's loop is gone.
@@ -409,6 +681,12 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   if (opts.allocate)
     populateOperatorAllocation(problem, dev.operators,
                                usesExactScheduler(opts.kind));
+  // Overlapping iterations only: without overlap the RAW round trip costs
+  // depth, not II, and a shadow would buy latency a mux is not worth.
+  ForwardRelaxation relax;
+  if (pipelined)
+    relax = relaxForwardableEdges(problem, dev, cycleTime, opts.regFloor,
+                                  minII);
   Operation *anchor = bodyBlock->getTerminator();
   // The trip this solution records is the INNERMOST loop's, the one its solved
   // `length`/`ii` describe. Every level above drives its child as a container,
@@ -421,10 +699,23 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
                      pipelined ? trip.count : std::nullopt, dev.operators);
   Stopwatch solveStart = now();
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
-                                    span)))
-    return failure();
+                                    span))) {
+    if (relax.edges.empty())
+      return failure();
+    // The relaxed problem starts its II search lower, which can strand the
+    // greedy placement where the unrelaxed search would not have gone. The
+    // relaxation is an optimization, so put it back and solve as shipped.
+    info(Stage::Sched, problem.getContainingOp())
+        << "The relaxed problem did not place; retrying without the "
+           "store->load forwarding relaxation";
+    undoForwardRelaxation(problem, relax);
+    if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
+                                      span)))
+      return failure();
+  }
   std::optional<unsigned> solvedII = problem.getInitiationInterval();
   assert(solvedII && "a modulo problem that solved carries an interval");
+  recordForwards(problem, relax.edges, *solvedII, model);
   recordSolve(problem, "cyclic", solvedII, solveStart);
   int64_t depth = pacedDepth(problem, anchor);
   // Iterations that do not overlap issue one body length apart, which is the

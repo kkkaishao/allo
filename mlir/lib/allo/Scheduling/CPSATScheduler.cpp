@@ -1102,7 +1102,10 @@ int64_t drainFloor(ProblemT &prob, ArrayRef<Problem::Dependence> breaks,
       if constexpr (std::is_same_v<ProblemT, ChainingModuloProblem>)
         if (prob.getDistance(dep).value_or(0) != 0)
           continue;
-      edge(dep.getSource(), op, latencyOf(dep.getSource()));
+      // A forwarded store->load edge separates by zero (its shadow supplies
+      // the datum), so it must not tighten this floor.
+      edge(dep.getSource(), op,
+           prob.isForwarded(dep) ? 0 : latencyOf(dep.getSource()));
     }
   // A chain break is intra-iteration whichever problem this is.
   for (const auto &dep : breaks)
@@ -1509,11 +1512,14 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
 
   // Precedence. An edge spanning `distance` iterations is relaxed by one II
   // per iteration it spans, matching the cyclic constraint row `buildTableau`
-  // emits; a chain-breaking edge is intra-iteration and carries no II term.
+  // emits; a chain-breaking edge is intra-iteration and carries no II term. A
+  // forwarded store->load edge needs only issue order (its shadow supplies the
+  // datum), so it separates by zero.
   for (Operation *op : ops)
     for (auto &dep : prob.getDependences(op)) {
       Operation *src = dep.getSource();
-      model.AddLessOrEqual(startVars.at(src) + latExpr(src) -
+      LinearExpr sep = prob.isForwarded(dep) ? LinearExpr(0) : latExpr(src);
+      model.AddLessOrEqual(startVars.at(src) + sep -
                                static_cast<int64_t>(ii) *
                                    prob.getDistance(dep).value_or(0),
                            startVars.at(dep.getDestination()));

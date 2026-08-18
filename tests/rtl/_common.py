@@ -61,9 +61,12 @@ def comb_step_ns(kind: str, width: int = 32) -> float:
 
 
 # A memory-carried accumulate (`M[x] += ...`) closes a distance-1 recurrence
-# read -> add -> write, so its II is the sum; a scalar-carried accumulate keeps
-# the partial in a register, so its II is just the add latency.
-MEM_REDUCE_II = MEM + FADD + MEM
+# read -> add -> write. The write's commit is shadowed by store->load
+# forwarding (the next read takes the store's datum on an address match), so
+# the II is the read plus the add, not the full round trip; a scalar-carried
+# accumulate keeps the partial in a register, so its II is just the add
+# latency.
+MEM_REDUCE_II = MEM + FADD
 
 
 def _to_rtl(kernel, **kw) -> RTL:

@@ -175,6 +175,13 @@ protected:
   SmallVector<Problem::Dependence> additionalConstraints;
 
   virtual Problem &getProblem() = 0;
+  /// The problem as the resource layer sees it, where the forwarded-edge set
+  /// lives; set by the concrete schedulers, null only for the resource-free
+  /// cyclic rung, which nothing instantiates on its own.
+  OccupancyProblem *occupancy = nullptr;
+  /// The latency a dependence separates its endpoints by: its source's, or
+  /// zero for a forwarded store->load edge.
+  int64_t sourceLatencyOf(Problem::Dependence dep);
   /// Iteration distance a dependence spans. The base answers 0 (the acyclic
   /// `distance == 0` special case); the cyclic subclasses override.
   virtual unsigned distanceOf(Problem::Dependence dep);
@@ -276,7 +283,9 @@ protected:
 
 public:
   SharedOperatorsSimplexScheduler(OccupancyProblem &prob, Operation *lastOp)
-      : SimplexSchedulerBase(lastOp), prob(prob) {}
+      : SimplexSchedulerBase(lastOp), prob(prob) {
+    occupancy = &prob;
+  }
   LogicalResult schedule() override;
 };
 
@@ -353,7 +362,9 @@ public:
   ModuloSimplexScheduler(ModuloOccupancyProblem &prob, Operation *lastOp,
                          unsigned minII = 1)
       : CyclicSimplexScheduler(prob, lastOp), prob(prob), mrt(*this),
-        minII(minII) {}
+        minII(minII) {
+    occupancy = &prob;
+  }
   LogicalResult schedule() override;
   /// See `lowerBoundII`. Settled before placement, so it is meaningful even
   /// after `schedule` fails, but only once `hasLowerBound` holds.
@@ -567,6 +578,13 @@ mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
 
 unsigned SimplexSchedulerBase::distanceOf(Problem::Dependence) { return 0; }
 
+int64_t SimplexSchedulerBase::sourceLatencyOf(Problem::Dependence dep) {
+  if (occupancy && occupancy->isForwarded(dep))
+    return 0;
+  auto &prob = getProblem();
+  return *prob.getLatency(*prob.getLinkedOperatorType(dep.getSource()));
+}
+
 Recurrence SimplexSchedulerBase::bindingRecurrence(unsigned ii) {
   auto &prob = getProblem();
   DenseMap<Operation *, unsigned> index;
@@ -591,8 +609,7 @@ Recurrence SimplexSchedulerBase::bindingRecurrence(unsigned ii) {
     auto dstIt = index.find(dep.getDestination());
     if (srcIt == index.end() || dstIt == index.end())
       return;
-    int64_t latency =
-        *prob.getLatency(*prob.getLinkedOperatorType(dep.getSource())) + extra;
+    int64_t latency = sourceLatencyOf(dep) + extra;
     edges.push_back({srcIt->second, dstIt->second, latency, distanceOf(dep)});
   };
   for (auto *op : prob.getOperations())
@@ -701,10 +718,9 @@ bool SimplexSchedulerBase::fillObjectiveRow(SmallVector<int> &row,
 
 void SimplexSchedulerBase::fillConstraintRow(SmallVector<int> &row,
                                              Problem::Dependence dep) {
-  auto &prob = getProblem();
   auto *src = dep.getSource();
   auto *dst = dep.getDestination();
-  unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
+  int64_t latency = sourceLatencyOf(dep);
   row[parameter1Column] = -latency; // note the negation
   if (src != dst) {                 // coefficients zero out for self-arcs.
     row[startTimeLocations[startTimeVariables[src]]] = 1;
@@ -1927,6 +1943,19 @@ LogicalResult OccupancyProblem::verifyOccupancy(unsigned ii) {
     }
   }
   return success();
+}
+
+LogicalResult ModuloOccupancyProblem::verifyPrecedence(Dependence dep) {
+  if (!isForwarded(dep))
+    return CyclicProblem::verifyPrecedence(dep);
+  unsigned stI = *getStartTime(dep.getSource());
+  unsigned stJ = *getStartTime(dep.getDestination());
+  unsigned dist = getDistance(dep).value_or(0);
+  if (stI <= stJ + dist * *getInitiationInterval())
+    return success();
+  return getContainingOp()->emitError()
+         << "Precedence violated for a forwarded store->load dependence: the "
+            "store issues after the load it forwards to";
 }
 
 LogicalResult ModuloOccupancyProblem::verify() {

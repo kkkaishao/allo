@@ -68,8 +68,11 @@ static DCPathInstanceOp makeInvoke(OpBuilder &b, Location loc,
 // Convert \p op (an op of the scheduled loop body) into its `dcp` equivalent in
 // the pipeline block \p b is inserting into, mapping its results in \p map. Ops
 // that are not compute/memory (constants, address arithmetic) are cloned as-is.
+// Each reified memory access is recorded in \p accessMap under its source op,
+// for `stampForwards` to pair once the whole block has converted.
 static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
-                      ScheduleModel &model, const DeviceModel &dev) {
+                      ScheduleModel &model, const DeviceModel &dev,
+                      DenseMap<Operation *, Operation *> &accessMap) {
   Location loc = op.getLoc();
   const OpSchedule *at = model.scheduleOf(&op);
   int64_t start = at ? at->start : 0;
@@ -122,16 +125,20 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   if (auto l = dyn_cast<AffineLoadOp>(&op)) {
     auto nw = DCPathLoadOp::create(
         b, loc, l.getType(), rm(l.getMemRef()), remap(l.getMapOperands()),
-        addrMap(), (uint64_t)start, memLatency(), bank, IntegerAttr());
+        addrMap(), (uint64_t)start, memLatency(), bank, IntegerAttr(),
+        DenseI64ArrayAttr());
     setAccessTiming(nw);
+    accessMap[&op] = nw;
     map.map(l.getResult(), nw.getResult());
     return;
   }
   if (auto l = dyn_cast<memref::LoadOp>(&op)) {
     auto nw = DCPathLoadOp::create(
         b, loc, l.getType(), rm(l.getMemRef()), remap(l.getIndices()),
-        addrMap(), (uint64_t)start, memLatency(), bank, IntegerAttr());
+        addrMap(), (uint64_t)start, memLatency(), bank, IntegerAttr(),
+        DenseI64ArrayAttr());
     setAccessTiming(nw);
+    accessMap[&op] = nw;
     map.map(l.getResult(), nw.getResult());
     return;
   }
@@ -139,16 +146,18 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     auto nw = DCPathStoreOp::create(
         b, loc, rm(s.getValueToStore()), rm(s.getMemRef()),
         remap(s.getMapOperands()), addrMap(), (uint64_t)start, memLatency(),
-        bank, IntegerAttr());
+        bank, IntegerAttr(), IntegerAttr());
     setAccessTiming(nw);
+    accessMap[&op] = nw;
     return;
   }
   if (auto s = dyn_cast<memref::StoreOp>(&op)) {
     auto nw = DCPathStoreOp::create(b, loc, rm(s.getValueToStore()),
                                     rm(s.getMemRef()), remap(s.getIndices()),
                                     addrMap(), (uint64_t)start, memLatency(),
-                                    bank, IntegerAttr());
+                                    bank, IntegerAttr(), IntegerAttr());
     setAccessTiming(nw);
+    accessMap[&op] = nw;
     return;
   }
   // Streams stay as FIFO ops, not compute; keep them verbatim with their start.
@@ -217,6 +226,39 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   }
   // Constants / address arithmetic: keep verbatim inside the region.
   cloneKept();
+}
+
+// Stamp the store->load forwarding pairs the schedule recorded onto the dcp
+// accesses just reified: each store gets a func-unique `fwd_id`, each load the
+// list of ids its shadow serves it from. Both ends of a pair sit in one block
+// (the scheduler's own gate), so \p accessMap holds them together and a pair is
+// stamped exactly once. Loads are ordered by their reified position, so the ids
+// are a function of the program rather than of pointer hashing.
+static void stampForwards(ScheduleModel &model,
+                          DenseMap<Operation *, Operation *> &accessMap,
+                          int64_t &nextFwdId) {
+  SmallVector<Operation *> loads;
+  for (auto &[load, stores] : model.allForwards())
+    if (accessMap.contains(load))
+      loads.push_back(load);
+  llvm::sort(loads, [&](Operation *a, Operation *b) {
+    return accessMap.lookup(a)->isBeforeInBlock(accessMap.lookup(b));
+  });
+  for (Operation *load : loads) {
+    Builder ab(load->getContext());
+    SmallVector<int64_t> ids;
+    for (Operation *store : model.allForwards().find(load)->second) {
+      Operation *reifiedStore = accessMap.lookup(store);
+      assert(reifiedStore && "a forwarded pair reifies within one block, so "
+                             "its store is in the same access map as its load");
+      auto nw = cast<DCPathStoreOp>(reifiedStore);
+      if (!nw.getFwdId())
+        nw.setFwdIdAttr(ab.getI64IntegerAttr(nextFwdId++));
+      ids.push_back(*nw.getFwdId());
+    }
+    cast<DCPathLoadOp>(accessMap.lookup(load))
+        .setFwdAttr(ab.getDenseI64ArrayAttr(ids));
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -400,10 +442,13 @@ static void materializeWhilePipeline(const RegionAttrs &r, scf::WhileOp w,
   }
 
   b.setInsertionPointToEnd(blk);
+  // A while owns no forwarding (only counted-loop solves record pairs), so its
+  // access map is write-only.
+  DenseMap<Operation *, Operation *> accessMap;
   for (Operation &op : before.without_terminator())
-    convertOp(op, b, map, model, dev);
+    convertOp(op, b, map, model, dev, accessMap);
   for (Operation &op : after.without_terminator())
-    convertOp(op, b, map, model, dev);
+    convertOp(op, b, map, model, dev, accessMap);
 
   Value cond = map.lookupOrDefault(w.getConditionOp().getCondition());
   SmallVector<Value> carried;
@@ -422,7 +467,8 @@ static void materializeWhilePipeline(const RegionAttrs &r, scf::WhileOp w,
 static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
                                                   LoopLikeOpInterface loop,
                                                   ScheduleModel &model,
-                                                  const DeviceModel &dev) {
+                                                  const DeviceModel &dev,
+                                                  int64_t &nextFwdId) {
   Operation *loopOp = loop.getOperation();
   OpBuilder b(loopOp);
   Location loc = loop.getLoc();
@@ -476,8 +522,10 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
     map.map(arg, blk->getArgument(i + 1));
 
   b.setInsertionPointToEnd(blk);
+  DenseMap<Operation *, Operation *> accessMap;
   for (Operation &op : body->without_terminator())
-    convertOp(op, b, map, model, dev);
+    convertOp(op, b, map, model, dev, accessMap);
+  stampForwards(model, accessMap, nextFwdId);
 
   Operation *term = body->getTerminator();
   SmallVector<Value> yields;
@@ -554,8 +602,10 @@ static void materializeSequential(const RegionAttrs &r,
 
   IRMapping map;
   b.setInsertionPointToEnd(blk);
+  // A straight-line span owns no forwarding, so its access map is write-only.
+  DenseMap<Operation *, Operation *> accessMap;
   for (Operation *op : work)
-    convertOp(*op, b, map, model, dev);
+    convertOp(*op, b, map, model, dev, accessMap);
 
   SmallVector<Value> yields(llvm::map_range(
       escaping, [&](Value v) { return map.lookupOrDefault(v); }));
@@ -718,6 +768,8 @@ struct Reifier {
   // Set in run(): this func calls sub-kernels, so a shared `memref.alloc` an
   // acyclic span holds is hoisted to func level rather than yielded.
   bool container = false;
+  // The next `fwd_id` a forwarded store takes, unique within this func.
+  int64_t nextFwdId = 0;
 
   void materializeBlock(Block &block) {
     for (const SchedRegion &region : enumerateRegions(block))
@@ -820,10 +872,11 @@ struct Reifier {
     if (shape == RegionShape::Container) {
       materializeBlock(body);
       pipe = materializeLoopToPipeline(sequentialWrapperAttrs(loop), loop,
-                                       model, dev);
+                                       model, dev, nextFwdId);
     } else {
       assert(sol && "a leaf counted loop owns the solve keyed by it");
-      pipe = materializeLoopToPipeline(RegionAttrs(sol), loop, model, dev);
+      pipe = materializeLoopToPipeline(RegionAttrs(sol), loop, model, dev,
+                                       nextFwdId);
     }
     // A container whose child spans are all declarations-only builds no child
     // region and comes out a leaf; nothing else may move.

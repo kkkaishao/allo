@@ -362,6 +362,25 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     p.arms.push_back({fired, addr, Value()});
     p.ownerRegion = rb.id;
   }
+  // A forwarded load's consumers read the shadow mux rather than the RAM
+  // datum: promise it now, resolved by `finalizeForwards` once the paired
+  // stores (emitted after the reads) have recorded their issue terms.
+  for (uarch::AccRef r : rb.memAccesses) {
+    const uarch::MemUnit &m = dp.mems[r.id];
+    const uarch::MemUnit::Access &acc = m.accesses[r.idx];
+    if (acc.isWrite ||
+        llvm::none_of(m.forwards, [&](const uarch::MemUnit::Forward &f) {
+          return f.load == r.idx;
+        }))
+      continue;
+    uint64_t key = accKey(m.id, r.idx);
+    Value raw = readData.lookup(key);
+    assert(raw && "a forwarded load's RAM datum exists before the shadow");
+    BankSplit bs = bankAddress(m, acc);
+    Backedge out = c.bb.get(raw.getType());
+    pendingForwards.push_back({m.id, r.idx, raw, bs.bank, bs.offset, out});
+    readData[key] = out;
+  }
 }
 
 void DatapathEmitter::emitLaneReads(const uarch::MemUnit &m, unsigned port,
@@ -586,6 +605,16 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
     if (!acc.isWrite)
       continue;
     fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainCycle(m, acc));
+    // A forwarded store's issue-time terms, taken before the write-latency
+    // delays: the shadow compares and captures at issue.
+    if (llvm::any_of(m.forwards, [&](const uarch::MemUnit::Forward &f) {
+          return f.store == r.idx;
+        })) {
+      BankSplit bs = bankAddress(m, acc);
+      fwdStores[accKey(m.id, r.idx)] = {
+          c.activationPulse(commitPulse(), acc.stage, sh), bs.bank, bs.offset,
+          resolveSource(acc.data)};
+    }
     if (acc.plan == PortPlan::Lane) {
       lanes[{r.id, acc.lane}].push_back(r.idx);
       continue;
@@ -792,6 +821,45 @@ void DatapathEmitter::finalizeScatteredPorts() {
       nameValue(cell, memElemName(dp, m, k));
       be.setValue(cell);
     }
+  }
+}
+
+// Resolve every pending forward: per paired store, a same-element compare at
+// the shared issue cycle gated by the store's commit pulse, the select and the
+// store's datum registered to the read latency on the load's shell, muxed over
+// the RAM datum. At most one select fires per cycle (a WAW pair holding one
+// address is kept a cycle apart, and same-cycle stores are provably
+// element-disjoint), so the arms stack in any order.
+void DatapathEmitter::finalizeForwards() {
+  for (PendingForward &p : pendingForwards) {
+    const uarch::MemUnit &m = dp.mems[p.mem];
+    const uarch::MemUnit::Access &load = m.accesses[p.load];
+    StallShell sh = shellFor(load.region);
+    // A bank cone is absent where the digit folded to a constant; the compare
+    // then reads the assigned bank (0 when unbanked).
+    auto bankOf = [&](const uarch::MemUnit::Access &acc, Value cone) {
+      if (cone)
+        return cone;
+      unsigned w = std::max(1u, llvm::Log2_64_Ceil(m.numBanks));
+      return c.konst(c.b.getIntegerType(w), acc.staticBank.value_or(0));
+    };
+    Value muxed = p.raw;
+    for (const uarch::MemUnit::Forward &f : m.forwards) {
+      if (f.load != p.load)
+        continue;
+      ForwardStore st = fwdStores.lookup(accKey(p.mem, f.store));
+      assert(st.we && "a forwarded store recorded no issue terms");
+      const uarch::MemUnit::Access &store = m.accesses[f.store];
+      Value match = c.icmpEqV(p.offset, st.offset);
+      if (m.numBanks > 1)
+        match = c.andBits(
+            match, c.icmpEqV(bankOf(load, p.bank), bankOf(store, st.bank)));
+      Value sel = c.delayValid(c.andBits(match, st.we), m.readLatency, sh);
+      Value data = c.shiftChain(st.data, m.readLatency, sh).last();
+      c.muxLedger.add(MuxRole::Crossbar, 2, m.width);
+      muxed = c.mux(sel, data, muxed);
+    }
+    p.out.setValue(muxed);
   }
 }
 

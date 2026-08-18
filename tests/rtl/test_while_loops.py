@@ -81,10 +81,10 @@ def test_decreasing_index_while_raises_cosim():
 
     loop = _sched(dec_const).cyclic()[0]
     # Constant trip: counted, known latency, and not a conditional/flushing
-    # region. The span is the arming cycle, N issues one II apart, the accumulate
-    # landing, and the completion latch.
+    # region. The span is N issues one II apart from the start cycle, the
+    # accumulate landing, and the completion latch.
     assert not loop.conditional and not loop.latency_is_bound
-    assert loop.latency == N + 2
+    assert loop.latency == N + 1
     out = np.zeros(1, np.int32)
     _to_rtl(dec_const).cosim(A, out)
     assert out[0] == int(A.sum())  # counts i down from N, so sums all of A
@@ -731,3 +731,69 @@ def test_checked_while_reuses_the_counted_skeleton():
     out = np.zeros(1, np.int32)
     rtl.cosim(A, np.int32(20), np.int32(10), out)
     assert out[0] == gold(20, 10)
+
+
+# --- region-boundary pass-through ---------------------------------------------
+
+
+def test_a_chained_container_turns_over_in_the_commit_cycle():
+    # `for i: [while, epilogue]` is the flat-FSM shape: the while hands the
+    # epilogue its finish pulse, the container relaunches on the epilogue's
+    # commit pulse, and the carried q crosses through the live result wire. A
+    # zero-trip iteration therefore costs exactly CHECK(1) + t_cond + drain,
+    # with the container's own done latch as the only cycle outside the loop.
+    N = 16
+
+    @kernel
+    def scan(x: i32[N], out: i32[N]):
+        q: i32 = 0
+        for i in range(N):
+            while q > x[i]:
+                q = q - x[i]
+            out[i] = q
+            q = q + 2
+
+    rtl = _to_rtl(scan)
+    regions = rtl.schedule().func("scan").regions
+    cond = next(r for r in regions if r.conditional)
+    epi = [r for r in regions if r.kind.value == "acyclic"][-1]
+    t_cond = max(op.t for op in cond.ops)
+    per_iter = 1 + t_cond + epi.cost.drain
+
+    x = np.full(N, 100, np.int32)  # q never exceeds 2N: every while is zero-trip
+    out = np.zeros(N, np.int32)
+    r = rtl.cosim(x, out, timeout=1000)
+    assert r.cycles == N * per_iter + 1
+    assert np.array_equal(out, np.arange(0, 2 * N, 2, np.int32))
+
+
+def test_a_backtracking_while_carries_its_state_across_the_turnover():
+    # Data-dependent while trips: q crosses while -> epilogue on the finish
+    # pulse, epilogue -> next iteration through the container's live latch, and
+    # into the while's own iter-arg through the register's D wire, all in the
+    # same cycle family. A stale sample at any of the three hand-offs changes
+    # the values, not just the timing.
+    N = 16
+
+    @kernel
+    def scan(x: i32[N], out: i32[N]):
+        q: i32 = 0
+        for i in range(N):
+            while q > x[i]:
+                q = q - x[i]
+            out[i] = q
+            q = q + 2
+
+    rtl = _to_rtl(scan)
+    rng = np.random.default_rng(0)
+    x = rng.integers(1, 4, N).astype(np.int32)
+    out = np.zeros(N, np.int32)
+    rtl.cosim(x, out, timeout=2000)
+
+    q, want = 0, []
+    for i in range(N):
+        while q > x[i]:
+            q -= int(x[i])
+        want.append(q)
+        q += 2
+    assert np.array_equal(out, np.array(want, np.int32))

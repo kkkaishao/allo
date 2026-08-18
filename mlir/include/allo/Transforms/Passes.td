@@ -464,9 +464,14 @@ def ScalarizeMemoryPass
     unrolled accumulation over a kernel argument leaves behind.
 
     Second, for the untouched survivors, if the array is small enough (at most
-    `maxElements` elements) and every subscript is a constant, automatically partition
-    it with `allo.part` so it lowers to registers rather than a memory whose ports and
-    access latency bound the II.
+    `maxElements` elements) and a register file buys bandwidth a ported memory
+    cannot give, automatically partition it with `allo.part` so it lowers to
+    registers rather than a memory whose ports and access latency bound the II.
+    That is the case when every subscript is a constant (the accesses are
+    wires), or when one block issues more than two accesses (an unrolled or
+    pipelined body a dual-ported row cannot serve in a cycle). A rolling loop
+    touching the array once or twice per iteration keeps the priced storage
+    the memory tables select.
   }];
   let dependentDialects = [
     "mlir::affine::AffineDialect", "mlir::memref::MemRefDialect"
@@ -474,6 +479,35 @@ def ScalarizeMemoryPass
   let options = [
     Option<"maxElements", "max-elements", "int64_t", "16",
            "Partition a local array with at most this many elements">
+  ];
+}
+
+def HoistInvariantReadsPass
+    : Pass<"hoist-invariant-reads", "func::FuncOp"> {
+  let summary = "Hoist loop-invariant memory reads in front of their loop";
+  let description = [{
+    Move a read whose address does not change across a loop's iterations out in
+    front of the loop, so the body meets a held register instead of spending a
+    memory port on the same word every iteration. An unrolled or pipelined body
+    re-reading a small coefficient array is the motivating shape: the repeated
+    reads bound the initiation interval by port count, while the preloaded
+    values cost one read each ahead of the loop.
+
+    A read moves only when every operand is defined outside the loop, the loop
+    provably runs at least once, and the array sees no write and no opaque use
+    inside the loop. Reads of a complete-partitioned array stay put: they are
+    already wires, and hoisting would only add registers carrying the values
+    across the region boundary. Identical hoisted reads collapse to one access.
+
+    Out of a leaf body, the one the modulo scheduler paces, reads move only
+    when their removal lowers the body's port-pressure floor, the widest
+    array's accesses per bank per iteration; a preload that leaves that
+    maximum in place buys no II and would only spend the held registers. A
+    body with loops inside is paced by its children, so an invariant read
+    there always moves and stops being re-issued every sweep.
+  }];
+  let dependentDialects = [
+    "mlir::affine::AffineDialect", "mlir::memref::MemRefDialect"
   ];
 }
 

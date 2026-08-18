@@ -248,8 +248,10 @@ def _dev(write_latency: int):
 
 
 # The deeper write is honored by the scheduler too, not just tolerated by
-# the emitter: the memory-carried recurrence's II is read + add + write, so it
-# grows one cycle per added write cycle.
+# the emitter: the memory-carried recurrence's II is read + add + write. A
+# one-cycle write is the exception, since only that window a store->load
+# shadow can cover: forwarding drops its round trip to read + add, while a
+# deeper write pays its scheduled cycles in full.
 def test_multi_cycle_write_costs_scheduled_cycles():
     @kernel
     def accumulate(A: i32[8], B: i32[8]):
@@ -269,7 +271,9 @@ def test_multi_cycle_write_costs_scheduled_cycles():
         )
         regions = rtl.schedule().func("accumulate")
         iis.append(max(r.interval for r in regions.cyclic()))
-    assert iis == [iis[0], iis[0] + 1, iis[0] + 2], iis
+    # wr=1 forwards (read + add); wr=2 pays read + add + 2, one above the
+    # unforwarded wr=1 round trip, and wr=3 one more.
+    assert iis == [iis[0], iis[0] + 2, iis[0] + 3], iis
 
 
 # The registers that carry a multi-cycle write ride the region's clock
@@ -540,8 +544,17 @@ def test_a_subscript_that_cannot_be_carried_keeps_the_row_its_register():
     # counter's width, so `20` is a constant of that register's own type.
     twenty = set(re.findall(r"(%c20_i\d+\w*) = hw\.constant 20", m))
     assert twenty, "no stride of 20 anywhere: the test measures nothing"
+    # The advance-by-20 reads the stride register, either directly or through
+    # its start-cycle bypass mux.
+    carriers = {f"%r0_addr{k}" for k in re.findall(r"%r0_addr(\d+)\b", m)}
+    carriers |= {
+        f"%{name}"
+        for name in re.findall(r"%([\w.]+) = comb\.mux [^\n]*%r0_addr\d+\b", m)
+    }
     assert any(
-        re.search(rf"comb\.add %r0_addr\d+, {c}\b", m) for c in twenty
+        re.search(rf"comb\.add {re.escape(o)}, {c}\b", m)
+        for o in carriers
+        for c in twenty
     ), "the row stride is not carried in a register"
     assert not any(
         re.search(rf"comb\.mul [^\n]*{c}\b", m) for c in twenty

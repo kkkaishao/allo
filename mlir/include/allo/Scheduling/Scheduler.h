@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -75,6 +76,18 @@ public:
   /// into an expression that subtracts, and an `unsigned` one silently
   /// evaluates `latencyOf(op) - 1` on a combinational operator as 2^32 - 1.
   int64_t latencyOf(Operation *op);
+
+  /// Store->load dependences a forwarding network relaxes: the load may issue
+  /// in the very cycle the store does, a shadow register supplying the datum
+  /// on an address match instead of the RAM, which has not committed it yet.
+  /// Set before solving; every solver and verifier weighs such an edge at
+  /// latency zero instead of the store's write latency.
+  void setForwarded(Dependence dep) { forwardedEdges.insert(dep); }
+  bool isForwarded(Dependence dep) const {
+    return forwardedEdges.contains(dep);
+  }
+  /// Forget every forwarded edge, for a re-solve of the unrelaxed problem.
+  void clearForwarded() { forwardedEdges.clear(); }
 
   /// The schedule DEPTH of a SOLVED problem: the cycle by which every operation
   /// has completed. A REPORT only, since a span composes from the drain
@@ -193,6 +206,7 @@ private:
   ResourceTypeProperty<AllocatableUnit> allocatable;
   ResourceTypeProperty<unsigned> allocation;
   OperationProperty<unsigned> assignedUnit;
+  llvm::DenseSet<Dependence> forwardedEdges;
 };
 
 /// The cyclic twin: CIRCT's `ModuloProblem` with occupancy windows, i.e.
@@ -205,6 +219,9 @@ public:
 
 protected:
   ModuloOccupancyProblem() = default;
+  /// A forwarded store->load edge needs only issue order (the shadow supplies
+  /// the datum), so it is checked at latency zero.
+  LogicalResult verifyPrecedence(Dependence dep) override;
 
 public:
   LogicalResult verify() override;

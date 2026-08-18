@@ -182,14 +182,18 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
           ? ctx.delayValid(ctx.andBits(start, term.isEmpty(ctx)), 1, shell)
           : Value();
   // A CallUnit region completes on the child's `done`; one that also has loose
-  // datapath waits for both, ANDing two held levels so the later wins.
+  // datapath waits for both, ANDing two held levels so the later wins. Only a
+  // call-free region records its completion pulse: composed with a call's done
+  // level, the pulse no longer marks completion.
   bool looseWork = !rb.streamAccesses.empty() || !rb.units.empty() ||
                    !rb.memAccesses.empty();
   Value done = fb.callDone;
   if (!fb.callDone || looseWork) {
-    Value drained =
+    auto [drained, pulse] =
         control.emitDone(rb, lastIssue, emptyDone, start, retrig, shell);
     done = fb.callDone ? ctx.andBits(fb.callDone, drained) : drained;
+    if (!fb.callDone)
+      donePulse[rb.id] = pulse;
   }
   // Resolving the promise RAUWs every consumer and erases the placeholders, so
   // re-register the region with the resolved values; a later region must not
@@ -245,13 +249,17 @@ unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
                                 RegRole::Survivor);
     nameValue(survivor, survivorName(rb.id, k));
     datapath.setSurvivor(rb.id, k, survivor);
+    liveResult[DatapathEmitter::accKey(rb.id, k)] = res;
     maxStage = std::max(maxStage, stage);
   }
   return maxStage;
 }
 
 // Run `regions` in program order, each region starting when its predecessor
-// drains (the first on `start`); returns the last region's done.
+// drains (the first on `start`); returns the last region's done. A conditional
+// predecessor hands its successor its completion pulse directly, a cycle ahead
+// of the latched done: a while's exit trails every commit and iter-arg latch
+// by at least a cycle (`handoffSafe`), so the successor samples settled state.
 Value HWEmitter::sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
                           bool retrig) {
   Value done;
@@ -259,8 +267,10 @@ Value HWEmitter::sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
   for (auto [i, rid] : llvm::enumerate(regions)) {
     const auto &rb = dp.regions[rid];
     done = emitRegion(rb, startK, retrig);
-    if (i + 1 < regions.size())
-      startK = ctx.startFor(/*regionStart=*/Value(), done);
+    if (i + 1 < regions.size()) {
+      Value pulse = handoffPulse(rid);
+      startK = pulse ? pulse : ctx.startFor(/*regionStart=*/Value(), done);
+    }
   }
   return done;
 }
@@ -288,7 +298,13 @@ Value HWEmitter::composeSiblings(llvm::ArrayRef<uarch::RegionId> regions,
       assert(d && "a predecessor's done must be emitted before its consumer");
       predDones.push_back(d);
     }
-    Value startK = ctx.startFor(start, predDones);
+    // The same conditional-predecessor hand-off as `sequence`; a join over
+    // several predecessors needs the latched levels.
+    Value startK = rb.predecessors.size() == 1
+                       ? handoffPulse(rb.predecessors.front())
+                       : Value();
+    if (!startK)
+      startK = ctx.startFor(start, predDones);
     Value done = emitRegion(rb, startK, /*retrig=*/true);
     // A lone region is its own conjunction and has no consumer to hand a stale
     // level to, so it keeps the raw done.
@@ -308,16 +324,27 @@ Value HWEmitter::composeSiblings(llvm::ArrayRef<uarch::RegionId> regions,
 // because the register must exist before the children that feed it emit.
 SmallVector<circt::Backedge>
 HWEmitter::setupCarriedIterArgs(const uarch::RegionBlock &rb, Value start,
-                                Value advance) {
+                                Value advance, bool publishThrough) {
   SmallVector<circt::Backedge> nextBE;
   for (auto [k, r] : llvm::enumerate(rb.results)) {
     assert(r.init && "a container iter-arg has no resolvable init");
-    Value init = datapath.resolveSource(r.init);
+    // An init sourced from a chained enclosing container's survivor: this
+    // latch fires in the very cycle that survivor latches, so read its D wire.
+    Value init;
+    if (r.init.kind == uarch::Source::Kind::Survivor)
+      init = throughValue.lookup(
+          DatapathEmitter::accKey(r.init.id, r.init.outPort));
+    if (!init)
+      init = datapath.resolveSource(r.init);
     circt::Backedge nb = ctx.bb.get(init.getType());
     nextBE.push_back(nb);
-    Value carried = ctx.latchReg(init, nb, start, advance);
+    Value through;
+    Value carried = ctx.latchReg(init, nb, start, advance, RegRole::Survivor,
+                                 publishThrough ? &through : nullptr);
     nameValue(carried, survivorName(rb.id, k));
     datapath.setSurvivor(rb.id, k, carried);
+    if (publishThrough)
+      throughValue[DatapathEmitter::accKey(rb.id, k)] = through;
   }
   return nextBE;
 }
@@ -337,8 +364,8 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
   // The controller is paced by the child's per-invocation completion pulse
   // (`fb.callDone`), a backedge since emitCalls needs the counter first.
   Backedge callDone = ctx.bb.get(ctx.i1);
-  IterationControl ic =
-      control.emitCountedIteration(rb, terminatorOf(rb), start, callDone);
+  IterationControl ic = control.emitCountedIteration(
+      rb, terminatorOf(rb), start, callDone, /*chained=*/false);
 
   // An empty loop never fires the child, whose own run gating keeps every
   // write-enable low.
@@ -349,27 +376,134 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
   return ic.done;
 }
 
+bool HWEmitter::advancesOnPulse(const uarch::RegionBlock &rb) const {
+  // A container composing an exact span keeps its wiring: consumers are
+  // placed against that span, so the hardware may not run ahead of it. A
+  // conditional container, a dynamic trip or any non-static child leaves
+  // every enclosing figure dynamic or a ceiling, and faster stays inside.
+  bool exactSpan =
+      !rb.conditional && rb.tripCount &&
+      llvm::all_of(rb.children, [&](uarch::RegionId c) {
+        return dp.regions[c].determinacy == DeterminacyEnum::CountedStatic;
+      });
+  if (exactSpan)
+    return false;
+  // The last child must hand its results over safely at the pulse: a
+  // call-free leaf exposes each result's live wire (`liveResult`), a
+  // conditional container's iter-args settle at least a cycle before its
+  // exit, and a guard's survivor latches on the pulse itself, so no carried
+  // value may source from one (its arms' commits already trail the pulse).
+  const uarch::RegionBlock &last = dp.regions[rb.children.back()];
+  bool lastOk = false;
+  switch (last.shape) {
+  case uarch::RegionBlock::Shape::Leaf:
+    lastOk = last.callUnits.empty();
+    break;
+  case uarch::RegionBlock::Shape::Container:
+    lastOk = last.conditional;
+    break;
+  case uarch::RegionBlock::Shape::Guard:
+    lastOk = llvm::none_of(rb.results, [&](const uarch::RegionResult &r) {
+      return r.value.kind == uarch::Source::Kind::Survivor &&
+             r.value.id == last.id;
+    });
+    break;
+  case uarch::RegionBlock::Shape::CallNode:
+    break;
+  }
+  if (!lastOk)
+    return false;
+  // Every carried next-value must be a settled survivor or a constant; a
+  // container-level unit would be sampled in the cycle it still computes.
+  return llvm::all_of(rb.results, [](const uarch::RegionResult &r) {
+    return r.value.kind == uarch::Source::Kind::Survivor ||
+           r.value.kind == uarch::Source::Kind::Const;
+  });
+}
+
+bool HWEmitter::chainsTurnover(const uarch::RegionBlock &rb) const {
+  if (!advancesOnPulse(rb))
+    return false;
+  // A conditional container's children launch behind its own CHECK window. A
+  // counted one's first child samples the counter and iter-args at its own
+  // start, so collapsing launch onto the commit cycle needs a first child
+  // that samples a cycle later: a conditional child's CHECK or a guard
+  // child's predicate test.
+  if (rb.conditional)
+    return true;
+  const uarch::RegionBlock &first = dp.regions[rb.children.front()];
+  return first.conditional || first.shape == uarch::RegionBlock::Shape::Guard;
+}
+
+Value HWEmitter::nextValueFor(const uarch::RegionBlock &rb, unsigned k,
+                              bool onPulse) {
+  const uarch::RegionResult &r = rb.results[k];
+  if (onPulse && r.value.kind == uarch::Source::Kind::Survivor &&
+      r.value.id == rb.children.back()) {
+    const uarch::RegionBlock &last = dp.regions[r.value.id];
+    // A counted leaf result captured in the commit cycle itself: its survivor
+    // register settles only at the turnover's end, so latch from the same
+    // wire its own capture takes. A conditional leaf's last capture precedes
+    // its exit by an II, and an earlier-stage capture already settled.
+    if (last.shape == uarch::RegionBlock::Shape::Leaf && !last.conditional &&
+        dp.readyCycle(last.results[r.value.outPort].value) == last.drainStage) {
+      Value live = liveResult.lookup(
+          DatapathEmitter::accKey(r.value.id, r.value.outPort));
+      assert(live && "a pulse-advanced container's live result was not "
+                     "recorded");
+      return live;
+    }
+  }
+  return datapath.resolveSource(r.value);
+}
+
+void HWEmitter::resolveIterationBody(const uarch::RegionBlock &rb, Value issue,
+                                     Backedge &lastDrain,
+                                     llvm::MutableArrayRef<Backedge> nextBE,
+                                     bool onPulse) {
+  Value done = sequence(rb.children, issue, /*retrig=*/true);
+  Value drain;
+  if (onPulse) {
+    drain = donePulse.lookup(rb.children.back());
+    assert(drain && "a pulse-advanced container's last child recorded no "
+                    "completion pulse");
+  } else {
+    drain = ctx.risingEdge(done);
+  }
+  lastDrain.setValue(drain);
+  for (auto [k, nb] : llvm::enumerate(nextBE))
+    nb.setValue(nextValueFor(rb, k, onPulse));
+}
+
 // A container region: a cyclic loop whose body nests one or more child regions,
 // run once per outer iteration. The outer counter is materialized first, then
 // the children are sequenced within one outer iteration, and the counter
 // advances when the LAST child drains. Non-overlapping (II_outer >= sum of
 // child latencies), so the outer index is stable across one pass. A value
 // handed child-to-child crosses as a survivor register. Returns a latched
-// completion level.
+// completion level. Where no exact span composes through the container, the
+// advance rides the last child's completion pulse (`advancesOnPulse`), and
+// with a conditional or guard first child the relaunch collapses onto that
+// same cycle (`chainsTurnover`).
 Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
   RegionTag tag(ctx, rb.id);
-  // The controller is paced by `lastDrain`, the last child's done edge,
-  // resolved once the children emit.
+  bool onPulse = advancesOnPulse(rb);
+  bool chained = chainsTurnover(rb);
+  // The controller is paced by `lastDrain`: the last child's done edge, or its
+  // completion pulse when the advance may ride it, resolved once the children
+  // emit. `chained` additionally collapses the relaunch onto that cycle.
   Backedge lastDrain = ctx.bb.get(ctx.i1);
-  IterationControl ic =
-      control.emitCountedIteration(rb, terminatorOf(rb), start, lastDrain);
+  IterationControl ic = control.emitCountedIteration(rb, terminatorOf(rb),
+                                                     start, lastDrain, chained);
   // The counter must be live while the children emit: it is their outer index,
   // and (for a variable-trip child) its own bound.
   datapath.setControl(rb.id, ic.rc);
 
   // Loop-carried iter-args, advancing on each outer-iteration drain; the final
-  // value is this region's survivor.
-  SmallVector<Backedge> nextBE = setupCarriedIterArgs(rb, start, lastDrain);
+  // value is this region's survivor. Chained, the first child launches in the
+  // latch cycle, so the D wires are published for its init latches.
+  SmallVector<Backedge> nextBE =
+      setupCarriedIterArgs(rb, start, lastDrain, /*publishThrough=*/chained);
 
   // The container's own combinational units (a nested guard's predicate over
   // this counter) emit once the counter and iter-arg survivors are live, so a
@@ -377,10 +511,7 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
   datapath.declareUnits(rb);
   datapath.emitUnits(rb);
 
-  lastDrain.setValue(ctx.risingEdge(sequence(rb.children, ic.rc.issue,
-                                             /*retrig=*/true)));
-  for (auto [k, nb] : llvm::enumerate(nextBE))
-    nb.setValue(datapath.resolveSource(rb.results[k].value));
+  resolveIterationBody(rb, ic.rc.issue, lastDrain, nextBE, onPulse);
   return ic.done;
 }
 
@@ -394,11 +525,15 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
 Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
                                           Value start) {
   RegionTag tag(ctx, rb.id);
+  bool onPulse = advancesOnPulse(rb);
 
   // The outer iter-arg registers are this region's survivors, advanced when an
   // outer iteration drains (`lastDrain`, resolved after the children emit).
+  // No D wires to publish: the children launch behind the CHECK window, at
+  // least a cycle after these registers latch.
   Backedge lastDrain = ctx.bb.get(ctx.i1);
-  SmallVector<Backedge> nextBE = setupCarriedIterArgs(rb, start, lastDrain);
+  SmallVector<Backedge> nextBE =
+      setupCarriedIterArgs(rb, start, lastDrain, /*publishThrough=*/false);
 
   // The condition cone yields the continue-condition and its ready latency
   // t_cond (0 when combinational, several cycles when memory- or IP-dependent).
@@ -406,13 +541,12 @@ Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
   auto [cond, tCond] = datapath.emitConditionRegion(rb, rb.condition);
   IterationControl ic =
       control.emitCheckedIteration(rb.id, cond, tCond, start, lastDrain);
+  donePulse[rb.id] = ic.donePulse;
 
-  // The last child's drain edge advances the iter-args and drives the next
-  // CHECK.
-  lastDrain.setValue(
-      ctx.risingEdge(sequence(rb.children, ic.rc.issue, /*retrig=*/true)));
-  for (auto [k, nb] : llvm::enumerate(nextBE))
-    nb.setValue(datapath.resolveSource(rb.results[k].value));
+  // The last child's drain advances the iter-args and drives the next CHECK;
+  // riding the pulse is safe because the CHECK samples a cycle later, when
+  // the advanced iter-args have settled.
+  resolveIterationBody(rb, ic.rc.issue, lastDrain, nextBE, onPulse);
   return ic.done;
 }
 
@@ -437,15 +571,20 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   nameValue(checkTime, regionSignal(rb.id, "check"));
   auto [thenStart, elseStart] = ctx.branchPulse(checkTime, cond);
   // Each arm runs its children once, retrig so a re-entered guard presents
-  // fresh edges each enclosing pass.
-  Value thenDrained =
-      rb.children.empty()
-          ? thenStart
-          : ctx.risingEdge(sequence(rb.children, thenStart, /*retrig=*/true));
-  Value elseDrained = rb.elseChildren.empty()
-                          ? elseStart
-                          : ctx.risingEdge(sequence(rb.elseChildren, elseStart,
-                                                    /*retrig=*/true));
+  // fresh edges each enclosing pass. The arm's completion follows the sibling
+  // hand-off rule: a `handoffSafe` tail hands its pulse (its commits and
+  // result latches trail it), everything else the done edge, so the survivor
+  // capture below always reads settled arm results.
+  auto armDrained = [&](llvm::ArrayRef<uarch::RegionId> arm,
+                        Value armStart) -> Value {
+    if (arm.empty())
+      return armStart;
+    Value done = sequence(arm, armStart, /*retrig=*/true);
+    Value pulse = handoffPulse(arm.back());
+    return pulse ? pulse : ctx.risingEdge(done);
+  };
+  Value thenDrained = armDrained(rb.children, thenStart);
+  Value elseDrained = armDrained(rb.elseChildren, elseStart);
   // Each yielded result is the taken arm's value, latched into one survivor
   // when that arm drains. The two drain pulses are disjoint (exactly one arm
   // runs a pass), so the pulse both selects the datum and enables the capture.
@@ -459,8 +598,12 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
     datapath.setSurvivor(rb.id, k, surv);
   }
   // Exactly one arm runs, so the region completes on whichever drains. Latch
-  // done (a level); clear on start so a retriggered guard re-edges.
-  Value done = ctx.holdDone(ctx.orBits(thenDrained, elseDrained), start);
+  // done (a level); clear on start so a retriggered guard re-edges. The set
+  // pulse is recorded for the hand-off and advance chains; `handoffSafe`
+  // gates its use to a result-less guard, whose pulse trails every commit.
+  Value pulse = ctx.orBits(thenDrained, elseDrained);
+  donePulse[rb.id] = pulse;
+  Value done = ctx.holdDone(pulse, start);
   nameValue(done, regionSignal(rb.id, "done"));
   return done;
 }
@@ -497,6 +640,9 @@ void HWEmitter::emit() {
   // An internal read port is one address bus for every read coloured onto it;
   // only now has each of them built the address it presents.
   datapath.finalizeSharedReadPorts();
+  // The store->load shadows: a forwarded load's mux needs the paired stores'
+  // issue terms, recorded as each region's writes emitted.
+  datapath.finalizeForwards();
   // Scalar results: the returning region's survivor register, stable once its
   // region (and thus `done`) has risen; the cosim samples it at `done`.
   for (const uarch::Result &r : dp.results)

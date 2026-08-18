@@ -274,4 +274,15 @@ void nameValue(Value v, Location loc) {
     nameValue(v, sanitizeCppIdentifier(*name));
 }
 
+bool isNamedValue(Value v) {
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return true; // a block argument is named by its port
+  if (auto reg = dyn_cast<seq::CompRegOp>(op))
+    return reg.getName() && !reg.getName()->empty();
+  if (auto ce = dyn_cast<seq::CompRegClockEnabledOp>(op))
+    return ce.getName() && !ce.getName()->empty();
+  return op->hasAttr("sv.namehint");
+}
+
 } // namespace mlir::allo::uarch
