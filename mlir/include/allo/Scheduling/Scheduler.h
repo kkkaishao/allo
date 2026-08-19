@@ -589,11 +589,17 @@ LogicalResult scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 /// the search under the area objective (an explicit pipeline directive's
 /// ceiling, held no lower than the natural floor); the cycles objective
 /// ignores it, since capping there could forbid a span win at a wider
-/// interval.
+/// interval. \p slackGrant, nonzero, is composition slack the enclosing
+/// kernel proved free of this region (off the sibling DAG's longest path); it
+/// buys INTERVAL room alone under the area objective: intervals the ungranted
+/// leash admits keep their own tight drain bound (extra drain room at a held
+/// interval buys folds the fabric prices as registers), wider ones are
+/// admitted with what the grant leaves. The cycles objective ignores it.
 LogicalResult scheduleCPSAT(ChainingModuloProblem &prob, Operation *lastOp,
                             float cycleTime, unsigned minII, unsigned maxII,
                             const SpanObjective &span,
-                            const SchedulerOptions &opts);
+                            const SchedulerOptions &opts,
+                            int64_t slackGrant = 0);
 
 /// Check, solve, and verify \p problem, minimizing the span \p span charges.
 /// The chaining modulo variant, with a target-II lower bound (from a pipeline
@@ -607,12 +613,13 @@ inline LogicalResult solveSchedulingProblem(ChainingModuloProblem &problem,
                                             unsigned minII,
                                             const SchedulerOptions &opts,
                                             const SpanObjective &span,
-                                            unsigned maxII = 0) {
+                                            unsigned maxII = 0,
+                                            int64_t slackGrant = 0) {
   if (failed(problem.check()))
     return failure();
   if (usesExactScheduler(opts.kind)) {
     if (failed(scheduleCPSAT(problem, anchor, cycleTime, minII, maxII, span,
-                             opts)))
+                             opts, slackGrant)))
       return failure();
   } else if (failed(mlir::allo::scheduleSimplex(problem, anchor, cycleTime,
                                                 opts.regFloor, minII))) {
@@ -623,7 +630,8 @@ inline LogicalResult solveSchedulingProblem(ChainingModuloProblem &problem,
   return success();
 }
 
-/// Acyclic twin of the variant above.
+/// Acyclic twin of the variant above. A slack grant has no interval to buy in
+/// a straight-line region, so none is taken.
 inline LogicalResult solveSchedulingProblem(
     ChainingSharedOperatorsProblem &problem, Operation *anchor, float cycleTime,
     const SchedulerOptions &opts, const SpanObjective &span) {

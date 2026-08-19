@@ -8,6 +8,7 @@
 #include "allo/Support/Logging.h"
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Format.h"
 
@@ -1503,7 +1504,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // What the region is charged, bounded by what the heuristic already reached
   // and below by the floor, which speeds the span proof. Under the area
   // objective the heuristic's drain is the span LEASH instead: a constraint,
-  // not what the first solve minimizes.
+  // not what the first solve minimizes, widened by any composition slack the
+  // kernel's sibling DAG granted this region.
   int64_t heuristicDrain = span.drainOf(prob);
   assert(heuristicDrain <= horizon &&
          "the horizon must cover the schedule the heuristic just found, or "
@@ -2030,7 +2032,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                                         Operation *lastOp, float cycleTime,
                                         unsigned minII, unsigned maxII,
                                         const SpanObjective &span,
-                                        const SchedulerOptions &opts) {
+                                        const SchedulerOptions &opts,
+                                        int64_t slackGrant) {
   SimplexWarmStart warm;
   if (failed(mlir::allo::scheduleSimplex(prob, lastOp, cycleTime, opts.regFloor,
                                          minII, &warm)))
@@ -2128,7 +2131,19 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                   (allocates || !choices.empty() || !span.regs.empty() ||
                    span.device.pulsePrice());
   std::optional<int64_t> leash = areaMode ? heuristicSpan : std::nullopt;
+  // The ungranted leash: an interval it already admits keeps its own tight
+  // drain bound below, so a slack grant buys interval room alone.
+  std::optional<int64_t> tightLeash = leash;
   if (areaMode) {
+    // Composition slack the kernel's sibling DAG proved free widens the
+    // leash: this region may run that much longer without moving the
+    // composed span.
+    if (leash && slackGrant > 0) {
+      *leash += slackGrant;
+      info(Stage::Sched, prob.getContainingOp())
+          << "Area leash widened by " << slackGrant
+          << " cycle(s) of composition slack";
+    }
     // A wider interval can win on area as long as it fits the leash; an
     // explicit pipeline(ii=n) directive caps it at n, never below the natural
     // floor the warm start settled.
@@ -2160,6 +2175,19 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   for (unsigned ii = warm.lowerBoundII; ii <= upperII; ++ii)
     if (!(areaMode && warm.placed && ii == greedyII))
       probes.push_back(ii);
+  // A slack grant can stretch the interval range far past what a full scan
+  // affords; thin it to an even ladder, the greedy's own interval kept first.
+  constexpr unsigned kGrantProbes = 12;
+  if (areaMode && slackGrant > 0 && probes.size() > kGrantProbes) {
+    llvm::SmallSetVector<unsigned, 16> ladder;
+    if (warm.placed)
+      ladder.insert(greedyII);
+    for (unsigned k = 0; k < kGrantProbes; ++k)
+      ladder.insert(warm.lowerBoundII +
+                    static_cast<unsigned>(uint64_t(upperII - warm.lowerBoundII) *
+                                          k / (kGrantProbes - 1)));
+    probes.assign(ladder.begin(), ladder.end());
+  }
 
   for (unsigned ii : probes) {
     // Cut. Cycles order: this interval's span already reaches the incumbent's
@@ -2178,8 +2206,15 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     }
     std::optional<int64_t> drainBound;
     if (areaMode) {
-      if (leash)
+      if (leash) {
         drainBound = *leash - iiWeight * ii;
+        // A grant buys interval room, not drain depth: where the ungranted
+        // leash already admits this interval, its own tight bound stands
+        // (extra drain room at a held interval buys folds the fabric prices
+        // as registers).
+        if (tightLeash && *tightLeash - iiWeight * ii >= floorDrain)
+          drainBound = *tightLeash - iiWeight * ii;
+      }
     } else if (best) {
       drainBound = *best - iiWeight * ii;
     }
@@ -2243,8 +2278,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
       bestChosen = std::move(chosen);
       bestClassUnits = std::move(classUnits);
       adopted = true;
-      if (areaMode && !leash)
-        leash = solved;
+      if (areaMode && !leash) {
+        leash = solved + std::max<int64_t>(slackGrant, 0);
+        tightLeash = solved;
+      }
     }
     if (!bySpan)
       break;
