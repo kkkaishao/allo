@@ -70,6 +70,34 @@ def test_heuristic_ignores_the_objective():
     _run(rtl)
 
 
+def test_freq_objective_sweeps_the_period_and_writes_the_clock_back():
+    # O="freq" probes periods below the requested clock, holds the span within
+    # span_tolerance, and the handle's clock follows the winner; compile then
+    # tightens it once more to the realized critical path.
+    rtl = _to_rtl(_mixed_kernel(), freq_mhz=50.0).set_scheduler_opt(O="freq")
+    result = rtl.schedule()
+    assert result.sweep and result.sweep[0].cycle_ns == pytest.approx(20.0)
+    n0 = result.sweep[0].latency
+    assert rtl.freq_mhz > 50.0
+    fn = result.func("mx")
+    assert fn.latency <= n0 * 1.1
+    est = rtl.estimation  # compiles, which tightens the clock to fmax
+    assert rtl.freq_mhz == pytest.approx(est.fmax)
+    assert est.clock_mhz == pytest.approx(rtl.freq_mhz)
+    _run(rtl)
+
+
+def test_tighten_clock_moves_the_operating_clock_to_the_realized_path():
+    # Any compiled design may be reclocked at its realized critical path
+    # without recompiling; the report's clock follows.
+    rtl = _to_rtl(_mixed_kernel())
+    fmax = rtl.estimation.fmax
+    mhz = rtl.tighten_clock()
+    assert mhz == pytest.approx(fmax) and rtl.freq_mhz == pytest.approx(fmax)
+    assert rtl.estimation.clock_mhz == pytest.approx(mhz)
+    _run(rtl)
+
+
 def test_clock_margin_splits_model_from_operating_period():
     # A margin cuts every chain to (1 - u) * cycle_ns while the design stays
     # clocked at cycle_ns; the QoR reports both periods.

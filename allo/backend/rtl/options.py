@@ -52,7 +52,13 @@ class SchedulerOptions:
             ``"area"`` minimizes area under a span leash, shipping no slower
             than the heuristic schedule, and an explicit ``pipeline(ii=n)``
             then also caps the II at ``n``. The heuristic scheduler solves
-            spans only, so the knob takes effect under ``scheduler="exact"``.
+            spans only, so those two take effect under ``scheduler="exact"``.
+            ``"freq"`` makes the clock an output: candidate periods below the
+            requested one are probed with the heuristic, the tightest whose
+            cycle count stays within ``span_tolerance`` is solved once under
+            this handle's own scheduler settings, and after emission the
+            clock is tightened once more to the realized critical path. The
+            handle's ``freq_mhz`` follows, and cosim runs at it.
         cycle_ns: the operating clock period, derived from the handle's
             ``freq_mhz``, which the cosim clock also reads. Chains are cut to
             it less the ``clock_margin`` withheld.
@@ -61,6 +67,10 @@ class SchedulerOptions:
             to ``(1 - clock_margin) * cycle_ns`` while the design is clocked
             at ``cycle_ns``, so placement and routing surprises the model
             cannot see fit inside the difference.
+        span_tolerance: the cycle-count regression ``O="freq"`` may trade for
+            a faster clock: the period sweep keeps a candidate only while the
+            span stays within ``(1 + span_tolerance)`` of the span at the
+            requested clock. Zero refuses to pay any cycles for frequency.
         budget: what one exact solve may spend, in the solver's deterministic
             time units (roughly a second of one core each).
         workers: how many search workers one exact solve runs. The portfolio is
@@ -76,6 +86,7 @@ class SchedulerOptions:
     O: str = "cycles"
     cycle_ns: float = 5.0
     clock_margin: float = 0.0
+    span_tolerance: float = 0.1
     budget: float = 30.0
     workers: int = 8
     seed: int = 0

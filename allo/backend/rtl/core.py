@@ -32,7 +32,7 @@ from .interface import Interfaces
 from .options import PrepassOptions, SchedulerOptions
 from .qor import QoR, estimate
 from .reports import CompileReport, MicroarchReport, ScheduleResult
-from .schedule import run_schedule
+from .schedule import run_schedule, sweep_freq
 from .sim import shell
 from ...lang.core import ShapedType
 from ...lang.kernel import Kernel
@@ -184,19 +184,53 @@ class RTL(Backend[P, R]):
             # The schedule is reified in place, so it runs on a copy. Operator
             # and device timing is injected into that copy only, keeping the CPU
             # functional path clear of it.
-            self._dcp_ir = ir_ext.clone_module(self.module)
-            inject_operators(self._dcp_ir, self._device)
-            inject_device(self._dcp_ir, self._device)
+            def make_module() -> Module:
+                m = ir_ext.clone_module(self.module)
+                inject_operators(m, self._device)
+                inject_device(m, self._device)
+                return m
+
             # An allocation is only worth deciding where the emitter builds it:
             # the trivial binding keeps one unit per operation.
-            self._schedule_result = run_schedule(
-                self.top,
-                self._dcp_ir,
-                self._sched_opts,
-                self._prepass_opts,
-                allocate=self.binding != "trivial",
-            )
+            allocate = self.binding != "trivial"
+            if self._sched_opts.O == "freq":
+                # The clock is an output: the sweep probes candidate periods
+                # on fresh copies, and the handle follows the winner.
+                self._dcp_ir, self._schedule_result = sweep_freq(
+                    self.top,
+                    make_module,
+                    self._sched_opts,
+                    self._prepass_opts,
+                    allocate,
+                    self._device.reg_delay_ns,
+                )
+                self._set_clock(
+                    self._schedule_result.cycle_ns
+                    / (1.0 - self._sched_opts.clock_margin)
+                )
+            else:
+                self._dcp_ir = make_module()
+                self._schedule_result = run_schedule(
+                    self.top,
+                    self._dcp_ir,
+                    self._sched_opts,
+                    self._prepass_opts,
+                    allocate,
+                )
         return self._schedule_result
+
+    def _set_clock(self, period_ns: float) -> None:
+        """Move the operating clock the design ships at; ``freq_mhz``, the
+        published options and so the QoR's ``clock_mhz`` all follow, and cosim
+        drives the new clock. Nothing is recompiled: the schedule's model
+        period, which the chains were cut to, stays what it was."""
+        self.freq_mhz = 1000.0 / period_ns
+        self._cycle_time = period_ns
+        result = self._schedule_result
+        self._sched_opts = replace(result.compiler.options, cycle_ns=period_ns)
+        self._schedule_result = replace(
+            result, compiler=replace(result.compiler, options=self._sched_opts)
+        )
 
     @property
     def dcp_module(self) -> Module:
@@ -254,6 +288,10 @@ class RTL(Backend[P, R]):
             # The boundary document verbatim, for `scaffold_project` to write.
             self._manifest = envelope["interfaces"]
             self._hw_ir = work
+            # freq mode's last step: collect the packing slack the sweep's
+            # winner left by clocking at the realized critical path.
+            if self._sched_opts.O == "freq":
+                self.tighten_clock()
         return self._hw_ir
 
     @property
@@ -290,6 +328,7 @@ class RTL(Backend[P, R]):
         """The whole compile: schedule, allocation and boundary in one object.
         Emission has run by the time this returns, so every member is present;
         for the schedule alone, call ``schedule()``."""
+        self.compile()  # before schedule() is read: compiling can move the clock
         return CompileReport(self.schedule(), self.microarch, self.interfaces)
 
     @property
@@ -298,6 +337,18 @@ class RTL(Backend[P, R]):
         at against the device it was compiled for. A model, and never a
         substitute for synthesis; see :mod:`allo.backend.rtl.qor`."""
         return estimate(self.report, self._device)
+
+    def tighten_clock(self) -> float:
+        """Clock the compiled design at its realized critical path, recompiling
+        nothing: the emitted structures hold their longest model path (the
+        QoR's ``fmax``) by construction, so the operating clock moves there,
+        with ``clock_margin`` withheld on top of it. Honest in both directions:
+        a design whose paths came in under the target speeds up, one that
+        missed it slows down. Returns the new ``freq_mhz``, which ``cosim``
+        then drives. Runs by itself at compile under ``O="freq"``."""
+        period = 1000.0 / self.estimation.fmax
+        self._set_clock(period / (1.0 - self._sched_opts.clock_margin))
+        return self.freq_mhz
 
     # -- verbs ------------------------------------------------------------
 

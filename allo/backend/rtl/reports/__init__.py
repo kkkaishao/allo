@@ -32,6 +32,7 @@ from .schedule import (
     RegionScheduleCost,
     ScheduledOp,
     ScheduleResult,
+    SweepPoint,
     UnhonoredDirective,
 )
 
@@ -61,5 +62,6 @@ __all__ = [
     "RegionScheduleCost",
     "ScheduledOp",
     "ScheduleResult",
+    "SweepPoint",
     "UnhonoredDirective",
 ]
