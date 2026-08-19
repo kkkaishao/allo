@@ -76,8 +76,9 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
 
 MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
-    MlirStringRef scheduler, double budget, bool allocate, int workers,
-    int seed, MlirStringCallback callback, void *userData) {
+    MlirStringRef scheduler, MlirStringRef objective, double budget,
+    bool allocate, int workers, int seed, MlirStringCallback callback,
+    void *userData) {
   ModuleOp mod = unwrap(module);
   StringRef topName = unwrap(top);
   StringRef schedulerName = unwrap(scheduler);
@@ -90,12 +91,22 @@ MlirLogicalResult alloRunSDCSchedulingPipeline(
         << "'; expected \"heuristic\" or \"exact\"";
     return mlirLogicalResultFailure();
   }
+  StringRef objectiveName = unwrap(objective);
+  std::optional<allo::ScheduleObjective> obj =
+      allo::parseScheduleObjective(objectiveName);
+  if (!obj) {
+    allo::logging::error(allo::logging::Stage::Sched,
+                         allo::logging::Code::UnknownOption, mod)
+        << "Unknown objective '" << objectiveName
+        << "'; expected \"cycles\" or \"area\"";
+    return mlirLogicalResultFailure();
+  }
   // The target clock period, the exact-solve budget and its worker count take
   // the option, else the default, resolved once here so no second copy exists
   // downstream. A seed of zero is itself the default and passes through.
   float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
   allo::SchedulerOptions opts{
-      *kind, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate,
+      *kind, *obj, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate,
       workers > 0 ? workers : allo::kDefaultSolveWorkers, seed};
   // The storage decision, taken once and recorded on every array before any
   // layer below reads it.

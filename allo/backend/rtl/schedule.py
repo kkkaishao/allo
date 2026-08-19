@@ -46,6 +46,11 @@ def run_schedule(
     how many copies of each operator a region builds.
     """
     run_pipeline(module, RTL_PREPARE_PIPELINE)
+    # The model period every period-dependent stage below reads: the operating
+    # clock less the margin withheld. The cosim clock stays the operating one.
+    if not 0.0 <= options.clock_margin < 1.0:
+        raise ValueError(f"clock_margin must lie in [0, 1); got {options.clock_margin}")
+    model_ns = options.cycle_ns * (1.0 - options.clock_margin)
     reassoc = (
         "reassociate-reductions{float-reassoc="
         f"{'true' if prepass.float_reassoc else 'false'}}}"
@@ -65,7 +70,7 @@ def run_schedule(
         f"{reassoc},{rotate},narrow-demanded-bits),drop-trivial-func,"
         f"{part},func.func(hoist-invariant-reads,assign-banks),canonicalize,cse,"
         f"func.func(expand-region-bounds),"
-        f"legalize-arith{{expand-const-arith=true period-ns={options.cycle_ns}}},"
+        f"legalize-arith{{expand-const-arith=true period-ns={model_ns}}},"
         f"canonicalize,cse)"
     )
     run_pipeline(module, pipeline)
@@ -77,8 +82,9 @@ def run_schedule(
         result = run_sdc_scheduling(
             module,
             top,
-            options.cycle_ns,
+            model_ns,
             options.scheduler,
+            options.O,
             options.budget,
             allocate,
             options.workers,

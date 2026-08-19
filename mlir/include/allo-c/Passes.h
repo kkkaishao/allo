@@ -44,16 +44,19 @@ alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
 /// `allo.dcp.*` ops, streaming back through `callback` the schedule report as
 /// JSON: per-func regions with their per-op start times, plus the per-region
 /// and whole-kernel latency. `scheduler` is "heuristic" or "exact" (CP-SAT).
-/// `budget` is what one exact solve may spend, in deterministic time units;
-/// zero or less takes the default. `allocate` lets an exact solve decide how many copies of each
+/// `objective` is the direction an exact solve optimizes toward, "cycles" or
+/// "area"; the heuristic ignores it. `budget` is what one exact solve may
+/// spend, in deterministic time units; zero or less takes the default.
+/// `allocate` lets an exact solve decide how many copies of each
 /// operator a region builds. `workers` (zero or less takes the default) and
 /// `seed` tune the CP-SAT search; changing either makes a compile
 /// non-reproducible. Returns failure (callback not invoked) on any failed
 /// phase.
 MLIR_CAPI_EXPORTED MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
-    MlirStringRef scheduler, double budget, bool allocate, int workers,
-    int seed, MlirStringCallback callback, void *userData);
+    MlirStringRef scheduler, MlirStringRef objective, double budget,
+    bool allocate, int workers, int seed, MlirStringCallback callback,
+    void *userData);
 
 #ifdef __cplusplus
 }

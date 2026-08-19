@@ -466,6 +466,15 @@ inline bool usesExactScheduler(SchedulerKind kind) {
   return kind != SchedulerKind::Heuristic;
 }
 
+/// The direction a solve optimizes toward. Only an exact solve reads it.
+enum class ScheduleObjective {
+  /// Shortest span, with area breaking ties under it.
+  Cycles,
+  /// Smallest area under a span leash: no slower than the heuristic's
+  /// schedule, with span slack reclaimed under the settled area.
+  Area,
+};
+
 /// Defaults for one solve. The budget is in OR-Tools deterministic time units
 /// (roughly a core-second) and is charged per solve, shared by a solve's span
 /// and area passes, so a cyclic search spends it again at every initiation
@@ -482,6 +491,7 @@ inline constexpr int kDefaultSolveSeed = 0;
 /// What the caller asked the scheduler for.
 struct SchedulerOptions {
   SchedulerKind kind = SchedulerKind::Heuristic;
+  ScheduleObjective objective = ScheduleObjective::Cycles;
   double budget = kDefaultSolveBudget;
   /// Whether to decide how many copies of each operator a region builds
   /// (`populateOperatorAllocation`) rather than leave every operation its own.
@@ -503,6 +513,10 @@ struct SchedulerOptions {
 /// \p name ("heuristic" / "exact") as a kind, or nullopt when it names
 /// neither.
 std::optional<SchedulerKind> parseSchedulerKind(StringRef name);
+
+/// \p name ("cycles" / "area") as an objective, or nullopt when it names
+/// neither.
+std::optional<ScheduleObjective> parseScheduleObjective(StringRef name);
 
 /// One region's operator-sharing problem, decided at bind time with the
 /// schedule already fixed: which same-class units to fold onto one instance.
@@ -565,26 +579,34 @@ LogicalResult scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                             const SpanObjective &span,
                             const SchedulerOptions &opts);
 /// Cyclic twin; \p minII lower-bounds the initiation interval, and the search
-/// over intervals is a branch and bound on \p span.
+/// over intervals is a branch and bound on \p span. \p maxII, nonzero, caps
+/// the search under the area objective (an explicit pipeline directive's
+/// ceiling, held no lower than the natural floor); the cycles objective
+/// ignores it, since capping there could forbid a span win at a wider
+/// interval.
 LogicalResult scheduleCPSAT(ChainingModuloProblem &prob, Operation *lastOp,
-                            float cycleTime, unsigned minII,
+                            float cycleTime, unsigned minII, unsigned maxII,
                             const SpanObjective &span,
                             const SchedulerOptions &opts);
 
 /// Check, solve, and verify \p problem, minimizing the span \p span charges.
 /// The chaining modulo variant, with a target-II lower bound (from a pipeline
 /// directive): the achieved II is max(\p minII, the natural minimum). \p minII
-/// == 1 imposes no additional bound. \p opts selects the resource solver; both
-/// paths go through the same `check` and `verify`.
+/// == 1 imposes no additional bound. \p maxII, nonzero, is an explicit
+/// directive's II ceiling, honored by the exact area objective alone. \p opts
+/// selects the resource solver; both paths go through the same `check` and
+/// `verify`.
 inline LogicalResult solveSchedulingProblem(ChainingModuloProblem &problem,
                                             Operation *anchor, float cycleTime,
                                             unsigned minII,
                                             const SchedulerOptions &opts,
-                                            const SpanObjective &span) {
+                                            const SpanObjective &span,
+                                            unsigned maxII = 0) {
   if (failed(problem.check()))
     return failure();
   if (usesExactScheduler(opts.kind)) {
-    if (failed(scheduleCPSAT(problem, anchor, cycleTime, minII, span, opts)))
+    if (failed(scheduleCPSAT(problem, anchor, cycleTime, minII, maxII, span,
+                             opts)))
       return failure();
   } else if (failed(mlir::allo::scheduleSimplex(problem, anchor, cycleTime,
                                                 opts.regFloor, minII))) {

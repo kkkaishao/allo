@@ -270,7 +270,7 @@ private:
   // One region, one solve.
   LogicalResult scheduleCyclic(LoopLikeOpInterface body,
                                const SchedRegion &region, unsigned minII,
-                               bool pipelined);
+                               unsigned maxII, bool pipelined);
   LogicalResult scheduleWhile(scf::WhileOp w, const SchedRegion &region);
   LogicalResult scheduleWhileCondition(scf::WhileOp w);
   LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops, bool ownsRegion);
@@ -664,12 +664,15 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
 
 // Schedule one counted loop body (affine.for or scf.for) as a
 // `ChainingModuloProblem` and annotate the result (start times, II, sub-cycle
-// times). \p minII lower-bounds the II. When \p pipelined is false iterations
-// do not overlap: the II is reported as the body length, so the region latency
-// folds to `trip * depth`, and it still reifies to a dcp.pipeline.
+// times). \p minII lower-bounds the II; \p maxII, nonzero, is an explicit
+// directive's ceiling, honored by the exact area objective alone. When
+// \p pipelined is false iterations do not overlap: the II is reported as the
+// body length, so the region latency folds to `trip * depth`, and it still
+// reifies to a dcp.pipeline.
 LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
                                             const SchedRegion &region,
-                                            unsigned minII, bool pipelined) {
+                                            unsigned minII, unsigned maxII,
+                                            bool pipelined) {
   auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps);
   Block *bodyBlock = &body.getLoopRegions().front()->front();
   populateOperatorTypes(problem, dev.operators, dev.memory);
@@ -699,7 +702,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
                      pipelined ? trip.count : std::nullopt, dev.operators);
   Stopwatch solveStart = now();
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
-                                    span))) {
+                                    span, maxII))) {
     if (relax.edges.empty())
       return failure();
     // The relaxed problem starts its II search lower, which can strand the
@@ -710,7 +713,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
            "store->load forwarding relaxation";
     undoForwardRelaxation(problem, relax);
     if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
-                                      span)))
+                                      span, maxII)))
       return failure();
   }
   std::optional<unsigned> solvedII = problem.getInitiationInterval();
@@ -1125,6 +1128,7 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
     }
     return scheduleCyclic(innermost, region,
                           dir >= 1 ? static_cast<unsigned>(dir) : 1,
+                          /*maxII=*/dir >= 1 ? static_cast<unsigned>(dir) : 0,
                           /*pipelined=*/dir != -1);
   }
   // An uncounted while; counted ones are already scf.for.

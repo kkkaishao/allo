@@ -137,6 +137,10 @@ class QoR:  # pylint: disable=too-many-instance-attributes
     #: substitute for the part's own timing report.
     fmax: float
     fmax_target: float  # MHz, the period the schedule was cut to
+    #: MHz the design is clocked at, absent where the compile options are not
+    #: attached. Sits apart from ``fmax_target`` where a clock margin cut the
+    #: chains short of the operating period, or a derate stretched them past it.
+    clock_mhz: float | None
     #: the paths behind ``fmax``, longest first across every module, each
     #: decomposed into the cells the signal passes through.
     critical_paths: tuple[TimingPath, ...]
@@ -182,6 +186,8 @@ class QoR:  # pylint: disable=too-many-instance-attributes
             f"estimated {self.fmax:.1f} MHz against a {self.fmax_target:.1f} MHz "
             f"target ({period:.2f} ns period)"
         )
+        if self.clock_mhz is not None and abs(self.clock_mhz - self.fmax_target) > 0.5:
+            head += f", clocked at {self.clock_mhz:.1f} MHz"
         return "\n".join(
             [head] + [p.describe("  ") for p in self.critical_paths[:limit]]
         )
@@ -391,6 +397,11 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
         },
         fmax=1000.0 / critical_paths[0].total,
         fmax_target=1000.0 / report.microarch.cycle_time,
+        clock_mhz=(
+            1000.0 / sched.compiler.options.cycle_ns
+            if sched.compiler.options
+            else None
+        ),
         critical_paths=critical_paths,
         area=area,
         by_kind=by_kind,
