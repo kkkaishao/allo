@@ -55,6 +55,12 @@ SatParameters solverParameters(const SchedulerOptions &opts) {
   // stops on depend on thread timing.
   if (opts.workers > 1)
     params.set_interleave_search(true);
+  // Developer probe: the solver's own progress log, for diagnosing where a
+  // budget goes on a model that returns nothing.
+  if (getenv("ALLO_CPSAT_LOG")) {
+    params.set_log_search_progress(true);
+    params.set_log_to_stdout(true);
+  }
   return params;
 }
 
@@ -528,16 +534,24 @@ addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
 ///
 /// Returns the per-operation sub-cycle variables, for constraints stated on
 /// top of the system (`addAllocationHeadroom`).
+///
+/// \p hintSchedule hints every variable created here off the schedule already
+/// on \p prob (an area-first solve completes its hint this way; a partial
+/// hint on a model this size never completes).
 template <class ProblemT>
 DenseMap<Operation *, IntVar>
 addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
                  DenseMap<Operation *, IntVar> &startVars, float cycleTime,
-                 float regFloor, const SelectionVars *sels = nullptr) {
+                 float regFloor, const SelectionVars *sels = nullptr,
+                 bool hintSchedule = false) {
   int64_t period = picos(cycleTime);
   // Nothing in a cycle starts before its operands leave a register, so the
   // fabric floor is every `z`'s lower bound. A chain from a registered producer
   // then costs `max(floor, that producer's outgoing delay)`.
   int64_t floor = picos(regFloor);
+  auto zHint = [&](Operation *op, int64_t hi) {
+    return std::clamp(picos(*prob.getStartTimeInCycle(op)), floor, hi);
+  };
   DenseMap<Operation *, IntVar> inCycle;
   for (Operation *op : prob.getOperations()) {
     if (std::optional<unsigned> i = sels ? sels->of(op) : std::nullopt) {
@@ -552,6 +566,8 @@ addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
           operations_research::Domain(floor, period - *llvm::min_element(ins)));
       model.AddLessOrEqual(z + LinearExpr::WeightedSum(sels->sel[*i], ins),
                            period);
+      if (hintSchedule)
+        model.AddHint(z, zHint(op, period - *llvm::min_element(ins)));
       inCycle.try_emplace(op, z);
       continue;
     }
@@ -559,8 +575,10 @@ addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
     assert(in + floor <= period &&
            "an operator whose own delay exceeds the period cannot reach a "
            "solve: `runSDCScheduler` derates the period to fit every row");
-    inCycle.try_emplace(
-        op, model.NewIntVar(operations_research::Domain(floor, period - in)));
+    IntVar z = model.NewIntVar(operations_research::Domain(floor, period - in));
+    if (hintSchedule)
+      model.AddHint(z, zHint(op, period - in));
+    inCycle.try_emplace(op, z);
   }
 
   for (Operation *op : prob.getOperations())
@@ -582,6 +600,11 @@ addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
       model.AddLessOrEqual(separation, srcLat).OnlyEnforceIf(sameCycle);
       model.AddGreaterOrEqual(separation, srcLat + 1)
           .OnlyEnforceIf(sameCycle.Not());
+      if (hintSchedule)
+        model.AddHint(sameCycle,
+                      static_cast<int64_t>(*prob.getStartTime(op)) -
+                              static_cast<int64_t>(*prob.getStartTime(src)) <=
+                          lat);
       // A multi-cycle producer contributes only its outgoing delay: its last
       // register stage is what the cycle starts from.
       if (si) {
@@ -651,10 +674,13 @@ IntVar drainVariable(CpModelBuilder &model,
                      DenseMap<Operation *, IntVar> &startVars,
                      ArrayRef<DrainTerm> terms, int64_t horizon,
                      std::optional<int64_t> bound,
-                     llvm::function_ref<LinearExpr(Operation *)> latencyOf) {
+                     llvm::function_ref<LinearExpr(Operation *)> latencyOf,
+                     std::optional<int64_t> hint = std::nullopt) {
   assert((!bound || *bound >= 0) && "incumbent cut before building the model");
   IntVar drain = model.NewIntVar(operations_research::Domain(
       0, bound ? std::min(*bound, horizon) : horizon));
+  if (hint)
+    model.AddHint(drain, *hint);
   for (const DrainTerm &term : terms) {
     LinearExpr commit = startVars.at(term.op) + term.offset;
     if (term.plusLatency)
@@ -761,14 +787,16 @@ void addAllocationHeadroom(CpModelBuilder &model, ProblemT &prob,
                            DenseMap<Operation *, IntVar> &startVars,
                            ArrayRef<AllocationVar> allocs, float cycleTime,
                            float regFloor,
-                           DenseMap<Operation *, IntVar> *sharedInCycle) {
+                           DenseMap<Operation *, IntVar> *sharedInCycle,
+                           bool hintSchedule = false) {
   if (llvm::none_of(allocs, [](const AllocationVar &a) {
         return a.headroom.has_value();
       }))
     return;
   DenseMap<Operation *, IntVar> own;
   if (!sharedInCycle) {
-    own = addSubCycleTimes(model, prob, startVars, cycleTime, regFloor);
+    own = addSubCycleTimes(model, prob, startVars, cycleTime, regFloor,
+                           /*sels=*/nullptr, hintSchedule);
     sharedInCycle = &own;
   }
   DenseMap<Operation *, IntVar> &inCycle = *sharedInCycle;
@@ -834,13 +862,25 @@ void addPiecewiseCost(CpModelBuilder &model, IntVar size,
 /// its issue, both read through \p sels / \p latencyOf. A candidate a shared
 /// class prices (\p shared) is skipped here, its cost riding the class's
 /// (members, units) table instead.
+///
+/// \p hintFrom, non-null, hints every variable created here off that problem's
+/// SOLVED schedule, completing the start/allocation/selection hints an
+/// area-first solve carries: a partial hint the solver fails to complete
+/// leaves a heavy model with no incumbent at all.
+///
+/// \p structuralOut, non-null, receives the STRUCTURAL part alone (instances,
+/// their selects, the decided rows; no chains, no pulse): the bootstrap
+/// objective of an area solve, whose piecewise chain terms leave the full
+/// expression's relaxation too weak to search on.
 LinearExpr areaTerms(CpModelBuilder &model, ArrayRef<IntVar> starts,
                      const SpanObjective &span,
                      DenseMap<Operation *, IntVar> &startVars,
                      ArrayRef<AllocationVar> allocs, int64_t ii,
                      int64_t horizon,
                      llvm::function_ref<LinearExpr(Operation *)> latencyOf,
-                     const SelectionVars &sels, const SharedClasses &shared) {
+                     const SelectionVars &sels, const SharedClasses &shared,
+                     OccupancyProblem *hintFrom = nullptr,
+                     LinearExpr *structuralOut = nullptr) {
   SmallVector<IntVar> vars;
   SmallVector<int64_t> weights;
   // At II > 1 the emitter folds every chain onto the region's phase, holding
@@ -866,22 +906,41 @@ LinearExpr areaTerms(CpModelBuilder &model, ArrayRef<IntVar> starts,
       model.AddLessOrEqual(startVars.at(reader) + distance * ii,
                            def + latencyOf(term.def) +
                                LinearExpr::Term(built, fold));
+    if (hintFrom) {
+      int64_t end = static_cast<int64_t>(*hintFrom->getStartTime(term.def)) +
+                    hintFrom->latencyOf(term.def);
+      int64_t depth = 0;
+      for (auto [reader, distance] : term.reads)
+        depth = std::max(
+            depth, static_cast<int64_t>(*hintFrom->getStartTime(reader)) +
+                       distance * ii - end);
+      model.AddHint(built, (depth + fold - 1) / fold);
+    }
     addPiecewiseCost(model, built, table, vars, weights);
   }
-  LinearExpr area = LinearExpr::WeightedSum(vars, weights);
+  LinearExpr structural;
   for (const AllocationVar &alloc : allocs)
-    area += alloc.price;
+    structural += alloc.price;
   for (const SharedClassVar &cls : shared.classes)
-    area += cls.price;
+    structural += cls.price;
   for (auto [i, choice] : llvm::enumerate(sels.choices))
     for (auto [m, cand] : llvm::enumerate(choice.cands))
       if (cand.price && !shared.covered.contains({static_cast<unsigned>(i),
                                                   static_cast<unsigned>(m)}))
-        area += LinearExpr::Term(sels.sel[i][m], cand.price);
+        structural += LinearExpr::Term(sels.sel[i][m], cand.price);
+  LinearExpr area = LinearExpr::WeightedSum(vars, weights) + structural;
+  if (structuralOut)
+    *structuralOut = structural;
   if (int64_t pulse = span.device.pulsePrice(); pulse && !starts.empty()) {
     IntVar deepest = model.NewIntVar(operations_research::Domain(0, horizon));
     for (IntVar start : starts)
       model.AddLessOrEqual(start, deepest);
+    if (hintFrom) {
+      int64_t top = 0;
+      for (Operation *op : hintFrom->getOperations())
+        top = std::max(top, static_cast<int64_t>(*hintFrom->getStartTime(op)));
+      model.AddHint(deepest, top);
+    }
     area += LinearExpr::Term(deepest, pulse);
   }
   return area;
@@ -997,6 +1056,21 @@ void rehintFrom(CpModelBuilder &model, ArrayRef<Operation *> ops,
       model.AddHint(var, SolutionBooleanValue(from, var));
   for (const SharedClassVar &cls : shared.classes)
     model.AddHint(cls.units, SolutionIntegerValue(from, cls.units));
+}
+
+/// Point the model's hints at EVERY variable of \p from, verbatim: the
+/// complete warm start the next solve on the same builder resumes from.
+/// Valid only while the builder has grown no variables since \p from was
+/// solved (added constraints are fine).
+void rehintAll(CpModelBuilder &model, const CpSolverResponse &from) {
+  assert(model.Proto().variables_size() == from.solution_size() &&
+         "a variable added after the solve has no value to hint");
+  auto *hint = model.MutableProto()->mutable_solution_hint();
+  hint->Clear();
+  for (int i = 0; i < from.solution_size(); ++i) {
+    hint->add_vars(i);
+    hint->add_values(from.solution(i));
+  }
 }
 
 /// What \p decided costs the device: every resource, at the price of the count
@@ -1329,7 +1403,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   DenseMap<Operation *, IntVar> inCycle;
   if (!sels.empty())
     inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, opts.regFloor,
-                               &sels);
+                               &sels, areaMode);
 
   // The composition of the two decisions: which row each operation runs on,
   // and how many instances of each row to build, priced together. Only in
@@ -1362,7 +1436,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   for (const AllocationVar &alloc : allocs)
     cumulativeOn(alloc.rsrc, alloc.units);
   addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
-                        opts.regFloor, sels.empty() ? nullptr : &inCycle);
+                        opts.regFloor, sels.empty() ? nullptr : &inCycle,
+                        areaMode);
 
   // What the region is charged, bounded by what the heuristic already reached
   // and below by the floor, which speeds the span proof. Under the area
@@ -1376,8 +1451,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   assert(floorDrain <= heuristicDrain &&
          "the drain floor is a lower bound on every schedule, the heuristic's "
          "included");
-  IntVar drain = drainVariable(model, startVars, span.drain, horizon,
-                               heuristicDrain, latExpr);
+  IntVar drain = drainVariable(
+      model, startVars, span.drain, horizon, heuristicDrain, latExpr,
+      areaMode ? std::optional(heuristicDrain) : std::nullopt);
   model.AddGreaterOrEqual(drain, floorDrain);
   // One unit of area outweighs the whole start-time sum, which settles ties
   // deterministically below it; the same weight puts the drain above the sum
@@ -1399,32 +1475,62 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   };
 
   if (areaMode) {
-    // Area first, under the leash the drain variable's bound states; then the
-    // shortest drain the settled area admits, on what is left of the budget.
+    // Three solves on one model, sharing one budget: the structural bootstrap,
+    // the full area complete-hinted from its whole solution, and the shortest
+    // drain the settled structure admits (see the modulo twin). The
+    // heuristic's schedule completes the bootstrap's hint, so an exhausted
+    // budget ships no worse than its realization.
+    LinearExpr structural;
     LinearExpr area = areaTerms(model, orderedStarts, span, startVars, allocs,
-                                /*ii=*/0, horizon, latExpr, sels, shared);
-    model.Minimize(LinearExpr::Sum(orderedStarts) + area * weight);
-    CpSolverResponse first =
+                                /*ii=*/0, horizon, latExpr, sels, shared,
+                                &prob, &structural);
+    model.Minimize(structural);
+    CpSolverResponse boot =
         SolveWithParameters(model.Build(), solverParameters(opts));
-    if (!solved(first)) {
-      reportUnsolved(prob, first, opts.budget);
+    if (!solved(boot)) {
+      reportUnsolved(prob, boot, opts.budget);
       applyDemandAllocation(prob, /*ii=*/0, cycleTime);
       return success();
     }
-    bool areaProven = first.status() == CpSolverStatus::OPTIMAL;
-    int64_t solvedArea = SolutionIntegerValue(first, area);
-    model.AddLessOrEqual(area, solvedArea);
-    model.Minimize(LinearExpr::Sum(orderedStarts) +
-                   LinearExpr::Term(drain, weight));
-    rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, shared,
-               first);
-    SchedulerOptions rest = opts;
-    rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
-    CpSolverResponse second =
-        SolveWithParameters(model.Build(), solverParameters(rest));
-    assert(second.status() != CpSolverStatus::INFEASIBLE &&
-           "the area solve's schedule satisfies the pinned model");
-    const CpSolverResponse &pick = solved(second) ? second : first;
+    rehintAll(model, boot);
+    model.Minimize(area);
+    SchedulerOptions restArea = opts;
+    restArea.budget = std::max(opts.budget - boot.deterministic_time(), 0.0);
+    CpSolverResponse first =
+        SolveWithParameters(model.Build(), solverParameters(restArea));
+    assert(first.status() != CpSolverStatus::INFEASIBLE &&
+           "the bootstrap's schedule satisfies the same model");
+    bool areaProven = solved(first) && first.status() == CpSolverStatus::OPTIMAL;
+    const CpSolverResponse *pick = solved(first) ? &first : &boot;
+    CpSolverResponse second;
+    if (solved(first)) {
+      int64_t solvedArea = SolutionIntegerValue(first, area);
+      model.AddLessOrEqual(area, solvedArea);
+      // The drain solve keeps the settled STRUCTURE: counts and rows pinned,
+      // only placement floats. Pinning the aggregate alone would let it spend
+      // register-chain savings on extra units, which the model prices as a
+      // wash and the fabric does not.
+      for (const AllocationVar &alloc : allocs)
+        model.AddEquality(alloc.units,
+                          SolutionIntegerValue(first, alloc.units));
+      for (const SmallVector<BoolVar, 2> &row : sels.sel)
+        for (const BoolVar &var : row)
+          model.AddEquality(LinearExpr(var),
+                            SolutionBooleanValue(first, var) ? 1 : 0);
+      for (const SharedClassVar &cls : shared.classes)
+        model.AddEquality(cls.units, SolutionIntegerValue(first, cls.units));
+      model.Minimize(LinearExpr::Sum(orderedStarts) +
+                     LinearExpr::Term(drain, weight));
+      rehintAll(model, first);
+      SchedulerOptions restDrain = restArea;
+      restDrain.budget =
+          std::max(restArea.budget - first.deterministic_time(), 0.0);
+      second = SolveWithParameters(model.Build(), solverParameters(restDrain));
+      assert(second.status() != CpSolverStatus::INFEASIBLE &&
+             "the area solve's schedule satisfies the pinned model");
+      if (solved(second))
+        pick = &second;
+    }
     if (!areaProven)
       warn(Stage::Sched, prob.getContainingOp())
           << "Exact scheduling ran out of budget before proving this region's "
@@ -1438,9 +1544,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     info(Stage::Sched, prob.getContainingOp())
         << "Exact scheduling minimized the region's area under a span leash "
            "of "
-        << heuristicDrain << ": area " << solvedArea << ", drain "
-        << SolutionIntegerValue(pick, drain);
-    return ship(pick);
+        << heuristicDrain << ": area " << SolutionIntegerValue(*pick, area)
+        << ", drain " << SolutionIntegerValue(*pick, drain);
+    return ship(*pick);
   }
 
   // The span solve, skipped where the floor already proves the heuristic's
@@ -1601,7 +1707,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   DenseMap<Operation *, IntVar> inCycle;
   if (!sels.empty())
     inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, opts.regFloor,
-                               &sels);
+                               &sels, areaMode && hint);
   // This model's own view of the collected classes; the copy carries the
   // per-model variables, the collection stays pristine for the writeback.
   SharedClasses shared = sharedMeta;
@@ -1628,6 +1734,12 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     model.AddEquality(startVars.at(op),
                       lap * static_cast<int64_t>(ii) +
                           LinearExpr::WeightedSum(slots, classes));
+    if (areaMode && hint) {
+      unsigned at = *prob.getStartTime(op);
+      for (unsigned p = 0; p < ii; ++p)
+        model.AddHint(slots[p], p == at % ii);
+      model.AddHint(lap, at / ii);
+    }
     slotsOf.try_emplace(op, std::move(slots));
   }
 
@@ -1698,7 +1810,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       model.AddLessOrEqual(usesIn(alloc.rsrc, slot), alloc.units);
   }
   addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
-                        opts.regFloor, sels.empty() ? nullptr : &inCycle);
+                        opts.regFloor, sels.empty() ? nullptr : &inCycle,
+                        areaMode && hint);
 
   // `(trip - 1) * ii` is constant at a fixed II, so minimizing the span here is
   // minimizing the drain; the outer search carries the II term. With no span to
@@ -1706,7 +1819,10 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   std::optional<IntVar> drainVar;
   if (span.trip) {
     drainVar = drainVariable(model, startVars, span.drain, horizon, drainBound,
-                             latExpr);
+                             latExpr,
+                             areaMode && hint
+                                 ? std::optional(span.drainOf(prob))
+                                 : std::nullopt);
     model.AddGreaterOrEqual(*drainVar, floorDrain);
   }
   IntVar primary = drainVar.value_or(orderedStarts[anchorIndex]);
@@ -1714,45 +1830,86 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
 
   if (areaMode) {
     assert(drainVar && "the area order runs only where a span composes");
-    // Area first, the drain already held to the leash-derived bound; then the
-    // shortest drain the settled area admits, on what is left of the budget.
-    // Under \p areaBound, INFEASIBLE means nothing here beats the incumbent.
+    // Three solves on one model, sharing one budget. A STRUCTURAL bootstrap
+    // first (instances, selects and rows, the clean part of the price): the
+    // heuristic's hint completes only at its own interval and carries its own
+    // realization, which a packed schedule degenerates to the ceiling
+    // allocation, while this objective searches well and lands the real
+    // lever. Then the FULL area, complete-hinted from the bootstrap's whole
+    // solution (its chain terms search too poorly to stand alone); then the
+    // shortest drain the settled structure admits.
+    LinearExpr structural;
     LinearExpr area = areaTerms(model, orderedStarts, span, startVars, allocs,
-                                ii, horizon, latExpr, sels, shared);
-    if (areaBound)
-      model.AddLessOrEqual(area, *areaBound);
-    model.Minimize(LinearExpr::Sum(orderedStarts) + area * weight);
-    CpSolverResponse first =
+                                ii, horizon, latExpr, sels, shared,
+                                hint ? &prob : nullptr, &structural);
+    model.Minimize(structural);
+    CpSolverResponse boot =
         SolveWithParameters(model.Build(), solverParameters(opts));
-    if (first.status() == CpSolverStatus::INFEASIBLE)
+    if (boot.status() == CpSolverStatus::INFEASIBLE)
       return ModuloOutcome::Infeasible;
-    if (!solved(first)) {
-      assert(first.status() != CpSolverStatus::MODEL_INVALID &&
+    if (!solved(boot)) {
+      assert(boot.status() != CpSolverStatus::MODEL_INVALID &&
              "the encoding built an ill-formed model");
+      info(Stage::Sched, prob.getContainingOp())
+          << "Area bootstrap at II=" << ii << " found no schedule: status "
+          << CpSolverStatus_Name(boot.status()) << " after "
+          << llvm::format("%.1f", boot.deterministic_time()) << " of "
+          << llvm::format("%g", opts.budget) << " deterministic units";
       return ModuloOutcome::Exhausted;
     }
-    areaProven = first.status() == CpSolverStatus::OPTIMAL;
-    int64_t solvedArea = SolutionIntegerValue(first, area);
-    model.AddLessOrEqual(area, solvedArea);
-    model.Minimize(LinearExpr::Sum(orderedStarts) +
-                   LinearExpr::Term(*drainVar, weight));
-    rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, shared,
-               first);
-    SchedulerOptions rest = opts;
-    rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
-    CpSolverResponse second =
-        SolveWithParameters(model.Build(), solverParameters(rest));
-    assert(second.status() != CpSolverStatus::INFEASIBLE &&
-           "the area solve's schedule satisfies the pinned model");
-    spanProven = second.status() == CpSolverStatus::OPTIMAL;
-    const CpSolverResponse &pick = solved(second) ? second : first;
+    // The full-area solve. INFEASIBLE under \p areaBound means nothing here
+    // beats the incumbent. A run out of budget ships the bootstrap, whose
+    // chain terms hold feasible but unminimized values (nothing priced them),
+    // so the area recorded for it overstates.
+    rehintAll(model, boot);
+    if (areaBound)
+      model.AddLessOrEqual(area, *areaBound);
+    model.Minimize(area);
+    SchedulerOptions restArea = opts;
+    restArea.budget = std::max(opts.budget - boot.deterministic_time(), 0.0);
+    CpSolverResponse first =
+        SolveWithParameters(model.Build(), solverParameters(restArea));
+    if (first.status() == CpSolverStatus::INFEASIBLE)
+      return ModuloOutcome::Infeasible;
+    areaProven = solved(first) && first.status() == CpSolverStatus::OPTIMAL;
+    const CpSolverResponse *pick = solved(first) ? &first : &boot;
+    CpSolverResponse second;
+    if (solved(first)) {
+      int64_t solvedArea = SolutionIntegerValue(first, area);
+      model.AddLessOrEqual(area, solvedArea);
+      // The drain solve keeps the settled STRUCTURE: counts and rows pinned,
+      // only placement floats. Pinning the aggregate alone would let it spend
+      // register-chain savings on extra units, which the model prices as a
+      // wash and the fabric does not.
+      for (const AllocationVar &alloc : allocs)
+        model.AddEquality(alloc.units,
+                          SolutionIntegerValue(first, alloc.units));
+      for (const SmallVector<BoolVar, 2> &row : sels.sel)
+        for (const BoolVar &var : row)
+          model.AddEquality(LinearExpr(var),
+                            SolutionBooleanValue(first, var) ? 1 : 0);
+      for (const SharedClassVar &cls : shared.classes)
+        model.AddEquality(cls.units, SolutionIntegerValue(first, cls.units));
+      model.Minimize(LinearExpr::Sum(orderedStarts) +
+                     LinearExpr::Term(*drainVar, weight));
+      rehintAll(model, first);
+      SchedulerOptions restDrain = restArea;
+      restDrain.budget =
+          std::max(restArea.budget - first.deterministic_time(), 0.0);
+      second = SolveWithParameters(model.Build(), solverParameters(restDrain));
+      assert(second.status() != CpSolverStatus::INFEASIBLE &&
+             "the area solve's schedule satisfies the pinned model");
+      spanProven = second.status() == CpSolverStatus::OPTIMAL;
+      if (solved(second))
+        pick = &second;
+    }
     for (Operation *op : ops)
-      starts[op] = SolutionIntegerValue(pick, startVars.at(op));
-    decided = readAllocation(pick, allocs);
-    chosen = readSelection(pick, sels);
-    classUnits = readSharedUnits(pick, shared);
-    drain = SolutionIntegerValue(pick, *drainVar);
-    modelArea = SolutionIntegerValue(pick, area);
+      starts[op] = SolutionIntegerValue(*pick, startVars.at(op));
+    decided = readAllocation(*pick, allocs);
+    chosen = readSelection(*pick, sels);
+    classUnits = readSharedUnits(*pick, shared);
+    drain = SolutionIntegerValue(*pick, *drainVar);
+    modelArea = SolutionIntegerValue(*pick, area);
     return ModuloOutcome::Scheduled;
   }
 
@@ -1929,16 +2086,28 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   bool adopted = false;
   std::optional<unsigned> exhaustedAt;
 
-  for (unsigned ii = warm.lowerBoundII; ii <= upperII; ++ii) {
+  // The intervals to probe. Cycles order: ascending, the cut below breaking
+  // the scan. Area order: the greedy's own interval FIRST, since it is the one
+  // interval the heuristic's schedule can hint and the incumbent it yields
+  // bounds every other probe; then the rest ascending.
+  SmallVector<unsigned> probes;
+  if (areaMode && warm.placed)
+    probes.push_back(greedyII);
+  for (unsigned ii = warm.lowerBoundII; ii <= upperII; ++ii)
+    if (!(areaMode && warm.placed && ii == greedyII))
+      probes.push_back(ii);
+
+  for (unsigned ii : probes) {
     // Cut. Cycles order: this interval's span already reaches the incumbent's
     // before a single operation is placed, and every later interval is worse;
     // where an allocation or a realization is decided, admit a tie since it
-    // can still win on area. Area order: the leash is the only span cut, and
-    // the whole range under it is scanned since area is not monotone in the
-    // interval.
+    // can still win on area. Area order: the leash is the only span cut,
+    // `continue` rather than `break` since the probe order is not monotone,
+    // and the whole range under the leash is scanned since area is not
+    // monotone in the interval.
     if (areaMode) {
       if (leash && iiWeight * ii + floorDrain > *leash)
-        break;
+        continue;
     } else if (best && iiWeight * ii + floorDrain >=
                            *best + ((allocates || !choices.empty()) ? 1 : 0)) {
       break;
