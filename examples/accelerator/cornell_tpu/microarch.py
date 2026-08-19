@@ -149,12 +149,22 @@ def mxu(bram: f32[BRAM_SIZE], w_addr: i32, x_addr: i32, z_addr: i32):
 
 
 # --- Top: fetch-decode-dispatch -------------------------------------------- #
+from .isa import bram
+@tpu.unit(extends=bram)
+def bram_controller():
+    bram_hw = ...
+    def crossbar(...):
+        pass
+    crossbar(bram_hw) # define crossbar logic here
+    pass
+
+
 @tpu.entry
 def cornell_tpu(dmem: f32[DRAM_SIZE], imem: i32[IMEM_SIZE], n_instr: i32):
     """The accelerator. ``bram``/``vreg`` are on-chip; the loop fetches each
     4-word instruction from ``imem``, decodes the opcode, and dispatches to the
     matching unit."""
-    bram: f32[BRAM_SIZE]
+    bram: f32[BRAM_SIZE] = bram
     vreg: f32[VEC_REGS, VEC_LANES]
     for pc in arange(n_instr, name="pc"):
         base: i32 = pc * IWIDTH
