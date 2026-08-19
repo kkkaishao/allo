@@ -469,6 +469,10 @@ class InstructionSpec:
         # Domains declared for *access* params, which turns them from solved into
         # chosen. Only a mover's residence params qualify — see `_check_schedule`.
         self.schedule_residence: dict = {}
+        # Declared by `ISA.configures`: this instruction *assigns configuration* —
+        # it sets machine state a later instruction runs under, rather than running
+        # a kernel of its own. Its emitted fields join into the epoch it precedes.
+        self.configures = False
         self.doc = None  # the defining function's docstring (carried onto Instruction)
 
     @property
@@ -522,15 +526,31 @@ class InstructionSpec:
         product yields one empty assignment, so a predicate with no domains at all is
         still evaluated — it then simply restricts which *shapes* are acceptable."""
         domains = free | self.schedule_domains
-        out = []
-        for combo in itertools.product(*domains.values()):
-            chosen = dict(zip(domains, combo))
-            if self.schedule_fn is not None and not self._over_params(
-                self.schedule_fn, shape_params, "schedule", chosen
-            ):
-                continue
-            out.append((chosen, self.cost_of(shape_params, chosen)))
-        return out
+        return [
+            (chosen, self.cost_of(shape_params, chosen))
+            for combo in itertools.product(*domains.values())
+            if self.admits(shape_params, chosen := dict(zip(domains, combo)), free)
+        ]
+
+    def admits(self, shape_params: dict, chosen: dict, free: dict = {}) -> bool:
+        """**Check mode**: does this instruction admit the *given* configuration?
+
+        The same domains and the same ``@I.schedule`` predicate that
+        ``configurations`` enumerates, applied to one assignment instead of all of
+        them: ``chosen`` must bind exactly the declared params, each value must lie
+        in its domain, and the predicate must hold. ``configure`` chooses (argmin
+        over the enumeration, which filters through this very method); a checker
+        checks (this method on a configuration read off the wire). One constraint
+        object, two entries — which is what makes verifying an externally supplied
+        program the same machinery as compiling one."""
+        domains = free | self.schedule_domains
+        if set(chosen) != set(domains):
+            return False
+        if any(chosen[n] not in domain for n, domain in domains.items()):
+            return False
+        return self.schedule_fn is None or bool(
+            self._over_params(self.schedule_fn, shape_params, "schedule", chosen)
+        )
 
     def configure(
         self, shape_params: dict, free: dict = {}
@@ -683,6 +703,57 @@ class Instruction(Generic[P, R]):
         return f"Instruction<{self.name}>"
 
 
+# ==========================================================================#
+# What an ``@I.expand`` body names: values and offsets into them, not addresses
+# ==========================================================================#
+
+
+@dataclass(eq=False)
+class Tile:
+    """A value an expansion *invents*: staging the lowering needs and the source
+    program never mentions.
+
+    It carries a shape and nothing else — where it lives is the allocator's
+    answer. That is the whole point of naming one: an expansion used to run after
+    allocation, so it had to pick its own addresses, which meant reserving a
+    corner of a buffer by hand and trusting that nothing else reached it.
+
+    Identity, not value, distinguishes two tiles (``eq=False``): two tiles of the
+    same shape are two different values, and merging them would silently share a
+    slot."""
+
+    shape: tuple
+
+
+@dataclass(frozen=True)
+class Ref:
+    """An address an expansion body names: a value, plus an element offset into it.
+
+    The body computes offsets **within** a value (``ifm + n * image``) and the
+    allocator supplies that value's base, which is what lets one body text work
+    against locations rather than hand-picked addresses. ``value`` is either a
+    ``Tile`` the body made or the planner's own location for one of the expanding
+    instruction's operands."""
+
+    value: object
+    offset: int = 0
+
+    def __add__(self, n: int) -> "Ref":
+        return Ref(self.value, self.offset + n)
+
+    __radd__ = __add__
+
+
+def scratch(shape) -> Ref:
+    """A fresh staging tile for an ``@I.expand`` body — ``shape`` in elements.
+
+    Its buffer and address are decided by the instructions that use it: the buffer
+    from where they read and write it, the residence from what their access
+    patterns describe, and the address by ordinary allocation over its live
+    range."""
+    return Ref(Tile(tuple(_as_list(shape))))
+
+
 def _as_list(x):
     return list(x) if isinstance(x, (list, tuple)) else [x]
 
@@ -699,6 +770,11 @@ class ISA:
         self.kernels: list[Kernel] = []  # every @unit / @entry kernel
         self.top: Kernel | None = None  # the unique @entry kernel
         self.latencies: dict[str, UnitLatency] = {}  # unit name -> (ii, depth)
+        # The interconnect (ISA.network): R as a predicate over σ's spatial axis,
+        # and the instruction that combines partial sums across instances. Both
+        # ``None`` = undeclared, which is what every operation ISA is.
+        self.reaches = None
+        self.reduces = None
 
     # --- memory hierarchy declarations ---
     def buffer(self, name, extents, dtype: DType, *, slot=(), is_global=False):
@@ -783,6 +859,81 @@ class ISA:
         spec.unit = unit
         spec.unit_latency = self._unit_latency(unit)
         spec.trips = trips
+
+    def network(self, *, reaches=None, reduces: Instruction | None = None) -> None:
+        """Declare the interconnect between spatial instances — the machine half of
+        constraints 4 and 7, which have had no declaration to check against.
+
+        ``reaches(producer_pe, consumer_pe) -> bool`` is **R**: whether a value one
+        instance writes can be read by another. The arguments are σ's own spatial
+        names (``"mac#0"``), so the relation is stated where σ states position and
+        nowhere else. Undeclared, R is total — precisely the operation-ISA case,
+        where every producer and consumer meet in a shared memory and R drops out
+        of the model. ``CompiledProgram.check`` then quantifies every RAW pair over
+        it without the caller having to remember.
+
+        ``reduces`` names the instruction that **combines partial sums across
+        instances** — a reducing network (BIRRD's), which in this vocabulary is not
+        a flag but an instruction: it reads a partial and the accumulator and writes
+        their sum, so it is an ordinary compute instruction with an ordinary compute
+        region, and the functional oracle executes it like any other. That is the
+        difference between declaring a network and asserting one. An imported
+        mapping may fan a reduction rank across instances exactly when this exists
+        (``mapping.Mapping.check`` refuses it otherwise), and the drain of each
+        instance's partial is issued with it instead of a copy."""
+        if reduces is not None:
+            spec = reduces.spec
+            if spec not in self.instructions:
+                raise AcceleratorDescriptionError(
+                    f"ISA '{self.name}': '{spec.name}' is not an instruction of this "
+                    f"ISA"
+                )
+            if len(spec.sources) != 2 or len(spec.destinations) != 1:
+                raise AcceleratorDescriptionError(
+                    f"{spec.name}: a reducing transfer reads the partial and the "
+                    f"accumulator and writes their combination — two sources and one "
+                    f"destination, not {len(spec.sources)} and "
+                    f"{len(spec.destinations)}"
+                )
+            self.reduces = reduces
+        if reaches is not None:
+            self.reaches = reaches
+
+    def configures(self, instruction: Instruction) -> None:
+        """Declare that ``instruction`` **assigns configuration rather than running a
+        kernel** — MINISA's ``Set*VNLayout`` before an ``ExecuteMapping``.
+
+        This is the machine-side declaration that gives a class its *epoch
+        granularity* (v2 §3.2). An epoch is a segment ending at the instruction that
+        runs the kernel, under the configuration folded from every update before it;
+        every machine compiled here so far sits at the operation end, where each
+        instruction's own assignment is already total, nothing is installed, and an
+        epoch is one instruction.
+
+        Declaring an instruction as configuring says it writes configuration
+        **registers**: what it assigns is *installed*, and every later epoch runs
+        under it until some instruction assigns the same field again. Two
+        consequences worth stating, because both are what a machine actually does
+        and neither was expressible while an epoch's configuration was a ⊔ of its
+        own instructions: **one setter configures many runs** (MINISA installs a
+        layer's layouts once and then issues a run of ``ExecuteMapping``s), and
+        **reconfiguring is legal** (writing the same field again is a layer
+        boundary, where a join would have called it a contradiction).
+
+        The setter still joins the segment it precedes, so σ places the pair
+        together and its own write is one event at one point in the stream — the
+        effect persists, the event does not repeat.
+
+        The declaration is about *meaning*, not cost: a configuring instruction's
+        own issue time is not modelled separately, because it is part of the epoch
+        it configures. A machine whose configuration write costs cycles states that
+        in the executing unit's ``ii``."""
+        spec = instruction.spec
+        if spec not in self.instructions:
+            raise AcceleratorDescriptionError(
+                f"ISA '{self.name}': '{spec.name}' is not an instruction of this ISA"
+            )
+        spec.configures = True
 
     def latency(self, unit: Kernel, *, ii: int, depth: int) -> None:
         """Declare ``unit``'s issue interval and pipeline depth, in cycles. An
@@ -943,12 +1094,15 @@ class ISA:
 
         return build_catalog(self)
 
-    def compile_program(self, source: str):
+    def compile_program(self, source: str, mapping_for=None):
         """Compile a source program (a TOSA-dialect MLIR module given as *text*)
-        onto this ISA, returning a runnable ``CompiledProgram``."""
+        onto this ISA, returning a runnable ``CompiledProgram``.
+
+        ``mapping_for`` reads back an externally chosen tiling for a source op; see
+        ``search.compile_program``."""
         from .search import compile_program
 
-        return compile_program(source, self)
+        return compile_program(source, self, mapping_for)
 
 
 def arity(fn) -> int:

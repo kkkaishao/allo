@@ -66,7 +66,7 @@ module-level name so it can be called bare inside an ``@npu.oracle`` body.
 
 from allo.exp.dsa import primitive
 from allo.exp.dsa.access import contiguous, view
-from allo.exp.dsa.core import ISA
+from allo.exp.dsa.core import ISA, scratch
 from allo.lang.core import f32
 
 npu = ISA("MiniNPU")
@@ -354,16 +354,10 @@ def vmatpop(I):
 # three-step MXU sequence; at M > 1 `vmatpush`'s fixed 1-row shape does not fit and
 # only the layer does.
 #
-# CAVEAT (shared with any `@expand`): the expansion runs *after* allocation, so the
-# registers it stages through are not values the allocator knows about. It reserves
-# the top two of the 32 vector registers and queue slot 0 by convention; best-fit
-# allocates from slot 0 upward, so they are the last to be taken, but a program under
-# heavy enough register pressure could still collide. Reserving expansion scratch
-# properly is a planner change, not a modeling one.
-
-VR_STAGE_X = VEC_REGS - 2  # activation row staged by the expansion
-VR_STAGE_Z = VEC_REGS - 1  # result row staged by the expansion
-Q_STAGE = 0  # MXU result-queue slot the expansion pops from
+# The registers it stages through are `scratch` tiles: ordinary values, allocated and
+# kept live over the run like anything else. (They used to be hand-reserved register
+# numbers, because an expansion ran *after* allocation and so had to pick its own —
+# a convention that a program under enough register pressure could collide with.)
 
 
 @npu.instruction(src=[vmem, vmem], dst=vmem, cost=lambda M: 1 + 4 * M)
@@ -389,13 +383,17 @@ def matmul_layer(I):
 
     @I.expand
     def _(x, w, z, M):
-        # `M` is the Stage-2-solved row count and `x`/`w`/`z` are the allocator's
-        # concrete VMEM offsets, so every address below is plain arithmetic. That the
-        # weight load is hoisted out of the row loop is not encoded anywhere -- this
-        # loop *is* its definition.
+        # `M` is the Stage-2-solved row count; `x`/`w`/`z` are the layer's operands as
+        # values, so `x + m * MXU_DIM` is an offset *into* `x` and the allocator
+        # supplies its base. The three staging slots are `scratch` tiles -- one vector
+        # register each way and one queue slot -- allocated and kept live across the
+        # loop like any other value, where they used to be hand-picked register
+        # numbers. That the weight load is hoisted out of the row loop is not encoded
+        # anywhere -- this loop *is* its definition.
+        xr, zr, q = (scratch((1, 1, MXU_DIM)) for _ in range(3))
         vmatload(s=w)
         for m in range(M):
-            vld(d=VR_STAGE_X, s=x + m * MXU_DIM)
-            vmatpush(x=VR_STAGE_X, q=Q_STAGE)
-            vmatpop(d=VR_STAGE_Z, q=Q_STAGE)
-            vst(s=VR_STAGE_Z, d=z + m * MXU_DIM)
+            vld(d=xr, s=x + m * MXU_DIM)
+            vmatpush(x=xr, q=q)
+            vmatpop(d=zr, q=q)
+            vst(s=zr, d=z + m * MXU_DIM)

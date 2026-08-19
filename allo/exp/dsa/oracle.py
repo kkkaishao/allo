@@ -81,6 +81,11 @@ def _runner_utils() -> list[str]:
 
 @dataclass
 class EmitRecord:
+    """One serialized instruction. In a *compiled* stream this is one epoch's
+    total configuration on the wire — ``epoch.Epoch`` is its denotational
+    reading; an ``@oracle`` stream is hand-written and makes no such promise
+    (it may omit schedule fields, which the simulator ignores anyway)."""
+
     name: str  # instruction mnemonic
     addr: list  # address-param values (static ints)
     compute: list  # computational attributes (α): the instruction's immediates

@@ -20,6 +20,13 @@ then run, top to bottom in compilation order:
 - ``plan`` (Stage 3) — liveness-driven slot allocation + data movement (routing
   and spilling), producing a ``CompiledProgram`` (a placed program + I/O map).
 
+Denotationally (``drafts/schedule-isa-summary.md`` v2 §3): each emitted
+instruction is one **epoch** — a total configuration for the machine's kernel —
+and the emit stream is the program's ∘-composition; ``epoch.py`` materializes
+that reading (``CompiledProgram.epochs``). Stage 2b is then the inter-epoch
+interface condition, and the movers Stage 3 inserts are the delta encoding of
+the time-varying λ.
+
 The public entry is ``ISA.compile_program(source)`` (sugar over ``compile_program``
 here); the returned ``CompiledProgram`` is callable — ``prog(*inputs)`` runs it on
 the functional simulator (the same oracle backbone hand-written assembly uses) — and
@@ -44,7 +51,9 @@ from . import primitive
 from .core import (
     ISA,
     Instruction,
+    Ref,
     ScalarProxy,
+    Tile,
     _index_params,
     access_map,
     access_names,
@@ -294,6 +303,13 @@ class Match:
     # Schedule param -> chosen value: the configuration Stage 1 picked for this site
     # (``InstructionSpec.configure``). Empty unless the ISA declared @I.schedule.
     schedule: dict = field(default_factory=dict)
+    # ``(mapping.Mapping, mapping.Binding)`` when this site is lowered by an imported
+    # mapping rather than performed by one instruction. Such a site is a **tile run**:
+    # its bound values are the source op's own tensors (not the instruction's
+    # operands), its instruction is the one the binding names, and its shapes come
+    # from the mapping's innermost factors — so neither Stage 2 nor Stage 2b applies
+    # to it and ``plan`` lowers it through ``mapping.lower_site``.
+    mapping: tuple | None = None
 
     @property
     def bound_values(self) -> list:
@@ -513,6 +529,7 @@ class _Choice:
     shape_params: dict | None  # solved sizes, or None if the shapes do not fit
     alpha: dict  # compute params bound from the source's constants
     schedule: dict = field(default_factory=dict)  # chosen schedule params
+    mapping: tuple | None = None  # an imported lowering for this site
 
 
 def _pattern_has(node, kind) -> bool:
@@ -564,7 +581,7 @@ def _no_match_error(op, catalog) -> str:
     return "\n".join(lines)
 
 
-def match_program(catalog: Catalog, source_module) -> Selection:
+def match_program(catalog: Catalog, source_module, mapping_for=None) -> Selection:
     """Cover the source compute DAG with instruction patterns via cost-aware
     tree-DP. A value used more than once is a forced cut point (it cannot be
     folded into a consumer's tile), so the foldable subgraphs are trees and a
@@ -574,7 +591,13 @@ def match_program(catalog: Catalog, source_module) -> Selection:
     plus the materialization cost of its operands — but only *single-use* operands
     are charged, because a shared (multi-use) operand is materialized once as its
     own root and must not be billed to every consumer. The optimum is reconstructed
-    from the returned values and scheduled in def-before-use order."""
+    from the returned values and scheduled in def-before-use order.
+
+    ``mapping_for(op)`` — when given — returns ``(Mapping, Binding)`` for a source op
+    that an external mapper has already tiled, or ``None``. A mapped op is not
+    matched: the binding names the instruction and the mapping says what run of it
+    the site becomes, so the site is decided before the DP sees it. It is consulted
+    once per recognized op, because a driver of it may be a whole mapper run."""
     func, block = _entry_block(source_module)
     ops = list(block.operations)
     terminator = ops[-1]
@@ -596,12 +619,42 @@ def match_program(catalog: Catalog, source_module) -> Selection:
             cv = _canon(v)
             use[cv] = use.get(cv, 0) + 1
 
+    # Asked once per recognized op, before any matching: a driver may run a whole
+    # external mapper, and `materialize` is not the place to do that repeatedly.
+    mapped: dict = {}  # the op's result value -> (Mapping, Binding)
+    for value, op in def_op.items():
+        got = mapping_for(op) if mapping_for is not None else None
+        if got is not None:
+            mapped[value] = got
+
     memo: dict = {}  # canonical value -> _Choice (optimal tile to materialize it)
 
     def materialize(v) -> _Choice:
         if v in memo:
             return memo[v]
         op = def_op[v]
+        if v in mapped:
+            # The site is already decided, so there is nothing to choose and nothing
+            # to fit: the binding names the instruction and the mapping says which
+            # run of it this op becomes. The cost is the operands' — the run's own
+            # price is not a DP quantity here, since a mapped site has no alternative
+            # to be weighed against and a consumer pays the same for every candidate.
+            _m, binding = mapped[v]
+            operands = _source_ins(op)
+            memo[v] = _Choice(
+                sum(
+                    materialize(_canon(ov)).cost
+                    for ov in operands
+                    if _canon(ov) in def_op and use.get(_canon(ov), 0) == 1
+                ),
+                catalog.isa._ops[binding.compute],
+                operands,
+                {},
+                {},
+                {},
+                mapped[v],
+            )
+            return memo[v]
         fitting = None  # cheapest candidate that also *fits* the source shapes
         fallback = None  # first structural match that does not fit (error reporting)
         unconfigurable: list = []  # fitting matches with no legal @schedule assignment
@@ -611,8 +664,15 @@ def match_program(catalog: Catalog, source_module) -> Selection:
                 continue
             # Deferred cut-point test: a folded (non-root) value must be used only
             # within this tile; if its global use count exceeds its within-tile use
-            # count it escapes and must be its own root, so this fold is invalid.
-            if any(use.get(iv, 0) != within.get(iv, 0) for iv in interior if iv != v):
+            # count it escapes and must be its own root, so this fold is invalid. A
+            # *mapped* value is a forced cut point for the same reason a shared one
+            # is — folding it away would discard the lowering that was imported for
+            # it — so it never becomes another tile's interior.
+            if any(
+                use.get(iv, 0) != within.get(iv, 0) or iv in mapped
+                for iv in interior
+                if iv != v
+            ):
                 continue
             n_src = len(instr.spec.sources)
             if not all(i in bindings for i in range(n_src)):
@@ -670,7 +730,13 @@ def match_program(catalog: Catalog, source_module) -> Selection:
         ch = materialize(v)
         matches.append(
             Match(
-                ch.instruction, ch.operands, v, ch.shape_params, ch.alpha, ch.schedule
+                ch.instruction,
+                ch.operands,
+                v,
+                ch.shape_params,
+                ch.alpha,
+                ch.schedule,
+                ch.mapping,
             )
         )
         for ov in ch.operands:
@@ -698,6 +764,10 @@ def match_program(catalog: Catalog, source_module) -> Selection:
 
 
 def _shape(value) -> tuple:
+    # A `Tile` is a value the lowering invented (an expansion's staging), so it
+    # carries its shape directly rather than through an IR type.
+    if isinstance(value, Tile):
+        return value.shape
     return tuple(ir.RankedTensorType(value.type).shape)
 
 
@@ -910,40 +980,100 @@ def _site_map(m: Match, pattern) -> tuple | None:
     return residence(mapping)
 
 
+def _group_residence(isa, moves, key, group) -> tuple | None:
+    """The residence one ``(value, buffer)`` group adopts, or ``None`` while every
+    access of it is still parametric.
+
+    A value has one residence in one buffer, so this is a decision *about the group*
+    rather than about any one access — the first thing in this frontend that is. Two
+    cases, and only the second is a choice:
+
+    - **The access that writes the value is concrete.** Then the value is packed where
+      its producer packs it, and that is the residence. Adopting anything else could
+      only add repacks, never remove one: a reader wanting some other map needs the
+      relayout either way, and readers wanting the same one share it.
+    - **Otherwise the compiler is choosing the packing**, and it takes the concrete map
+      its readers describe that leaves the cheapest repacks between them — priced on the
+      movement graph, the same one ``plan`` will route over. Ties keep source order, so
+      a machine that prices no movement is left with the first-concrete-wins rule this
+      generalizes.
+
+    Costing distinct maps (rather than accesses) is what makes it agree with what
+    ``plan`` will actually do: two readers wanting the same packing are served by one
+    relayout, because routing reuses the state it repacked into."""
+    maps = [(_site_map(m, p), write) for m, p, write in group]
+    writer = next((r for r, write in maps if write and r is not None), None)
+    if writer is not None:
+        return writer
+    wanted = list(dict.fromkeys(r for r, _write in maps if r is not None))
+    if len(wanted) < 2:
+        return wanted[0] if wanted else None
+    buf = key[1]
+    edges = _move_edges(isa, moves, prod(_static_shape(key[0])))
+
+    def repacking(target) -> float:
+        _order, _prev, dist = _explore(edges, [(buf, target)])
+        return sum(dist.get((buf, m), inf) for m in wanted if m != target)
+
+    return min(wanted, key=repacking)
+
+
 def solve_layouts(isa, selection: Selection) -> Selection:
     """Stage 2b — solve the access params that describe **residence**: strides, and
     the dimension ordering of a ``layout``.
 
     Neither shows up in a visible shape, so Stage 2 cannot see them. What pins them is
     the residence its neighbours describe: accesses are grouped per ``(value, buffer)``
-    and a parametric one adopts the map a concrete one in its group states, which is a
-    unification of index maps on the SSA edge rather than a vote among enum labels —
-    the whole difference between solving an ordering and picking one. Program I/O and
-    the constant pool seed their groups with the host ABI.
+    and a parametric one adopts the map its group settles on, which is a unification of
+    index maps on the SSA edge rather than a vote among enum labels — the whole
+    difference between solving an ordering and picking one. Program I/O and the constant
+    pool seed their groups with the host ABI.
+
+    What the unification *is*, denotationally: the **inter-epoch interface
+    condition** (``epoch.py``). Epochs compose with ∘ only if a value one epoch
+    leaves behind is found by the next under the same map — "a value has one
+    residence, and every access of it must describe the same map" is that condition
+    stated per value. Where two epochs cannot agree on a map, the condition is met
+    by ``plan`` inserting a mover between them: an explicit λ-update, not an
+    exception to the rule.
+
+    The group, not the access, is the unit of decision (``_group_residence``): where the
+    producer's own access is concrete it dictates the packing, and where it is not the
+    compiler is genuinely choosing one, so it takes the reader map that leaves the
+    cheapest repacks. This is the one place a decision here ranges over more than one
+    instruction, and the only place this stage consults ``plan``'s movement graph.
 
     This stage **solves; it does not check.** Two accesses of one value may still
     disagree afterwards, and whether that is compilable depends on the machine having a
     mover that repacks between them — which only ``plan`` knows, so ``plan`` decides
-    (and inserts the relayout). Adopting the *first* concrete map is what keeps a
-    parametric access from ever needing one: matches are in source order, so that map
-    is the producer's.
+    (and inserts the relayout).
 
     A group with no concrete map at all is free, and takes the dense row-major packing
-    — the host's — because a cost model with no memory model prices every ordering the
-    same, so anything else would be a coin flip dressed up as a choice.
+    — the host's — because with nothing to repack towards there is nothing to price.
 
     None of this reaches a **mover**: the planner is what inserts one, so it takes part
     in no unification. A mover's own residence params are chosen instead, by the router,
-    one assignment per movement-graph edge — see ``_order_assignments``."""
+    one assignment per movement-graph edge — see ``_order_assignments``.
+
+    Nor a **mapped site**: its accesses are tile accesses inside a run, described by
+    the mapping rather than by a bound source value, and the residence its level-0
+    tiles have is whatever this stage settled for the surrounding program — which is
+    the sense in which a mapping enters at an SSA edge like any other lowering."""
     io = _io_buffer(isa)
     block = selection.func.regions[0].blocks[0]
 
-    sites: dict = {}  # (value, buffer name) -> [(match, pattern)]
+    moves = _movement_catalog(isa)
+    sites: dict = {}  # (value, buffer name) -> [(match, pattern, writes?)]
     for m in selection.matches:
+        if m.mapping is not None:
+            continue  # a mapped site's accesses are the mapping's, not this stage's
         spec = m.instruction.spec
         patterns, _, _ = trace_instruction(spec)
-        for buf, pattern, value in zip(spec.buffers, patterns, m.bound_values):
-            sites.setdefault((_canon(value), buf.name), []).append((m, pattern))
+        for i, (buf, pattern, value) in enumerate(
+            zip(spec.buffers, patterns, m.bound_values)
+        ):
+            site = (m, pattern, i >= len(spec.sources))
+            sites.setdefault((_canon(value), buf.name), []).append(site)
 
     # Host-supplied data: the arguments, the results, and the constant pool — all of
     # them written into (or read out of) the I/O buffer densely before/after the run,
@@ -967,22 +1097,18 @@ def solve_layouts(isa, selection: Selection) -> Selection:
         for key, group in sites.items():
             target = pinned.get(key)
             if target is None:
-                # The first concrete access sets the group's target. Matches are in
-                # source order and a producer precedes its consumers, so that is the
-                # producer's own map when it has one, and the host ABI when the value
-                # is program data (pinned above). Accesses that then *disagree* are not
-                # an error here: whether the machine can repack between them is the
-                # move graph's business, so `plan` decides (and inserts a relayout).
-                target = next(
-                    (r for r in (_site_map(m, p) for m, p in group) if r is not None),
-                    None,
-                )
+                # The group picks its own residence (`_group_residence`); the host ABI
+                # already pinned it above when the value is program data. Accesses that
+                # then *disagree* are not an error here: whether the machine can repack
+                # between them is the move graph's business, so `plan` decides (and
+                # inserts the relayout).
+                target = _group_residence(isa, moves, key, group)
                 if target is None:
                     continue
                 pinned[key] = target
                 moved = True
             _value, name = key
-            for m, pattern in group:
+            for m, pattern, _write in group:
                 if _site_map(m, pattern) is not None:
                     continue
                 who = f"{m.instruction.name} on '{name}'"
@@ -1004,6 +1130,8 @@ def solve_layouts(isa, selection: Selection) -> Selection:
         pinned[free] = _dense_map(_static_shape(free[0]), isa.buffers[free[1]])
 
     for m in selection.matches:
+        if m.mapping is not None:
+            continue  # the binding supplies them (`Binding.params`)
         roles, _ = param_roles(m.instruction.spec)
         loose = [
             i
@@ -1045,6 +1173,11 @@ class CompiledProgram:
     inputs: list  # per func arg: (offset, shape)
     outputs: list  # per func result: (offset, shape, label)
     constants: list = field(default_factory=list)  # (offset, ndarray), preloaded
+    # Per emit, the spatial instance a lowering imported for it (``None`` where the
+    # compiler placed the instruction itself). σ's one part this frontend cannot
+    # derive: ``ISA.bind`` gives one unit per *mnemonic*, so a derived σ serializes
+    # every invocation of an instruction, and a mapping says which instance runs what.
+    instances: list = field(default_factory=list)
 
     def _issue(self, rec) -> tuple[str, float, float]:
         """``(unit name, issue cycles, pipeline depth)`` for one emitted instruction.
@@ -1141,6 +1274,39 @@ class CompiledProgram:
         for off, shape, label in self.outputs:
             lines.append(f"    {label} = {io}{list(off)}  shape={tuple(shape)}")
         return "\n".join(lines)
+
+    def epochs(self) -> list:
+        """This program read as its sequence of epochs — the denotational view
+        (``epoch.py``): one total configuration per emitted instruction, with the
+        per-operand regions its λ-fragment names."""
+        from .epoch import epochs
+
+        return epochs(self.isa, self.emits)
+
+    def schedule(self):
+        """This program's minimal σ (``epoch.schedule``): its epochs ASAP-placed
+        onto the microarchitecture's units, respecting the dependences derived
+        from their regions. In cycles when the whole ISA has a cycle model —
+        ``Schedule.makespan`` is then the point this program actually achieves
+        inside the ``bottleneck_cycles()`` / ``cycles()`` bracket — and in unit
+        steps otherwise.
+
+        Where a lowering imported a spatial assignment (``instances``), σ carries
+        it: the derivation would have serialized those epochs onto one unit."""
+        from .epoch import pe_names, schedule
+
+        eps = self.epochs()
+        pes = pe_names(self.isa, eps, self.instances) if self.instances else None
+        return schedule(self.isa, eps, pes)
+
+    def check(self, **kw) -> list:
+        """Check this program against the constraint system (``check.py``); an
+        empty list means every executable obligation holds. ``sigma=`` verifies
+        an externally supplied ``Schedule`` instead of the derived one;
+        ``reachable=`` supplies the machine's R over RAW event pairs."""
+        from .check import check
+
+        return check(self, **kw)
 
     def dump(self) -> None:
         """Print the compiled instruction sequence (I/O map + emit stream)."""
@@ -1262,7 +1428,10 @@ def _movement_catalog(isa) -> list[str]:
     value is decided by residence, never by the buffer pair."""
     moves = []
     for spec in isa.instructions:
-        if not is_mover(spec):
+        # A configuring instruction may look like a copy (it writes a state
+        # register), but it *assigns configuration*: inserting one to move a value
+        # would reconfigure the machine behind the program's back.
+        if not is_mover(spec) or spec.configures:
             continue
         if compute_params(spec):
             # The planner inserts moves itself, so there is no source constant to
@@ -1333,6 +1502,7 @@ class _Loc:
     base: int = -1  # that axis's coordinate; -1 until allocated
     last_use: int = -1
     uses: list = field(default_factory=list)  # step indices that read this location
+    defs: list = field(default_factory=list)  # step indices that write it
     freed: bool = False
 
     @property
@@ -1348,6 +1518,7 @@ class _Move:
     write: _Loc
     chosen: dict = field(default_factory=dict)  # access params the router chose
     schedule: list = field(default_factory=list)  # fresh schedule params, in order
+    pe: object = None  # σ's spatial instance, when a lowering imported one
 
 
 @dataclass
@@ -1360,6 +1531,14 @@ class _Compute:
     reusable: set  # source-operand indices whose slot the result may reuse in place
     alpha: list  # computational attributes (α), bound from the source's constants
     schedule: list  # schedule params, in declaration order (the chosen configuration)
+    # Per-axis element offsets *into* each operand's location (reads then write,
+    # one ``{axis: shift}`` dict apiece), non-empty only for a lowering's tile
+    # steps: the lowering says which sub-block of a value this instruction
+    # touches, allocation says where the value starts.
+    offsets: list = field(default_factory=list)
+    # σ's spatial instance, when a lowering imported one (`mapping.assemble`); `None`
+    # leaves the axis to `epoch.schedule`'s own per-unit derivation.
+    pe: object = None
 
 
 def _alias_groups(offset_of: dict) -> list:
@@ -1454,57 +1633,38 @@ def _colocatable(m: Match) -> set:
 
 
 class _ExpandRecorder:
-    """Collects the instruction calls an ``@expand`` body issues, **configuring** each.
+    """Collects the instruction calls an ``@expand`` body issues, as *values*.
 
     Same protocol as ``OracleProgram``: ``Instruction.__call__`` records into whatever
     ``isa._active_oracle`` holds. The difference from an ``@oracle`` body is who is
     writing the assembly. An oracle is hand-written, so its emits are taken as given;
-    an expansion is the *compiler's own lowering*, so the schedule params of what it
-    issues are the compiler's to choose — by the same rule as at a matched site
-    (``InstructionSpec.configure``: the cheapest assignment the predicate admits).
+    an expansion is the *compiler's own lowering*, and it runs **inside** the planner
+    (``plan`` pass 1), before anything is allocated — so what it records is not an
+    address list but a list of ``Ref``s (a value plus an offset into it) alongside the
+    solved shape params. Turning those into locations, and the locations into
+    addresses, is the planner's job, which is exactly what an expansion could not
+    reach when it ran last."""
 
-    The shape params to configure against are read back out of the address list, where
-    a shape param's slot holds its solved size — the same recovery ``_issue`` does to
-    price an emitted instruction."""
-
-    def __init__(self, isa, name: str):
-        self.isa = isa
+    def __init__(self, name: str):
         self.name = name
-        self.emits: list[EmitRecord] = []
+        self.calls: list[tuple] = []
 
     def record_emit(self, name, addr, compute):
-        spec = self.isa._ops[name].spec
-        roles, _ = param_roles(spec)
-        config = spec.configure({i: addr[i] for i, r in roles.items() if r == "shape"})
-        if config is None:
-            raise CompileError(
-                f"{self.name}: its @expand issues '{name}' with no legal @schedule "
-                f"configuration — the expansion asks for a configuration the hardware "
-                f"cannot be put into, so the layer-level instruction's own @schedule "
-                f"predicate is admitting more than it can actually lower"
-            )
-        chosen, _cost = config
-        self.emits.append(
-            EmitRecord(
-                name,
-                list(addr),
-                list(compute),
-                [chosen[n] for n in spec.schedule_domains],
-            )
-        )
+        assert not compute, f"{self.name}: @expand issued '{name}' with α"
+        self.calls.append((name, list(addr)))
 
 
-def expand_emits(isa, spec, addr: list) -> list:
-    """Run an instruction's ``@expand`` body on its solved address params and return
-    the run of emits it issues.
+def expand_calls(isa, spec, args: list) -> list:
+    """Run an instruction's ``@expand`` body and return the calls it issues, as
+    ``(mnemonic, [Ref | int])``.
 
-    An instruction that carries ``@expand`` is *layer-level*: it matches (and is
-    allocated) as one operation, then lowers to many. Because expansion happens after
-    allocation, the body receives concrete numbers — allocated buffer offsets for the
-    offset params, Stage-2-solved sizes for the shape params — so it can compute each
-    tile's address arithmetically. Its ``@compute`` region stays the layer's
-    semantics: the catalog states what the expansion must equal, and the oracle
-    executes the expansion, so the two can be diffed."""
+    An instruction that carries ``@expand`` is *layer-level*: it matches as one
+    operation and lowers to many. The body's own operands arrive as ``Ref``s to the
+    planner's locations for them and its shape params as Stage-2-solved ints, so the
+    body computes offsets **within** a value and never an absolute address. Its
+    ``@compute`` region stays the layer's semantics: the catalog states what the
+    expansion must equal, and the oracle executes the expansion, so the two can be
+    diffed."""
     if compute_params(spec):
         raise AcceleratorDescriptionError(
             f"{spec.name}: @expand and compute params (α) cannot be combined — the "
@@ -1521,18 +1681,18 @@ def expand_emits(isa, spec, addr: list) -> list:
             f"tiles the expansion issues address sub-blocks whose residence is not "
             f"the layer's map"
         )
-    recorder = _ExpandRecorder(isa, spec.name)
+    recorder = _ExpandRecorder(spec.name)
     prev = isa._active_oracle
     isa._active_oracle = recorder
     try:
-        spec.expand_fn(*addr)
+        spec.expand_fn(*args)
     finally:
         isa._active_oracle = prev
-    if not recorder.emits:
+    if not recorder.calls:
         raise AcceleratorDescriptionError(
             f"{spec.name}: @expand issued no instructions"
         )
-    return recorder.emits
+    return recorder.calls
 
 
 def _placement_dims(shape, buf) -> tuple:
@@ -1671,10 +1831,10 @@ def _move_edges(isa, moves: list, size: int) -> list:
     return edges
 
 
-def _explore(edges: list, starts) -> tuple[list, dict]:
+def _explore(edges: list, starts) -> tuple[list, dict, dict]:
     """Dijkstra over ``(buffer, residence)`` states: every state a value can be moved
-    into, **cheapest first**, and the tree of cheapest predecessors
-    (``state -> (previous state, edge) | None``).
+    into **cheapest first**, the tree of cheapest predecessors (``state -> (previous
+    state, edge) | None``), and the cost of reaching each.
 
     Routing over *states* rather than buffers is what makes a relayout something the
     planner can find on its own: a value that is in the right buffer but the wrong
@@ -1711,7 +1871,7 @@ def _explore(edges: list, starts) -> tuple[list, dict]:
                 prev[nxt] = (state, edge)
                 heapq.heappush(heap, (dist[nxt], tick, nxt))
                 tick += 1
-    return settled, prev
+    return settled, prev, dist
 
 
 def _reachable(edges: list, starts) -> list:
@@ -1723,7 +1883,7 @@ def _route(edges: list, starts, goal: tuple) -> list | None:
     """The cheapest path from any of ``starts`` to ``goal``, as
     ``[(state, edge | None), ...]`` beginning at the reached start, or ``None`` if
     ``goal`` is unreachable."""
-    _, prev = _explore(edges, starts)
+    _, prev, _dist = _explore(edges, starts)
     if goal not in prev:
         return None
     path, state = [], goal
@@ -1733,71 +1893,72 @@ def _route(edges: list, starts, goal: tuple) -> list | None:
     return list(reversed(path))
 
 
-def plan(isa, selection: Selection) -> CompiledProgram:
-    """Liveness-driven, buffer-aware allocation over *locations* (see ``_Loc``).
+class _Planner:
+    """The locations and steps of one compilation, and what turns them into
+    addresses.
 
-    1. *Schedule* — lower each match to a linear stream of moves + computes,
-       inserting data movement (``bring_to``) whenever a value is not resident in
-       the buffer an instruction needs it in **and laid out the way that instruction
-       reads it**. Routing runs over ``(buffer, residence)`` states, so a repacking
-       move is found the same way a copy is; each hop is a short-lived intermediate
-       location (**P-C**). Program I/O lives in the global buffer, in the host ABI's
-       layout at both ends.
-    2. *Liveness* — def step + last-use step (and the full use list) per location.
-    3. *Allocation* — best-fit free-list per buffer, releasing a location at its
-       last use so slots are reused; a result coalesces in place onto a dying
-       element-wise operand. On overflow a Belady victim (resident, not used at the
-       overflow step, farthest next use) is **spilled** to the backing store and
-       reloaded before its next use (**P-B**); inserting the spill grows the
-       schedule, so liveness + allocation are re-run to a fixpoint."""
-    io = _io_buffer(isa)
-    moves = _movement_catalog(isa)
-    block = selection.func.regions[0].blocks[0]
-    func_args = list(block.arguments)
+    Pass 1 appends steps over locations; passes 2 and 3 (``finish``) are liveness,
+    best-fit allocation with Belady spilling to a fixpoint, and emission. Only pass
+    1 depends on where the program came from — ``plan`` drives it from a
+    ``Selection``, ``lower_expansion`` from the calls an ``@expand`` body issues,
+    and ``mapping.assemble`` from an imported nest — which is what makes *a mapping
+    is an imported expansion* a fact about the code rather than only about the
+    account."""
 
-    # --- pass 1: schedule (moves + computes) over locations ------------------
-    loc: dict = {}  # value -> {(buffer name, residence): _Loc}
-    steps: list = []
-    constants: list = []  # (_Loc in io, ndarray) for each source constant used as data
-    edges_for: dict = {}  # value element count -> the moves usable at that size
+    def __init__(self, isa):
+        self.isa = isa
+        self.io = _io_buffer(isa)
+        self.moves = _movement_catalog(isa)
+        self.loc: dict = {}  # value -> {(buffer name, residence): _Loc}
+        self.steps: list = []
+        self.constants: list = []  # (_Loc in io, ndarray) per constant used as data
+        self._edges_for: dict = {}  # element count -> the moves usable at that size
+        self._run_edges: dict = {}  # (src, dst, run length) -> the mover chosen
 
-    def make_loc(value, buf, res) -> _Loc:
+    # ---- locations, and the data movement between them --------------------- #
+
+    def edges(self, size: int) -> list:
+        if size not in self._edges_for:
+            self._edges_for[size] = _move_edges(self.isa, self.moves, size)
+        return self._edges_for[size]
+
+    def make_loc(self, value, buf, res) -> _Loc:
         l = _Loc(value, buf, _loc_size(value, buf), res)
-        loc.setdefault(value, {})[(buf.name, res)] = l
+        self.loc.setdefault(value, {})[(buf.name, res)] = l
         return l
 
-    def route_move(cur: _Loc, path: list, sink: list) -> _Loc:
+    def at(self, value, buf, res) -> _Loc:
+        """The location of ``value`` in ``buf`` laid out as ``res``, made if new.
+
+        Unlike ``make_loc`` this is idempotent: a tile the lowering invented is
+        written many times (once per round of the run it lowers to) and every write
+        is the *same* location — one slot, reused — which is what makes its live
+        range the whole run and its address the allocator's to pick."""
+        here = self.loc.setdefault(value, {})
+        return here.get((buf.name, res)) or self.make_loc(value, buf, res)
+
+    def abi(self, value) -> tuple:
+        """The host ABI's residence for a value in the I/O buffer."""
+        return _dense_map(_static_shape(value), self.io)
+
+    def route_move(self, cur: _Loc, path: list, sink: list) -> _Loc:
         """Append a move per hop along ``path`` (states from ``_route``, starting at
         ``cur``'s own state); return the final location."""
         for (name, res), edge in path[1:]:
-            dst = make_loc(cur.value, isa.buffers[name], res)
+            dst = self.make_loc(cur.value, self.isa.buffers[name], res)
             sink.append(_Move(edge.name, cur, dst, edge.chosen, edge.schedule))
             cur = dst
         return cur
 
-    def edges(value) -> list:
-        size = prod(_shape(value))
-        if size not in edges_for:
-            edges_for[size] = _move_edges(isa, moves, size)
-        return edges_for[size]
-
-    def abi(value) -> tuple:
-        """The host ABI's residence for a value in the I/O buffer."""
-        return _dense_map(_static_shape(value), io)
-
-    def wants(pattern, params) -> tuple:
-        """The residence one access of a match describes."""
-        return residence(access_map(pattern, params))
-
-    def bring_to(value, target, want, who) -> _Loc:
+    def bring_to(self, value, target, want, who) -> _Loc:
         """A location of ``value`` in ``target`` laid out as ``want``.
 
-        A value that is in the right buffer but the wrong layout is not resident: it is
-        one repacking edge away, and finding that edge is the same search as finding a
-        route between buffers. Which is the point — a relayout is data movement, so the
-        planner inserts it exactly the way it inserts any other move, and prices it the
-        same way too."""
-        here = loc.get(value, {})
+        A value that is in the right buffer but the wrong layout is not resident: it
+        is one repacking edge away, and finding that edge is the same search as
+        finding a route between buffers. Which is the point — a relayout is data
+        movement, so the planner inserts it exactly the way it inserts any other
+        move, and prices it the same way too."""
+        here = self.loc.get(value, {})
         if (target.name, want) in here:
             return here[(target.name, want)]
         if not here:
@@ -1814,19 +1975,22 @@ def plan(isa, selection: Selection) -> CompiledProgram:
                     f"a `dialect_resource` blob cannot be read — pass it as a function "
                     f"argument instead)"
                 )
-            constants.append((make_loc(value, io, abi(value)), data))
-            here = loc[value]
+            self.constants.append(
+                (self.make_loc(value, self.io, self.abi(value)), data)
+            )
+            here = self.loc[value]
             if (target.name, want) in here:
                 return here[(target.name, want)]
-        path = _route(edges(value), list(here), (target.name, want))
+        avail = self.edges(prod(_shape(value)))
+        path = _route(avail, list(here), (target.name, want))
         if path is None:
-            raise _unroutable(value, here, target, want, who)
-        return route_move(here[path[0][0]], path, steps)
+            raise self._unroutable(value, here, target, want, who)
+        return self.route_move(here[path[0][0]], path, self.steps)
 
-    def _unroutable(value, here, target, want, who) -> CompileError:
+    def _unroutable(self, value, here, target, want, who) -> CompileError:
         """Say *why* a value cannot get where it is needed: an unreachable buffer, or a
         reachable one in the wrong layout with nothing that repacks it."""
-        avail = edges(value)
+        avail = self.edges(prod(_shape(value)))
         anywhere = {
             res for buf, res in _reachable(avail, list(here)) if buf == target.name
         }
@@ -1840,8 +2004,9 @@ def plan(isa, selection: Selection) -> CompiledProgram:
             # instruction, and the two want different fixes.
             silent = sorted(
                 name
-                for name in moves
-                if name not in live and isa._ops[name].spec.sources[0].name in starts
+                for name in self.moves
+                if name not in live
+                and self.isa._ops[name].spec.sources[0].name in starts
             )
             note = (
                 f" — {silent} leave(s) those buffers but no legal configuration of "
@@ -1860,29 +2025,652 @@ def plan(isa, selection: Selection) -> CompiledProgram:
             f"two ends agree on a layout"
         )
 
-    input_locs = [make_loc(a, io, abi(a)) for a in func_args]
+    def copy_run(self, src, src_off, dst, dst_off, n: int, who: str, pe=None) -> None:
+        """One contiguous ``n``-element transfer, ``(location, offset)`` to
+        ``(location, offset)``, as a step.
+
+        ``bring_to`` moves a whole *value* and opens a fresh location at each hop;
+        this moves a run **inside** two locations that already exist, which is what
+        a tile transfer is made of. The instruction is not named by the caller but
+        found in the same edge graph routing uses — every mover the ISA declares, at
+        every configuration its ``@schedule`` admits, priced by its own
+        ``cost_of``."""
+        edge = self._run_edge(src.buffer, dst.buffer, n, who)
+        spec = self.isa._ops[edge.name].spec
+        _, offset_of = param_roles(spec)
+        self.steps.append(
+            _Compute(
+                edge.name,
+                [src],
+                dst,
+                offset_of,
+                _solve_move_params(spec, n) | edge.chosen,
+                set(),  # a transfer never coalesces onto its source
+                [],
+                edge.schedule,
+                [{0: src_off}, {0: dst_off}],
+                pe,
+            )
+        )
+
+    def reduce_run(self, src, src_off, dst, dst_off, n: int, who: str, pe=None):
+        """One contiguous ``n``-element transfer that **combines** instead of
+        overwriting, with the instruction the machine declares for it
+        (``ISA.network(reduces=...)``).
+
+        This is what makes a spatial reduction expressible rather than asserted:
+        the combination is an ordinary instruction with an ordinary compute region,
+        so it is an epoch like any other — the oracle executes it, definedness sees
+        that it reads the accumulator, and the dependence edges through the shared
+        destination serialize the instances' contributions."""
+        instr = self.isa.reduces
+        assert instr is not None, f"{who}: no reducing instruction is declared"
+        spec = instr.spec
+        want = (src.buffer, dst.buffer, dst.buffer)
+        got = tuple(spec.buffers)
+        if got != want:
+            raise AllocationError(
+                f"{who}: '{spec.name}' combines "
+                f"{[b.name for b in got]}, but this reduction has to combine a "
+                f"partial in '{src.buffer.name}' into '{dst.buffer.name}'"
+            )
+        if compute_params(spec):
+            raise AcceleratorDescriptionError(
+                f"{spec.name}: a reducing transfer takes no computational attribute "
+                f"— nothing supplies one where the planner issues it"
+            )
+        roles, offset_of = param_roles(spec)
+        params = _solve_move_params(spec, n)
+        config = spec.configure(
+            {i: params[i] for i, r in roles.items() if r == "shape"}
+        )
+        if config is None:
+            raise AllocationError(
+                f"{who}: '{spec.name}' has no legal @schedule configuration for a run "
+                f"of {n} element(s)"
+            )
+        chosen, _cost = config
+        self.steps.append(
+            _Compute(
+                spec.name,
+                [src, dst],
+                dst,
+                offset_of,
+                params,
+                set(),
+                [],
+                [chosen[k] for k in spec.schedule_domains],
+                [{0: src_off}, {0: dst_off}, {0: dst_off}],
+                pe,
+            )
+        )
+
+    def _run_edge(self, src, dst, n: int, who: str) -> _Edge:
+        """The cheapest mover carrying an ``n``-element run from ``src`` to ``dst``.
+
+        A run is dense at both ends, so the move has to carry the residence
+        verbatim: an edge that relayouts states a different address correspondence
+        and would scramble it. Choosing here rather than being told is what lets a
+        mover with an ordering param be *used* — at the assignments that copy
+        verbatim — where naming one instruction has to refuse it for having any."""
+        key = (src.name, dst.name, n)
+        if key not in self._run_edges:
+            usable = [
+                e
+                for e in self.edges(n)
+                if e.src == src.name and e.dst == dst.name and e.relayout is None
+            ]
+            if not usable:
+                raise AllocationError(
+                    f"{who}: no data-movement instruction carries a run of {n} "
+                    f"element(s) from '{src.name}' to '{dst.name}'"
+                )
+            self._run_edges[key] = min(usable, key=lambda e: e.cost)
+        return self._run_edges[key]
+
+    # ---- pass 1, for a match that lowers to a run of tile instructions ------ #
+
+    def _tile_maps(self, calls, who) -> dict:
+        """Each staging tile's residence, from the accesses that *fix* one.
+
+        A mover whose read and write maps agree carries a residence rather than
+        fixing it — the same fact ``_move_edges`` records as a residence-preserving
+        edge — so what pins a tile is its non-mover accesses, unified across them.
+        That is Stage 2b's rule applied to a value the lowering invented, and it is
+        why a body may stage a run of words with one instruction and read it back as
+        a multi-dimensional tile with the next."""
+        fixed: dict = {}
+        carried: dict = {}
+        for name, addr in calls:
+            spec = self.isa._ops[name].spec
+            patterns, _, _ = trace_instruction(spec)
+            params = {i: v for i, v in enumerate(addr) if not isinstance(v, Ref)}
+            maps = [_wants(p, params) for p in patterns]
+            _, offset_of = param_roles(spec)
+            preserving = is_mover(spec) and maps[0] == maps[1]
+            for i, v in enumerate(addr):
+                if not isinstance(v, Ref) or not isinstance(v.value, Tile):
+                    continue
+                pos = offset_of[i][0][0]
+                into = carried if preserving else fixed
+                if into.setdefault(v.value, maps[pos]) != maps[pos]:
+                    raise LayoutError(
+                        f"{who}: its staging tile of shape {v.value.shape} is read as "
+                        f"{show_map(into[v.value])} by one instruction and "
+                        f"{show_map(maps[pos])} by '{name}' — a value has one "
+                        f"residence, so the expansion has to stage them separately"
+                    )
+        out = {}
+        for tile, res in (carried | fixed).items():
+            if prod(_shape(tile)) != prod(s for s, _st in res):
+                raise ShapeError(
+                    f"{who}: its staging tile of shape {tile.shape} is accessed as "
+                    f"{show_map(res)} — the expansion moves a different number of "
+                    f"elements than the tile holds"
+                )
+            out[tile] = res
+        return out
+
+    def lower_expansion(self, m, spec, reads, write) -> None:
+        """Lower one layer-level match to the run of tile instructions its
+        ``@expand`` body issues — as *steps over locations*, so the staging it needs
+        is allocated, made live and spillable like anything else.
+
+        The body is handed a ``Ref`` to the planner's location for each of its own
+        operands and the Stage-2-solved size for each shape param. An operand the
+        issued instruction addresses by a *constant* (a state buffer: the MXU's
+        stationary tile) has no parameter to name a value with, so it resolves to
+        whatever the expansion last put in that buffer — which is what the hardware
+        means by it."""
+        isa = self.isa
+        _, layer_offsets = param_roles(spec)
+        operands = reads + [write]
+        args = [
+            (
+                Ref(operands[layer_offsets[i][0][0]])
+                if i in layer_offsets
+                else m.shape_params[i]
+            )
+            for i in range(arity(spec.access_fn))
+        ]
+        calls = expand_calls(isa, spec, args)
+        tiles = self._tile_maps(calls, spec.name)
+        resident: dict = {}  # buffer name -> what a constant-addressed access means
+        for name, addr in calls:
+            issued = isa._ops[name].spec
+            issued_patterns, _, _ = trace_instruction(issued)
+            params = {i: v for i, v in enumerate(addr) if not isinstance(v, Ref)}
+            _, offset_of = param_roles(issued)
+            n_src = len(issued.sources)
+            locs: list = [None] * len(issued.buffers)
+            rel = [{} for _ in issued.buffers]
+            for i, v in enumerate(addr):
+                if not isinstance(v, Ref):
+                    continue
+                for pos, axis in offset_of[i]:
+                    buf = issued.buffers[pos]
+                    if isinstance(v.value, Tile):
+                        if pos < n_src and v.value not in self.loc:
+                            raise CompileError(
+                                f"{spec.name}: '{name}' reads a staging tile of shape "
+                                f"{v.value.shape} that nothing has written yet"
+                            )
+                        locs[pos] = self.at(v.value, buf, tiles[v.value])
+                    else:
+                        locs[pos] = v.value
+                    rel[pos][axis] = v.offset
+            maps = [_wants(p, params) for p in issued_patterns]
+            carries = is_mover(issued) and maps[0] == maps[1]
+            for pos in range(len(locs)):
+                buf = issued.buffers[pos]
+                if locs[pos] is None and pos >= n_src:
+                    # A constant-addressed *destination* is a mover's: a fresh
+                    # location of the value it carries, keeping that value's
+                    # residence when the mover preserves one.
+                    src = locs[0]
+                    if src is None:
+                        raise CompileError(
+                            f"{spec.name}: '{name}' writes '{buf.name}' at a fixed "
+                            f"address with no operand to carry there"
+                        )
+                    locs[pos] = self.at(
+                        src.value, buf, src.map if carries else maps[pos]
+                    )
+                elif locs[pos] is None:
+                    # A constant-addressed *read* names no value; within an expansion
+                    # it is whatever was last written to that buffer, which is what a
+                    # state buffer (the MXU's stationary tile) means by it.
+                    locs[pos] = resident.get(buf.name)
+                    if locs[pos] is None:
+                        raise CompileError(
+                            f"{spec.name}: '{name}' reads '{buf.name}' at a fixed "
+                            f"address, but nothing in the expansion has written there"
+                        )
+                    if locs[pos].map != maps[pos]:
+                        raise LayoutError(
+                            f"{spec.name}: '{name}' reads '{buf.name}' as "
+                            f"{show_map(maps[pos])}, but the expansion left it holding "
+                            f"{show_map(locs[pos].map)}"
+                        )
+                if pos >= n_src:
+                    resident[buf.name] = locs[pos]
+            config = issued.configure(
+                {i: addr[i] for i, r in param_roles(issued)[0].items() if r == "shape"}
+            )
+            if config is None:
+                raise CompileError(
+                    f"{spec.name}: its @expand issues '{name}' with no legal "
+                    f"@schedule configuration — the expansion asks for a "
+                    f"configuration the hardware cannot be put into, so the "
+                    f"layer-level instruction's own @schedule predicate is admitting "
+                    f"more than it can actually lower"
+                )
+            chosen, _cost = config
+            self.steps.append(
+                _Compute(
+                    name,
+                    locs[:n_src],
+                    locs[n_src],
+                    offset_of,
+                    params,
+                    set(),  # an issued instruction never coalesces onto an operand
+                    [],
+                    [chosen[n] for n in issued.schedule_domains],
+                    rel,
+                )
+            )
+
+    # ---- passes 2 + 3 ------------------------------------------------------ #
+
+    def finish(self, inputs: list, outputs: list) -> CompiledProgram:
+        """Liveness, allocation to a no-spill fixpoint, and emission.
+
+        ``inputs`` are the locations the host fills before the run, in argument
+        order; ``outputs`` are the ``(location, shape, label)`` it reads back."""
+        isa, io, steps = self.isa, self.io, self.steps
+        output_locs = [l for l, _shp, _label in outputs]
+
+        def reads_of(st) -> list:
+            return [st.read] if isinstance(st, _Move) else st.reads
+
+        def all_locs() -> list:
+            seeds = inputs + [l for l, _data in self.constants]
+            seen, out = set(map(id, seeds)), list(seeds)
+            for st in steps:
+                for l in reads_of(st) + [st.write]:
+                    if id(l) not in seen:
+                        seen.add(id(l))
+                        out.append(l)
+            return out
+
+        def liveness():
+            final = len(steps)  # virtual step: the terminator reads the outputs
+            for l in all_locs():
+                l.last_use, l.uses, l.defs, l.base, l.freed = -1, [], [], -1, False
+            for i, st in enumerate(steps):
+                for r in reads_of(st):
+                    r.last_use = i
+                    r.uses.append(i)
+                # A location is live until its last *write* too, not only its last
+                # read. A source value is SSA and written once, so this says nothing
+                # about it; a tile the lowering invented is refilled every round, and
+                # freeing it at the last read of round 1 would hand its slot away
+                # while the rest of the run still writes there.
+                st.write.defs.append(i)
+                st.write.last_use = max(st.write.last_use, i)
+            for l in output_locs:
+                l.last_use = final
+                l.uses.append(final)
+
+        def allocate():
+            """Assign offsets in one walk; on overflow return ``(victim, step)`` to
+            spill, else ``None`` (offsets are final). Belady victim selection."""
+            free = {name: [(0, buf.capacity)] for name, buf in isa.buffers.items()}
+            live = {name: [] for name in isa.buffers}  # placed, not-yet-freed
+
+            def release(l):
+                runs = sorted(free[l.buffer.name] + [(l.base, l.size)])
+                merged = [runs[0]]
+                for off, sz in runs[1:]:
+                    poff, psz = merged[-1]
+                    if poff + psz == off:
+                        merged[-1] = (poff, psz + sz)
+                    else:
+                        merged.append((off, sz))
+                free[l.buffer.name] = merged
+                live[l.buffer.name].remove(l)
+                l.freed = True
+
+            def best_fit(buf, size) -> int | None:
+                runs = free[buf.name]
+                pick = min(
+                    (i for i, (_o, sz) in enumerate(runs) if sz >= size),
+                    key=lambda i: runs[i][1],
+                    default=-1,
+                )
+                if pick < 0:
+                    return None
+                off, sz = runs.pop(pick)
+                if sz > size:
+                    runs.append((off + size, sz - size))
+                return off
+
+            def place(l) -> bool:
+                l.base = best_fit(l.buffer, l.size)
+                if l.base is None:
+                    return False
+                live[l.buffer.name].append(l)
+                return True
+
+            def forced_alias(st, reads, write, t):
+                """The operand location this step's write **must** be placed on top
+                of, or ``None`` if its access forces nothing.
+
+                An address param used as the basis of two buffers is not a hint: the
+                ISA is saying those operands are at one address (QKV's ``softmax``
+                reads and writes one ``addr``). Allocation therefore has to guarantee
+                it, rather than leave it to the opportunistic reuse below — which
+                does nothing when the operand outlives the instruction."""
+                if not isinstance(st, _Compute):
+                    return None
+                n = len(reads)
+                target = None
+                for param, positions in _alias_groups(st.offset_of):
+                    operands = [p for p in positions if p < n]
+                    for p in operands[1:]:
+                        if reads[p] is not reads[operands[0]]:
+                            raise AllocationError(
+                                f"{st.name}: address param p{param} puts operands "
+                                f"{operands[0]} and {p} at one address, but they are "
+                                f"bound to different values"
+                            )
+                    if n in positions and operands:
+                        target = reads[operands[0]]
+                if target is None or target is write:
+                    # `target is write` is an accumulator a lowering already placed
+                    # in one slot: the aliasing the access states holds by
+                    # construction, so there is nothing to coalesce.
+                    return None
+                if target.buffer is not write.buffer or target.size != write.size:
+                    raise AllocationError(
+                        f"{st.name}: writes its result over the operand it reads, but "
+                        f"the two do not occupy the same space "
+                        f"({target.buffer.name}[{target.size}] vs "
+                        f"{write.buffer.name}[{write.size}])"
+                    )
+                if target.last_use != t or target.freed:
+                    raise AllocationError(
+                        f"{st.name}: writes its result over the operand it reads, but "
+                        f"that operand is read again at step "
+                        f"{min(u for u in target.uses if u > t)}"
+                        f" — the in-place write would destroy it. Copy it first, or "
+                        f"use an out-of-place instruction."
+                    )
+                return target
+
+            # Constants are resident from the start, exactly like inputs: nothing in
+            # the program writes them, so the allocator must reserve their space up
+            # front.
+            for l in inputs + [l for l, _data in self.constants]:
+                if not place(l):
+                    raise AllocationError(
+                        f"backing store '{io.name}' overflow on inputs"
+                    )
+
+            for t, st in enumerate(steps):
+                reads, write = reads_of(st), st.write
+                reused = forced_alias(st, reads, write, t)
+                if reused is None and isinstance(st, _Compute) and st.reusable:
+                    reused = next(
+                        (
+                            reads[i]
+                            for i in st.reusable
+                            if reads[i].buffer is write.buffer
+                            and reads[i].last_use == t
+                            and reads[i].size == write.size
+                            and not reads[i].freed
+                        ),
+                        None,
+                    )
+                if reused is not None:
+                    write.base = reused.base  # coalesce: hand the slot to the result
+                    live[write.buffer.name].remove(reused)
+                    live[write.buffer.name].append(write)
+                    reused.freed = True
+                elif write.base >= 0 and not write.freed:
+                    # Already placed and still live: a tile the lowering invented,
+                    # written once per round of the run it lowers to. One location,
+                    # one slot — a source value is SSA and lands here only once, but
+                    # such a tile is not, and re-placing it would consume a fresh
+                    # block every round.
+                    pass
+                elif not place(write):
+                    return _pick_victim(write.buffer, t, live[write.buffer.name]), t
+                for r in reads:
+                    if r.last_use == t and not r.freed:
+                        release(r)
+            return None
+
+        def _pick_victim(buf, t, resident):
+            # Spill the resident location whose *next* use is farthest away
+            # (Belady), excluding anything this very step still reads. A location the
+            # program writes again is excluded too: the reload lands after that write
+            # and would undo it. Tiles a lowering invented are exactly that — one
+            # slot refilled every round — so a machine too small for a lowering's
+            # working set is an allocation error, not a spill that loses a refill.
+            candidates = [
+                l
+                for l in resident
+                if t not in l.uses
+                and any(s > t for s in l.uses)
+                and not any(s > t for s in l.defs)
+            ]
+            if not candidates:
+                raise AllocationError(
+                    f"buffer '{buf.name}' overflow at step {t}: no spillable location "
+                    f"(an instruction needs more slots than '{buf.name}' has)"
+                )
+            return max(candidates, key=lambda l: min(s for s in l.uses if s > t))
+
+        def spill(victim, t):
+            """Evict ``victim`` from its buffer to the backing store over
+            [t, next-use): store it down before step t, reload it back before its
+            next use, and repoint the later uses onto the reloaded copy. Grows
+            ``steps`` (re-run liveness)."""
+            u = min(s for s in victim.uses if s > t)
+            if victim.buffer is io:
+                raise AllocationError(f"backing store '{io.name}' overflow")
+            # A spill must come back **as it left** — the later uses were routed to
+            # this residence — but only the *round trip* has to preserve it, not each
+            # leg: a machine whose only path to the backing store is a repacking dma
+            # spills fine as long as the reload repacks back. So the store residence
+            # is searched for, cheapest first, rather than assumed to be the victim's.
+            home = (victim.buffer.name, victim.map)
+            avail = self.edges(prod(_shape(victim.value)))
+            down = up = None
+            for state in _reachable(avail, [home]):
+                if state[0] != io.name:
+                    continue
+                down, up = _route(avail, [home], state), _route(avail, [state], home)
+                if down and up:
+                    break
+                down = up = None
+            if not (down and up):
+                raise AllocationError(
+                    f"cannot spill from '{victim.buffer.name}': no round trip to "
+                    f"'{io.name}' returns the value to {show_map(victim.map)}"
+                )
+            store_steps: list = []
+            spilled = self.route_move(victim, down, store_steps)
+            reload_steps: list = []
+            reloaded = self.route_move(spilled, up, reload_steps)
+            for i, st in enumerate(steps):
+                if i >= u:
+                    if isinstance(st, _Move):
+                        if st.read is victim:
+                            st.read = reloaded
+                    else:
+                        st.reads = [reloaded if r is victim else r for r in st.reads]
+            steps[u:u] = reload_steps  # reload before the next use ...
+            steps[t:t] = store_steps  # ... and store before the overflow step (t < u)
+
+        # An instruction's operands are all live at once and none can be spilled
+        # (they are in use), so a buffer that cannot even hold one instruction's
+        # operands is infeasible — reject upfront. This also guarantees the spill
+        # loop terminates: every remaining overflow then has a non-operand victim to
+        # evict, so each spill resolves the earliest overflow and pushes the frontier
+        # strictly later.
+        for st in steps:
+            if isinstance(st, _Compute):
+                need: dict = {}
+                for r in dict.fromkeys(st.reads):  # distinct locations (handles a*a)
+                    need[r.buffer.name] = need.get(r.buffer.name, 0) + r.size
+                for name, n in need.items():
+                    if n > isa.buffers[name].capacity:
+                        raise AllocationError(
+                            f"{st.name}: operands need {n} unit(s) of '{name}' but it "
+                            f"holds only {isa.buffers[name].capacity} "
+                            f"(capacity too small to spill into)"
+                        )
+
+        while True:
+            liveness()
+            outcome = allocate()
+            if outcome is None:
+                break
+            spill(*outcome)
+
+        # --- emit with concrete offsets --------------------------------------
+        emits: list[EmitRecord] = []
+        for st in steps:
+            if isinstance(st, _Move):
+                # A move fills its access params like a compute: offset params take
+                # the source/destination placements; shape params are solved from the
+                # moved value's element count (prod(visible) == value size), since the
+                # move was inserted in Stage 3 and never went through Stage-2 solve.
+                spec = isa._ops[st.name].spec
+                _, offset_buffer = param_roles(spec)
+                # `st.chosen` are the residence params the router chose by choosing
+                # this edge; they fill their own slots in the address list exactly as
+                # a solved shape param does.
+                shape_params = _solve_move_params(spec, prod(_shape(st.read.value)))
+                shape_params |= st.chosen
+                addr = _addr(
+                    offset_buffer,
+                    [st.read, st.write],
+                    shape_params,
+                    arity(spec.access_fn),
+                )
+                emits.append(EmitRecord(st.name, addr, [], st.schedule))
+            else:
+                spec = isa._ops[st.name].spec
+                addr = _addr(
+                    st.offset_of,
+                    st.reads + [st.write],
+                    st.shape_params,
+                    arity(spec.access_fn),
+                    st.offsets,
+                )
+                emits.append(EmitRecord(st.name, addr, st.alpha, st.schedule))
+
+        return CompiledProgram(
+            isa,
+            io,
+            emits,
+            [(l.offset, _shape(l.value)) for l in inputs],
+            [(l.offset, tuple(shape), label) for l, shape, label in outputs],
+            [(l.offset, d) for l, d in self.constants],
+            [st.pe for st in steps] if any(st.pe for st in steps) else [],
+        )
+
+
+def _wants(pattern, params) -> tuple:
+    """The residence one access describes, at these params."""
+    return residence(access_map(pattern, params))
+
+
+def _addr(offset_of, locs, shape_params, n_addr, rel=()) -> list:
+    """Fill an instruction's address params. An offset param names one coordinate
+    *component* of one operand — ``(buffer position, axis)`` — so a multi-index
+    access takes several, all read off that operand's placement. A param naming that
+    component in several operands has been forced to one address by ``allocate``, so
+    any of its references gives the same number.
+
+    ``rel`` shifts an operand within its location, for a lowering's tile steps: the
+    allocator supplies the value's base and the lowering supplies, **per coordinate
+    axis**, the offset of the sub-block this instruction touches — a rank-2 operand
+    has one shift per axis, and folding them into one number was exactly the bug
+    that mis-addressed every off-origin block."""
+
+    def component(i):
+        pos, axis = offset_of[i][0]
+        shift = rel[pos].get(axis, 0) if rel else 0
+        return locs[pos].offset[axis] + shift
+
+    return [component(i) if i in offset_of else shape_params[i] for i in range(n_addr)]
+
+
+def plan(isa, selection: Selection) -> CompiledProgram:
+    """Liveness-driven, buffer-aware allocation over *locations* (see ``_Loc``).
+
+    1. *Schedule* — lower each match to a linear stream of moves + computes,
+       inserting data movement (``bring_to``) whenever a value is not resident in
+       the buffer an instruction needs it in **and laid out the way that instruction
+       reads it**. Routing runs over ``(buffer, residence)`` states, so a repacking
+       move is found the same way a copy is; each hop is a short-lived intermediate
+       location (**P-C**). Program I/O lives in the global buffer, in the host ABI's
+       layout at both ends. Each inserted move is one update of the time-varying λ
+       — the delta encoding v2 §3.3 names — which is why the emitted stream, read
+       as epochs (``epoch.py``), meets the interface condition by construction.
+    2. *Liveness* — def step + last-use step (and the full use list) per location.
+    3. *Allocation* — best-fit free-list per buffer, releasing a location at its
+       last use so slots are reused; a result coalesces in place onto a dying
+       element-wise operand. On overflow a Belady victim (resident, not used at the
+       overflow step, farthest next use) is **spilled** to the backing store and
+       reloaded before its next use (**P-B**); inserting the spill grows the
+       schedule, so liveness + allocation are re-run to a fixpoint.
+
+    Passes 2 and 3 are ``_Planner.finish`` — they are the same wherever the steps
+    came from, which is what an imported mapping enters through."""
+    p = _Planner(isa)
+    block = selection.func.regions[0].blocks[0]
+    func_args = list(block.arguments)
+
+    # --- pass 1: schedule (moves + computes) over locations ------------------
+    inputs = [p.make_loc(a, p.io, p.abi(a)) for a in func_args]
 
     for m in selection.matches:
+        if m.mapping is not None:
+            # An imported lowering: the site is a tile run, so its operands are the
+            # source op's tensors rather than the instruction's, and everything about
+            # it — the nest, the transfers, the staging — is the mapping's.
+            from .mapping import lower_site
+
+            lower_site(m, p)
+            continue
         spec = m.instruction.spec
         patterns, _, _ = trace_instruction(spec)
         reads = [
-            bring_to(
+            p.bring_to(
                 _canon(v),
                 buf,
-                wants(p, m.shape_params),
+                _wants(pat, m.shape_params),
                 f"{m.instruction.name} operand {i}",
             )
-            for i, (v, buf, p) in enumerate(
+            for i, (v, buf, pat) in enumerate(
                 zip(m.operand_values, spec.sources, patterns)
             )
         ]
-        write = make_loc(
+        write = p.make_loc(
             _canon(m.result_value),
             spec.destinations[0],
-            wants(patterns[len(spec.sources)], m.shape_params),
+            _wants(patterns[len(spec.sources)], m.shape_params),
         )
+        if spec.expand_fn is not None:
+            p.lower_expansion(m, spec, reads, write)
+            continue
         _, offset_of = param_roles(spec)
-        steps.append(
+        p.steps.append(
             _Compute(
                 m.instruction.name,
                 reads,
@@ -1896,291 +2684,20 @@ def plan(isa, selection: Selection) -> CompiledProgram:
         )
 
     terminator = list(block.operations)[-1]
-    output_vals = list(terminator.operands)
     # The host reads a result back densely, so an output must *arrive* in the ABI's
     # layout: a program that computed it repacked needs the relayout inserted here.
-    output_locs = [
-        bring_to(_canon(v), io, abi(_canon(v)), f"result #{i}")
-        for i, v in enumerate(output_vals)
-    ]
-
-    # --- helpers shared by the liveness + allocation fixpoint ----------------
-    def reads_of(st) -> list:
-        return [st.read] if isinstance(st, _Move) else st.reads
-
-    def all_locs() -> list:
-        seeds = input_locs + [l for l, _data in constants]
-        seen, out = set(map(id, seeds)), list(seeds)
-        for st in steps:
-            for l in reads_of(st) + [st.write]:
-                if id(l) not in seen:
-                    seen.add(id(l))
-                    out.append(l)
-        return out
-
-    def liveness():
-        final = len(steps)  # virtual step: the terminator reads the outputs
-        for l in all_locs():
-            l.last_use, l.uses, l.base, l.freed = -1, [], -1, False
-        for i, st in enumerate(steps):
-            for r in reads_of(st):
-                r.last_use = i
-                r.uses.append(i)
-        for l in output_locs:
-            l.last_use = final
-            l.uses.append(final)
-
-    def allocate():
-        """Assign offsets in one walk; on overflow return ``(victim, step)`` to
-        spill, else ``None`` (offsets are final). Belady victim selection."""
-        free = {name: [(0, buf.capacity)] for name, buf in isa.buffers.items()}
-        live = {name: [] for name in isa.buffers}  # placed, not-yet-freed locations
-
-        def release(l):
-            runs = sorted(free[l.buffer.name] + [(l.base, l.size)])
-            merged = [runs[0]]
-            for off, sz in runs[1:]:
-                poff, psz = merged[-1]
-                if poff + psz == off:
-                    merged[-1] = (poff, psz + sz)
-                else:
-                    merged.append((off, sz))
-            free[l.buffer.name] = merged
-            live[l.buffer.name].remove(l)
-            l.freed = True
-
-        def best_fit(buf, size) -> int | None:
-            runs = free[buf.name]
-            pick = min(
-                (i for i, (_o, sz) in enumerate(runs) if sz >= size),
-                key=lambda i: runs[i][1],
-                default=-1,
-            )
-            if pick < 0:
-                return None
-            off, sz = runs.pop(pick)
-            if sz > size:
-                runs.append((off + size, sz - size))
-            return off
-
-        def place(l) -> bool:
-            l.base = best_fit(l.buffer, l.size)
-            if l.base is None:
-                return False
-            live[l.buffer.name].append(l)
-            return True
-
-        def forced_alias(st, reads, write, t):
-            """The operand location this step's write **must** be placed on top of,
-            or ``None`` if its access forces nothing.
-
-            An address param used as the basis of two buffers is not a hint: the ISA is
-            saying those operands are at one address (QKV's ``softmax`` reads and writes
-            one ``addr``). Allocation therefore has to guarantee it, rather than leave
-            it to the opportunistic reuse below — which does nothing when the operand
-            outlives the instruction."""
-            if not isinstance(st, _Compute):
-                return None
-            n = len(reads)
-            target = None
-            for param, positions in _alias_groups(st.offset_of):
-                operands = [p for p in positions if p < n]
-                for p in operands[1:]:
-                    if reads[p] is not reads[operands[0]]:
-                        raise AllocationError(
-                            f"{st.name}: address param p{param} puts operands "
-                            f"{operands[0]} and {p} at one address, but they are bound "
-                            f"to different values"
-                        )
-                if n in positions and operands:
-                    target = reads[operands[0]]
-            if target is None:
-                return None
-            if target.buffer is not write.buffer or target.size != write.size:
-                raise AllocationError(
-                    f"{st.name}: writes its result over the operand it reads, but the "
-                    f"two do not occupy the same space "
-                    f"({target.buffer.name}[{target.size}] vs "
-                    f"{write.buffer.name}[{write.size}])"
-                )
-            if target.last_use != t or target.freed:
-                raise AllocationError(
-                    f"{st.name}: writes its result over the operand it reads, but that "
-                    f"operand is read again at step {min(u for u in target.uses if u > t)}"
-                    f" — the in-place write would destroy it. Copy it first, or use an "
-                    f"out-of-place instruction."
-                )
-            return target
-
-        # Constants are resident from the start, exactly like inputs: nothing in the
-        # program writes them, so the allocator must reserve their space up front.
-        for l in input_locs + [l for l, _data in constants]:
-            if not place(l):
-                raise AllocationError(f"backing store '{io.name}' overflow on inputs")
-
-        for t, st in enumerate(steps):
-            reads, write = reads_of(st), st.write
-            reused = forced_alias(st, reads, write, t)
-            if reused is None and isinstance(st, _Compute) and st.reusable:
-                reused = next(
-                    (
-                        reads[i]
-                        for i in st.reusable
-                        if reads[i].buffer is write.buffer
-                        and reads[i].last_use == t
-                        and reads[i].size == write.size
-                        and not reads[i].freed
-                    ),
-                    None,
-                )
-            if reused is not None:
-                write.base = reused.base  # coalesce: hand the slot to the result
-                live[write.buffer.name].remove(reused)
-                live[write.buffer.name].append(write)
-                reused.freed = True
-            elif not place(write):
-                return _pick_victim(write.buffer, t, live[write.buffer.name]), t
-            for r in reads:
-                if r.last_use == t and not r.freed:
-                    release(r)
-        return None
-
-    def _pick_victim(buf, t, resident):
-        # Spill the resident location whose *next* use is farthest away (Belady),
-        # excluding anything this very step still reads.
-        candidates = [l for l in resident if t not in l.uses]
-        if not candidates:
-            raise AllocationError(
-                f"buffer '{buf.name}' overflow at step {t}: no spillable location "
-                f"(an instruction needs more slots than '{buf.name}' has)"
-            )
-        return max(candidates, key=lambda l: min(s for s in l.uses if s > t))
-
-    def spill(victim, t):
-        """Evict ``victim`` from its buffer to the backing store over [t, next-use):
-        store it down before step t, reload it back before its next use, and repoint
-        the later uses onto the reloaded copy. Grows ``steps`` (re-run liveness)."""
-        u = min(s for s in victim.uses if s > t)
-        if victim.buffer is io:
-            raise AllocationError(f"backing store '{io.name}' overflow")
-        # A spill must come back **as it left** — the later uses were routed to this
-        # residence — but only the *round trip* has to preserve it, not each leg: a
-        # machine whose only path to the backing store is a repacking dma spills fine
-        # as long as the reload repacks back. So the store residence is searched for,
-        # cheapest first, rather than assumed to be the victim's own.
-        home = (victim.buffer.name, victim.map)
-        avail = edges(victim.value)
-        down = up = None
-        for state in _reachable(avail, [home]):
-            if state[0] != io.name:
-                continue
-            down, up = _route(avail, [home], state), _route(avail, [state], home)
-            if down and up:
-                break
-            down = up = None
-        if not (down and up):
-            raise AllocationError(
-                f"cannot spill from '{victim.buffer.name}': no round trip to "
-                f"'{io.name}' returns the value to {show_map(victim.map)}"
-            )
-        store_steps: list = []
-        spilled = route_move(victim, down, store_steps)
-        reload_steps: list = []
-        reloaded = route_move(spilled, up, reload_steps)
-        for i, st in enumerate(steps):
-            if i >= u:
-                if isinstance(st, _Move):
-                    if st.read is victim:
-                        st.read = reloaded
-                else:
-                    st.reads = [reloaded if r is victim else r for r in st.reads]
-        steps[u:u] = reload_steps  # reload before the next use ...
-        steps[t:t] = store_steps  # ... and store before the overflow step (t < u)
-
-    # An instruction's operands are all live at once and none can be spilled (they
-    # are in use), so a buffer that cannot even hold one instruction's operands is
-    # infeasible — reject upfront. This also guarantees the spill loop terminates:
-    # every remaining overflow then has a non-operand victim to evict, so each spill
-    # resolves the earliest overflow and pushes the frontier strictly later.
-    for st in steps:
-        if isinstance(st, _Compute):
-            need: dict = {}
-            for r in dict.fromkeys(st.reads):  # distinct locations (handles a*a)
-                need[r.buffer.name] = need.get(r.buffer.name, 0) + r.size
-            for name, n in need.items():
-                if n > isa.buffers[name].capacity:
-                    raise AllocationError(
-                        f"{st.name}: operands need {n} unit(s) of '{name}' but it "
-                        f"holds only {isa.buffers[name].capacity} "
-                        f"(capacity too small to spill into)"
-                    )
-
-    # --- passes 2+3: liveness + allocation, iterated to a no-spill fixpoint ---
-    while True:
-        liveness()
-        outcome = allocate()
-        if outcome is None:
-            break
-        spill(*outcome)
-
-    # --- emit with concrete offsets ------------------------------------------
-    def _addr(offset_of, locs, shape_params, n_addr) -> list:
-        """Fill an instruction's address params. An offset param names one coordinate
-        *component* of one operand — ``(buffer position, axis)`` — so a multi-index
-        access takes several, all read off that operand's placement. A param naming
-        that component in several operands has been forced to one address by
-        ``allocate``, so any of its references gives the same number."""
-
-        def component(i):
-            pos, axis = offset_of[i][0]
-            return locs[pos].offset[axis]
-
-        return [
-            component(i) if i in offset_of else shape_params[i] for i in range(n_addr)
-        ]
-
-    emits: list[EmitRecord] = []
-    for st in steps:
-        if isinstance(st, _Move):
-            # A move fills its access params like a compute: offset params take the
-            # source/destination placements; shape params are solved from the moved
-            # value's element count (prod(visible) == value size), since the move was
-            # inserted in Stage 3 and never went through Stage-2 solve.
-            spec = isa._ops[st.name].spec
-            _, offset_buffer = param_roles(spec)
-            # `st.chosen` are the residence params the router chose by choosing this
-            # edge; they fill their own slots in the address list exactly as a solved
-            # shape param does.
-            shape_params = _solve_move_params(spec, prod(_shape(st.read.value)))
-            shape_params |= st.chosen
-            addr = _addr(
-                offset_buffer,
-                [st.read, st.write],
-                shape_params,
-                arity(spec.access_fn),
-            )
-            emits.append(EmitRecord(st.name, addr, [], st.schedule))
-        else:
-            spec = isa._ops[st.name].spec
-            addr = _addr(
-                st.offset_of,
-                st.reads + [st.write],
-                st.shape_params,
-                arity(spec.access_fn),
-            )
-            if spec.expand_fn is None:
-                emits.append(EmitRecord(st.name, addr, st.alpha, st.schedule))
-            else:
-                emits.extend(expand_emits(isa, spec, addr))
-
-    inputs = [(l.offset, _shape(l.value)) for l in input_locs]
     outputs = [
-        (l.offset, _shape(v), f"out{i}")
-        for i, (l, v) in enumerate(zip(output_locs, output_vals))
+        (
+            p.bring_to(_canon(v), p.io, p.abi(_canon(v)), f"result #{i}"),
+            # The *terminator's* shape, not the canonical value's: a result the host
+            # reads back through a reshape is still that many elements, laid out the
+            # way the source's own type says.
+            _shape(v),
+            f"out{i}",
+        )
+        for i, v in enumerate(terminator.operands)
     ]
-    return CompiledProgram(
-        isa, io, emits, inputs, outputs, [(l.offset, d) for l, d in constants]
-    )
+    return p.finish(inputs, outputs)
 
 
 # ==========================================================================#
@@ -2188,18 +2705,28 @@ def plan(isa, selection: Selection) -> CompiledProgram:
 # ==========================================================================#
 
 
-def compile_program(source: str, isa) -> CompiledProgram:
+def compile_program(source: str, isa, mapping_for=None) -> CompiledProgram:
     """Compile a source program onto ``isa``.
 
     The source program is a TOSA-dialect MLIR module given as *text* — we generate
     none ourselves; the caller hands us a module string (e.g. from torch_mlir's
     TOSA backend) and we ``Module.parse`` it here. The returned ``CompiledProgram``
-    holds only plain data (no IR handles), so the parse context can be dropped."""
+    holds only plain data (no IR handles), so the parse context can be dropped.
+
+    ``mapping_for(op) -> (Mapping, Binding) | None`` supplies an externally chosen
+    tiling for a source op — the read-back half of an external mapper (Timeloop).
+    A callable rather than a table keyed by op, because a TOSA op has no stable
+    name to key on and a driver is written once for a whole class of them. Where it
+    answers, the op is **not** required to be one instruction's worth of work: its
+    shapes derive the iteration domain and the mapping's innermost factors give the
+    instruction its own, which is the exact point at which tiling enters the
+    backend.
+    """
     with ir.Context(), ir.Location.unknown():
         module = ir.Module.parse(source)
         normalize_source(module)
         catalog = Catalog(isa)
-        selection = match_program(catalog, module)
+        selection = match_program(catalog, module, mapping_for)
         solve(selection)
         solve_layouts(isa, selection)
         return plan(isa, selection)

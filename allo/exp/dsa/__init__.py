@@ -12,6 +12,7 @@ from a TOSA source program onto that ISA (``ISA.compile_program``).
 from . import access, errors, primitive
 from .access import collapse, contiguous, expand, layout, strided, view
 from .core import ISA, BufferKind, BufferSpec, Instruction, InstructionSpec
+from .epoch import Config, Dep, Epoch, Region, Schedule, Sigma
 from .errors import (
     AcceleratorDescriptionError,
     AllocationError,
@@ -32,6 +33,13 @@ __all__ = [
     "InstructionSpec",
     "OracleConfig",
     "BufferKind",
+    # the denotational layer (epoch.py): a compiled program as epochs, with σ
+    "Config",
+    "Dep",
+    "Epoch",
+    "Region",
+    "Schedule",
+    "Sigma",
     "access",
     "errors",
     "primitive",

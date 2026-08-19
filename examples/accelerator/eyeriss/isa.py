@@ -94,7 +94,7 @@ fixed kernel), and the bias add (folded into the host program).
 
 from allo.exp.dsa import primitive
 from allo.exp.dsa.access import contiguous, view
-from allo.exp.dsa.core import ISA
+from allo.exp.dsa.core import ISA, scratch
 from allo.lang.core import f32
 
 eyeriss = ISA("Eyeriss")
@@ -302,14 +302,15 @@ def conv_layer(I):
     def _(ifm, flt, pi, po, N, C, M):
         i_img, w_all = H_TILE * H_TILE * C, M * R * S * C
         p_img = E_TILE * E_TILE * M
-        p_stage = GLB_WORDS - p_img
-        w_stage = p_stage - w_all
-        i_stage = w_stage - i_img
-        glb_load(s=flt, d=w_stage, n=w_all)  # filters, hoisted out of the image loop
+        # The staged blocks are `scratch` tiles -- values, so the allocator places
+        # them and their live ranges are the run. `ifm + n * i_img` is an offset
+        # *into* the layer's operand; the operand's own base is allocation's answer.
+        i_tile = scratch((1, H_TILE, H_TILE, C))
+        w_tile = scratch((M, R, S, C))
+        p_tile = scratch((1, E_TILE, E_TILE, M))
+        glb_load(s=flt, d=w_tile, n=w_all)  # filters, hoisted out of the image loop
         for n in range(N):
-            glb_load(s=ifm + n * i_img, d=i_stage, n=i_img)
-            glb_load(s=pi + n * p_img, d=p_stage, n=p_img)
-            conv_pass(
-                ifm=i_stage, flt=w_stage, pi=p_stage, po=p_stage, Np=1, Cp=C, Mp=M
-            )
-            glb_store(s=p_stage, d=po + n * p_img, n=p_img)
+            glb_load(s=ifm + n * i_img, d=i_tile, n=i_img)
+            glb_load(s=pi + n * p_img, d=p_tile, n=p_img)
+            conv_pass(ifm=i_tile, flt=w_tile, pi=p_tile, po=p_tile, Np=1, Cp=C, Mp=M)
+            glb_store(s=p_tile, d=po + n * p_img, n=p_img)
