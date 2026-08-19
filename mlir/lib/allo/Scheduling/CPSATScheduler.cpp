@@ -709,7 +709,7 @@ struct AllocationVar {
 /// busiest-slot demand, opened until the select cone fits the sub-cycle slack
 /// that schedule leaves the resource's operations. This count paired with those
 /// start times satisfies the headroom constraint, so it is a feasible point as
-/// a hint and buildable as a fallback.
+/// a hint.
 template <class ProblemT>
 unsigned demandWithHeadroom(ProblemT &prob, Problem::ResourceType rsrc,
                             unsigned ii, float cycleTime) {
@@ -732,8 +732,7 @@ unsigned demandWithHeadroom(ProblemT &prob, Problem::ResourceType rsrc,
 ///
 /// \p hint says the heuristic's start times are being hinted too, and then the
 /// count hinted is the tightest one those start times admit with the select
-/// cone charged. On a region whose budget runs out, `applyDemandAllocation`
-/// ships that same count.
+/// cone charged.
 ///
 /// \p owned are the rows a shared class already carries (`addSharedClasses`),
 /// skipped so one model never prices a row twice.
@@ -1101,18 +1100,80 @@ void applyAllocation(OccupancyProblem &prob, const Allocated &decided,
       << " instances of " << decided.size() << " shared operator types";
 }
 
-/// Fall back to the tightest allocation the schedule already on the problem
-/// admits, for a solve that decided none: the busiest-cycle demand with the
-/// select cone held against the slack that schedule leaves. Without it, a
-/// region whose budget ran out keeps the trivial allocation (one instance per
-/// operation) instead of what the schedule actually supports.
+/// Fall back to a first-fit shared allocation over the schedule already on the
+/// problem, for a solve that decided none. Operations whose realization was
+/// the solver's to decide join no class up front; here they are grouped at the
+/// library's own pick, which is what an undecided solve realizes them as. Bins
+/// then grow member by member in start order; joining one holds the class's
+/// select cone at the grown size against every member's own sub-cycle slack,
+/// so one packed operation keeps its own instance instead of opening the whole
+/// class to its ceiling the way a class-wide minimum slack would.
 template <class ProblemT>
-void applyDemandAllocation(ProblemT &prob, unsigned ii, float cycleTime) {
-  Allocated decided;
-  for (Problem::ResourceType rsrc : prob.getResourceTypes())
-    if (prob.getAllocatable(rsrc))
-      decided.push_back({rsrc, demandWithHeadroom(prob, rsrc, ii, cycleTime)});
-  applyAllocation(prob, decided, ii);
+void applyFallbackAllocation(ProblemT &prob, const OperatorLibrary &lib,
+                             bool allocate, unsigned ii, float cycleTime) {
+  if (allocate)
+    populateOperatorAllocation(prob, lib, AllocationScope::Selecting);
+  int64_t built = 0, ops = 0;
+  unsigned classes = 0;
+  for (Problem::ResourceType rsrc : prob.getResourceTypes()) {
+    auto unit = prob.getAllocatable(rsrc);
+    if (!unit)
+      continue;
+    unsigned ceiling = unit->ceiling;
+    // The cone the model itself would charge a fullest instance of f members:
+    // the table entry at the largest count whose fullest instance holds f.
+    auto cone = [&](unsigned f) {
+      return f <= 1 ? 0.0 : unit->headroomNs[(ceiling - 1) / (f - 1)];
+    };
+    struct Bin {
+      SmallVector<Operation *, 2> members;
+      llvm::SmallDenseSet<unsigned, 4> slots; // congruence classes, cyclic
+      unsigned freeAt = 0;                    // next free cycle, acyclic
+      double minSlack = std::numeric_limits<double>::infinity();
+    };
+    SmallVector<Bin> bins;
+    for (Operation *op : prob.usersOf(rsrc)) {
+      double slack = double(cycleTime) - *prob.getStartTimeInCycle(op) -
+                     *prob.getIncomingDelay(*prob.getLinkedOperatorType(op));
+      unsigned start = *prob.getStartTime(op);
+      unsigned occ = prob.getResourceCycles(op);
+      auto free = [&](Bin &bin) {
+        if (!ii)
+          return bin.freeAt <= start;
+        for (unsigned k = 0; k < occ; ++k)
+          if (bin.slots.count((start + k) % ii))
+            return false;
+        return true;
+      };
+      Bin *dest = nullptr;
+      for (Bin &bin : bins)
+        if (cone(bin.members.size() + 1) <= std::min(bin.minSlack, slack) &&
+            free(bin)) {
+          dest = &bin;
+          break;
+        }
+      if (!dest)
+        dest = &bins.emplace_back();
+      dest->members.push_back(op);
+      dest->minSlack = std::min(dest->minSlack, slack);
+      if (ii)
+        for (unsigned k = 0; k < occ; ++k)
+          dest->slots.insert((start + k) % ii);
+      else
+        dest->freeAt = start + occ;
+    }
+    prob.setAllocation(rsrc, bins.size());
+    for (auto [k, bin] : llvm::enumerate(bins))
+      for (Operation *m : bin.members)
+        prob.setAssignedUnit(m, static_cast<unsigned>(k));
+    built += bins.size();
+    ops += ceiling;
+    ++classes;
+  }
+  if (classes)
+    info(Stage::Sched, prob.getContainingOp())
+        << "Allocated: " << ops << " operations onto " << built
+        << " instances of " << classes << " shared operator types";
 }
 
 /// Report a solve that produced nothing usable and leave the heuristic's
@@ -1489,7 +1550,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
         SolveWithParameters(model.Build(), solverParameters(opts));
     if (!solved(boot)) {
       reportUnsolved(prob, boot, opts.budget);
-      applyDemandAllocation(prob, /*ii=*/0, cycleTime);
+      applyFallbackAllocation(prob, span.device, opts.allocate, /*ii=*/0,
+                              cycleTime);
       return success();
     }
     rehintAll(model, boot);
@@ -1560,7 +1622,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     first = SolveWithParameters(model.Build(), solverParameters(opts));
     if (!solved(first)) {
       reportUnsolved(prob, first, opts.budget);
-      applyDemandAllocation(prob, /*ii=*/0, cycleTime);
+      applyFallbackAllocation(prob, span.device, opts.allocate, /*ii=*/0,
+                              cycleTime);
       return success();
     }
     ranFirst = true;
@@ -1589,7 +1652,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
          "the span solve's schedule satisfies the pinned model");
   if (!solved(second) && !ranFirst) {
     reportUnsolved(prob, second, opts.budget);
-    applyDemandAllocation(prob, /*ii=*/0, cycleTime);
+    applyFallbackAllocation(prob, span.device, opts.allocate, /*ii=*/0,
+                              cycleTime);
     return success();
   }
   const CpSolverResponse &pick = solved(second) ? second : first;
@@ -2214,7 +2278,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                        : "Exact scheduling found nothing shorter than the "
                          "heuristic's schedule at II=")
           << greedyII << "; keeping it";
-    applyDemandAllocation(prob, greedyII, cycleTime);
+    applyFallbackAllocation(prob, span.device, opts.allocate, greedyII,
+                            cycleTime);
     return success();
   }
 

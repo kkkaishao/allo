@@ -159,6 +159,12 @@ public:
     return assignedUnit.lookup(op);
   }
 
+  /// Record which instance \p op runs on, for a caller that derives the
+  /// assignment itself rather than through `assignUnits`.
+  void setAssignedUnit(Operation *op, unsigned index) {
+    assignedUnit[op] = index;
+  }
+
   /// Turn every decided count into an assignment of operations to instances,
   /// spread round-robin over all the instances the decision bought rather than
   /// packed into the fewest that would fit.

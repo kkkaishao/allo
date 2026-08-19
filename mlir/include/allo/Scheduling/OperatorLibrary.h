@@ -552,15 +552,19 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
 /// no select between them and the emitter builds one only where the drivers
 /// differ.
 ///
-/// \p exactSelects says the exact solver will decide realizations: an
-/// operation with selection candidates then joins no class HERE, since a
-/// class groups one STATIC identity and the solve may move the operation off
-/// it. The exact model re-composes such operations into the class of
-/// whichever row they decide (its shared classes), merging with the static
-/// members this declares.
+/// Which operations join a class. `Static` is the exact path: an operation
+/// with selection candidates joins no class, since a class groups one STATIC
+/// identity and the solve may move the operation off it; the exact model
+/// re-composes such operations into the class of whichever row they decide
+/// (its shared classes), merging with the static members this declares.
+/// `Selecting` is the exact FALLBACK: only those skipped operations, grouped
+/// at the library's own pick, which is what a solve that decided nothing
+/// realizes them as.
+enum class AllocationScope { All, Static, Selecting };
+
 template <class ProblemT>
 void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib,
-                                bool exactSelects) {
+                                AllocationScope scope) {
   using namespace circt::scheduling;
   constexpr bool isCyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
   // The loop whose carried values a shared unit re-injects; its own induction
@@ -589,9 +593,12 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib,
     OperatorChar c = lib.lookup(op);
     if (!c.identity.realized() || c.identity.comb)
       continue;
-    if (exactSelects && !selectionCandidates(op, lib, isCyclic).empty())
-      continue; // the realization is the solver's decision; the op keeps its
-                // own instance and bind-time sharing may still fold it
+    bool selects = scope != AllocationScope::All &&
+                   !selectionCandidates(op, lib, isCyclic).empty();
+    if (scope == AllocationScope::Static && selects)
+      continue; // the realization is the solver's decision
+    if (scope == AllocationScope::Selecting && !selects)
+      continue; // already declared by the Static pass
     // A non-pipelined unit is busy for its whole latency; a pipelined one
     // contends only for its issue slot.
     unsigned occ = c.pipelined ? 1 : std::max(1u, c.timing.latency);
@@ -643,6 +650,7 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib,
                   static_cast<unsigned>(std::max<int64_t>(1, cls.portWidth)));
     }
     Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
+    assert(!problem.getAllocatable(rsrc) && "one identity is declared once");
     problem.setAllocatable(
         rsrc, typename ProblemT::AllocatableUnit{ceiling, std::move(price),
                                                  std::move(headroom)});
