@@ -50,7 +50,13 @@ MARK = "@@SYNTH@@"
 
 
 def emit_one(
-    key: str, variant: str, scheduler: str, binding: str, freq: float | None, work: Path
+    key: str,
+    variant: str,
+    scheduler: str,
+    binding: str,
+    objective: str,
+    freq: float | None,
+    work: Path,
 ) -> dict:
     """Compile one (benchmark, variant, scheduler) and scaffold it under
     ``work``, returning the row the synthesis phase consumes."""
@@ -75,7 +81,9 @@ def emit_one(
         parts = bench.build()
         sched = bench.schedules[variant](parts)
         opts = {"freq_mhz": freq} if freq is not None else {}
-        rtl = sched.export("rtl", **opts).set_scheduler_opt(scheduler=scheduler)
+        rtl = sched.export("rtl", **opts).set_scheduler_opt(
+            scheduler=scheduler, O=objective
+        )
         if binding == "trivial":
             rtl.use_trivial_binding()
         res = rtl.schedule()
@@ -84,12 +92,20 @@ def emit_one(
             warnings.simplefilter("always")
             rtl.scaffold_project(str(work / f"{tag}.prj"))
         q = rtl.estimation
+        # Under O="freq" the compile wrote the clock it chose back to the
+        # handle, and that clock is what the design is held to; otherwise the
+        # model period (post-derate) is the honest constraint.
+        cycle_ns = (
+            1000.0 / rtl.freq_mhz
+            if objective == "freq"
+            else res.cycle_ns or 1000.0 / rtl.freq_mhz
+        )
         out.update(
             status="pass",
             top=rtl.top,
             part=rtl.device.part,
             clk=rtl.interfaces.of_symbol(rtl.top).control.clk,
-            cycle_ns=res.cycle_ns or 1000.0 / rtl.freq_mhz,
+            cycle_ns=cycle_ns,
             predicted={**area_of(q), "mem_bits": q.mem_bits},
             blackboxes=[str(w.message) for w in caught],
         )
@@ -99,7 +115,7 @@ def emit_one(
 
 
 def _run_child(
-    item, binding: str, freq: float | None, work: Path, timeout: int
+    item, binding: str, objective: str, freq: float | None, work: Path, timeout: int
 ) -> dict:
     key, variant, scheduler = item
     env = dict(os.environ)
@@ -114,6 +130,8 @@ def _run_child(
         f"{key}::{variant}::{scheduler}",
         "--binding",
         binding,
+        "--objective",
+        objective,
         "--work",
         str(work),
     ]
@@ -306,12 +324,14 @@ _ACT = ("lut", "lut_logic", "lut_mem", "srl", "ff", "dsp", "carry8", "bram")
 def write_csv(work: Path, rows: list[dict], impl: bool) -> None:
     with (work / "synth.csv").open("w") as f:
         w = csv.writer(f)
-        head = ["tag", "status"] + [f"pred_{k}" for k in _PRED] + list(_ACT)
+        head = ["tag", "status", "clock_mhz"] + [f"pred_{k}" for k in _PRED]
+        head += list(_ACT)
         if impl:
             head += ["wns_ns", "fmax_mhz"]
         w.writerow(head)
         for r in rows:
-            line = [r["tag"], r["status"]]
+            clock = round(1000.0 / r["cycle_ns"], 1) if "cycle_ns" in r else ""
+            line = [r["tag"], r["status"], clock]
             line += [r.get("predicted", {}).get(k, "") for k in _PRED]
             a = r.get("actual") or {}
             line += [a.get(k, "") for k in _ACT]
@@ -381,6 +401,12 @@ def main() -> None:
         help="'trivial' or 'auto', as the bed scan takes it",
     )
     ap.add_argument(
+        "--objective",
+        default="cycles",
+        help="the O knob each case compiles under; 'freq' constrains each "
+        "design at the clock its sweep chose",
+    )
+    ap.add_argument(
         "--freq", type=float, help="target clock (MHz), overriding the device default"
     )
     ap.add_argument(
@@ -416,7 +442,9 @@ def main() -> None:
 
     if args.one:
         key, variant, scheduler = args.one.split("::")
-        row = emit_one(key, variant, scheduler, args.binding, args.freq, work)
+        row = emit_one(
+            key, variant, scheduler, args.binding, args.objective, args.freq, work
+        )
         print(MARK + json.dumps(row), flush=True)
         return
 
@@ -441,7 +469,10 @@ def main() -> None:
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = [
-            pool.submit(_run_child, it, args.binding, args.freq, work, args.timeout)
+            pool.submit(
+                _run_child, it, args.binding, args.objective, args.freq, work,
+                args.timeout,
+            )
             for it in items
         ]
         for i, f in enumerate(futs, 1):
