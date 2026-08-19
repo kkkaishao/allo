@@ -214,6 +214,7 @@ def measure_one(
     budget: float | None = None,
     binding: str = "trivial",
     workers: int | None = None,
+    objective: str = "cycles",
 ) -> dict:
     """Schedule (and by default compile) one variant, returning its metrics.
 
@@ -222,7 +223,8 @@ def measure_one(
     exact solve may spend, in deterministic time units. ``workers`` overrides how
     many search workers one exact solve runs. ``binding`` is ``"trivial"`` (one
     unit per op) or ``"auto"``, the binding the scheduler implies; the recorded
-    row carries the resolved name."""
+    row carries the resolved name. ``objective`` is the exact solver's
+    optimization direction (the ``O`` knob); the heuristic ignores it."""
     bench = _load(key)
     out: dict = {
         "key": key,
@@ -232,6 +234,7 @@ def measure_one(
         "budget": budget,
         "workers": workers,
         "binding": binding,
+        "objective": objective,
         "stage": "build",
         "status": "error",
     }
@@ -249,7 +252,7 @@ def measure_one(
         opts = {}
         if freq is not None:
             opts["freq_mhz"] = freq
-        knobs = {"scheduler": scheduler}
+        knobs = {"scheduler": scheduler, "O": objective}
         if budget is not None:
             knobs["budget"] = budget
         if workers is not None:
@@ -360,6 +363,7 @@ def _run_child(
     budget: float | None,
     binding: str,
     workers: int | None,
+    objective: str,
 ) -> dict:
     key, variant, scheduler = item
     env = dict(os.environ)
@@ -376,6 +380,8 @@ def _run_child(
         stage,
         "--binding",
         binding,
+        "--objective",
+        objective,
     ]
     if freq is not None:
         cmd += ["--freq", str(freq)]
@@ -739,6 +745,13 @@ def main():
         "portfolio is interleaved, so the deterministic budget still bounds a "
         "deterministic search; the axis a parallel-solve change is swept over",
     )
+    ap.add_argument(
+        "-O",
+        "--objective",
+        default="cycles",
+        help="the exact solver's optimization direction (the O knob); the "
+        "heuristic ignores it",
+    )
     ap.add_argument("--timeout", type=int, default=900, help="wall seconds per run")
     ap.add_argument("-o", "--out", default="qor.json")
     ap.add_argument("--per-region", action="store_true")
@@ -772,6 +785,7 @@ def main():
                     args.budget,
                     args.binding,
                     args.workers,
+                    args.objective,
                 )
             )
         )
@@ -800,9 +814,10 @@ def main():
     clock = f", freq={args.freq}MHz" if args.freq else ""
     pool_size = f", budget={args.budget}" if args.budget else ""
     nproc = f", workers={args.workers}" if args.workers else ""
+    direction = f", O={args.objective}" if args.objective != "cycles" else ""
     print(
         f"{len(work)} runs, {args.jobs} jobs, stage={args.stage}"
-        f", binding={args.binding}{clock}{pool_size}{nproc}",
+        f", binding={args.binding}{clock}{pool_size}{nproc}{direction}",
         flush=True,
     )
 
@@ -818,6 +833,7 @@ def main():
                 args.budget,
                 args.binding,
                 args.workers,
+                args.objective,
             )
             for w in work
         ]

@@ -113,11 +113,13 @@ def verify_one(
     scheduler: str = "heuristic",
     seed: int = 0,
     cycles: int = 0,
+    objective: str = "cycles",
 ) -> dict:
     """Compile one variant under one binding, cosim it and compare.
 
     ``binding`` is the operator-sharing policy and the axis this probe exists
-    for; ``cycles`` overrides the derived simulation budget."""
+    for; ``cycles`` overrides the derived simulation budget. ``objective`` is
+    the exact solver's optimization direction (the ``O`` knob)."""
     from allo.backend.rtl import LatencyModelWarning
     from benchmark.spec import find
 
@@ -127,6 +129,7 @@ def verify_one(
         "variant": variant,
         "binding": binding,
         "scheduler": scheduler,
+        "objective": objective,
         "stage": "build",
         "status": "error",
     }
@@ -138,7 +141,7 @@ def verify_one(
     try:
         parts = bench.build()
         sched = bench.schedules[variant](parts)
-        rtl = sched.export("rtl").set_scheduler_opt(scheduler=scheduler)
+        rtl = sched.export("rtl").set_scheduler_opt(scheduler=scheduler, O=objective)
         if binding == "trivial":
             rtl.use_trivial_binding()
 
@@ -191,7 +194,9 @@ def verify_one(
     return out
 
 
-def _run_child(item, scheduler: str, seed: int, cycles: int, timeout: int) -> dict:
+def _run_child(
+    item, scheduler: str, seed: int, cycles: int, timeout: int, objective: str
+) -> dict:
     key, variant, binding = item
     env = dict(os.environ)
     env["XILINX_VITIS"] = "/nonexistent"
@@ -209,6 +214,8 @@ def _run_child(item, scheduler: str, seed: int, cycles: int, timeout: int) -> di
         str(seed),
         "--cycles",
         str(cycles),
+        "--objective",
+        objective,
     ]
     t0 = time.time()
     base = {"key": key, "variant": variant, "binding": binding, "scheduler": scheduler}
@@ -354,6 +361,13 @@ def main():
         default="heuristic",
         help="the solver each binding is realized on. A scalar, not an axis",
     )
+    ap.add_argument(
+        "-O",
+        "--objective",
+        default="cycles",
+        help="the exact solver's optimization direction (the O knob); the "
+        "heuristic ignores it",
+    )
     ap.add_argument("--seed", type=int, default=0, help="the input generator's seed")
     ap.add_argument(
         "--cycles",
@@ -371,7 +385,13 @@ def main():
             MARK
             + json.dumps(
                 verify_one(
-                    key, variant, binding, args.scheduler, args.seed, args.cycles
+                    key,
+                    variant,
+                    binding,
+                    args.scheduler,
+                    args.seed,
+                    args.cycles,
+                    args.objective,
                 )
             )
         )
@@ -410,7 +430,13 @@ def main():
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = [
             pool.submit(
-                _run_child, w, args.scheduler, args.seed, args.cycles, args.timeout
+                _run_child,
+                w,
+                args.scheduler,
+                args.seed,
+                args.cycles,
+                args.timeout,
+                args.objective,
             )
             for w in work
         ]
