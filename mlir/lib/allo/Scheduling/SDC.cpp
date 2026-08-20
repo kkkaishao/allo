@@ -1404,9 +1404,9 @@ static void loadDependentDialects(MLIRContext &context) {
 }
 
 // The least clock period the solve can hold: every operation must fit a cycle
-// of its own, `regFloor + inDelay` to reach its first register and `outDelay`
-// to leave its last, the two bounds the chaining model needs of a single
-// operator. A target below the result is raised rather than refused, so an
+// of its own, `regFloor + inDelay` to reach its first register, `outDelay` to
+// leave its last, and `minPeriod` for the internal stages the row is
+// warranted at. A target below the result is raised rather than refused, so an
 // over-period operator lowers the achieved frequency instead of failing the
 // compile. Each offending row is named once, with what would shorten it.
 //
@@ -1428,7 +1428,8 @@ static float minSchedulablePeriod(ArrayRef<func::FuncOp> funcs,
       NodeTiming t = asMemAccess(op)
                          ? accessCharacterization(op, dev.operators, dev.memory)
                          : dev.operators.lookup(op).timing;
-      float need = std::max(regFloor + (float)t.inDelay, (float)t.outDelay);
+      float need = std::max(
+          {regFloor + (float)t.inDelay, (float)t.outDelay, (float)t.minPeriod});
       if (need <= target)
         return;
       least = std::max(least, need);

@@ -531,6 +531,11 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator",
     rule the verifier and the evaluator both switch on is worth more than the
     notation a per-op exception would save.
 
+    `min_period` is the least clock period the row's internal pipeline stages
+    are warranted at, from the device characterization. A selection period
+    below it cannot hold the core, whatever its boundary cones say; `0` claims
+    nothing (the row holds any period its `in_delay`/`out_delay` fit).
+
     `fed_width`, when present, restricts the row to operations whose operands
     carry no more significant bits than it: the same core measured with its
     inputs known to be extensions, where synthesis prunes the array. Such a
@@ -548,6 +553,7 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator",
     I64Attr:$latency,
     F32Attr:$in_delay,
     F32Attr:$out_delay,
+    DefaultValuedAttr<F32Attr, "0.0">:$min_period,
     DefaultValuedAttr<BoolAttr, "true">:$pipelined,
     DefaultValuedAttr<StallContractAttr, "::mlir::allo::StallContractEnum::Ce">:$stall,
     OptionalAttr<ArrayAttr>:$uses,

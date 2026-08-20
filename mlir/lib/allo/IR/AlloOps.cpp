@@ -716,6 +716,10 @@ void DCPathOperatorOp::print(OpAsmPrinter &p) {
   printNum(p, getInDelayAttr().getValueAsDouble());
   p << " out_delay ";
   printNum(p, getOutDelayAttr().getValueAsDouble());
+  if (double mp = getMinPeriodAttr().getValueAsDouble()) {
+    p << " min_period ";
+    printNum(p, mp);
+  }
   if (getPipelined())
     p << " pipelined";
   p << ' ' << stringifyStallContractEnum(getStall());
@@ -743,6 +747,10 @@ ParseResult DCPathOperatorOp::parse(OpAsmParser &p, OperationState &result) {
   auto fnTy = dyn_cast<FunctionType>(sig);
   if (!fnTy)
     return p.emitError(p.getNameLoc(), "expected a function-type signature");
+  double minPeriod = 0.0;
+  if (succeeded(p.parseOptionalKeyword("min_period")) &&
+      parseNum(p, minPeriod))
+    return failure();
   bool pipelined = succeeded(p.parseOptionalKeyword("pipelined"));
   if (p.parseKeyword(&stall))
     return failure();
@@ -758,6 +766,8 @@ ParseResult DCPathOperatorOp::parse(OpAsmParser &p, OperationState &result) {
                       b.getF32FloatAttr(inDelay));
   result.addAttribute(getOutDelayAttrName(result.name),
                       b.getF32FloatAttr(outDelay));
+  result.addAttribute(getMinPeriodAttrName(result.name),
+                      b.getF32FloatAttr(minPeriod));
   result.addAttribute(getPipelinedAttrName(result.name),
                       b.getBoolAttr(pipelined));
   result.addAttribute(getStallAttrName(result.name),

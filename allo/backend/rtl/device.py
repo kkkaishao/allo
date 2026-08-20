@@ -939,6 +939,7 @@ def inject_operators(module, device: Device):
                 latency=t.latency,
                 in_delay=FloatAttr.get(f32ty, t.in_delay_ns),
                 out_delay=FloatAttr.get(f32ty, t.out_delay_ns),
+                min_period=FloatAttr.get(f32ty, t.min_period_ns),
                 pipelined=t.pipelined,
                 stall=stall,
                 uses=_uses_attr(device.operator_uses.get(op.symbol), device.name),

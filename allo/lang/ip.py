@@ -52,6 +52,9 @@ class Timing:
     pipelined: bool
     # pipelining style: free running, elastic, or clock enable
     style: Literal["free", "elastic", "ce"] | None = None
+    # least clock period (ns) the core's internal stages are warranted at;
+    # 0 claims nothing and leaves the boundary cones as the only gate
+    min_period_ns: float = 0.0
 
 
 def verify_timing(timing: Timing):
@@ -61,6 +64,8 @@ def verify_timing(timing: Timing):
         raise ValueError("Input delay must be non-negative.")
     if timing.out_delay_ns < 0:
         raise ValueError("Output delay must be non-negative.")
+    if timing.min_period_ns < 0:
+        raise ValueError("Minimum period must be non-negative.")
     if timing.pipelined:
         if timing.style is None:
             raise ValueError("Pipelined operations must specify a style.")
@@ -82,6 +87,7 @@ class IP(Kernel[P, R]):
         out_delay_ns: float = 0.0,
         pipelined: bool = False,
         style: Literal["free", "elastic", "ce"] | None = None,
+        min_period_ns: float = 0.0,
     ):
         super().__init__(fn, mapping=())
         if self.is_async:
@@ -92,6 +98,7 @@ class IP(Kernel[P, R]):
             out_delay_ns=out_delay_ns,
             pipelined=pipelined,
             style=style,
+            min_period_ns=min_period_ns,
         )
         # An optional user behavioral model for cosim: a C expression over the
         # operands `a`, `b`, ... computing the result (see `add_c_model`). None
@@ -171,6 +178,7 @@ class OperatorIP(IP[P, R]):
         pipelined: bool = False,
         style: Literal["free", "elastic", "ce"] | None = None,
         fed_width: int | None = None,
+        min_period_ns: float = 0.0,
     ):
         super().__init__(
             fn,
@@ -179,6 +187,7 @@ class OperatorIP(IP[P, R]):
             out_delay_ns=out_delay_ns,
             pipelined=pipelined,
             style=style,
+            min_period_ns=min_period_ns,
         )
         self.optype = optype
         # Restricts the row to ops whose operands carry no more significant
@@ -223,15 +232,21 @@ class OperatorIP(IP[P, R]):
         return f"{self.mnemonic}_{'_'.join(tags)}_l{self.timing.latency}"
 
     def retimed(
-        self, latency: int, in_delay_ns: float | None = None
+        self,
+        latency: int,
+        in_delay_ns: float | None = None,
+        min_period_ns: float | None = None,
     ) -> "OperatorIP[P, R]":
         """A copy of this core pipelined to ``latency``. The symbol follows the
         new latency, so the same core at two depths gets two names.
-        ``in_delay_ns`` overrides the archetype's input cone for this depth."""
+        ``in_delay_ns`` overrides the archetype's input cone for this depth;
+        ``min_period_ns`` states the clock the depth's internal stages hold."""
         core = copy.copy(self)
         core.timing = replace(self.timing, latency=latency)
         if in_delay_ns is not None:
             core.timing = replace(core.timing, in_delay_ns=in_delay_ns)
+        if min_period_ns is not None:
+            core.timing = replace(core.timing, min_period_ns=min_period_ns)
         verify_timing(core.timing)
         return core
 
@@ -248,6 +263,7 @@ def operator_ip(
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
     fed_width: int | None = None,
+    min_period_ns: float = 0.0,
 ) -> OperatorIP[P, R]: ...
 
 
@@ -262,6 +278,7 @@ def operator_ip(
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
     fed_width: int | None = None,
+    min_period_ns: float = 0.0,
 ) -> Callable[[Callable[P, R]], OperatorIP[P, R]]: ...
 
 
@@ -276,6 +293,7 @@ def operator_ip(
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
     fed_width: int | None = None,
+    min_period_ns: float = 0.0,
 ) -> OperatorIP[P, R] | Callable[[Callable[P, R]], OperatorIP[P, R]]:
     """Declare an operator core: an external block the compiler binds ops of
     ``optype`` onto. The body is ``...``; the parameters declare the signature,
@@ -294,6 +312,7 @@ def operator_ip(
             pipelined=pipelined,
             style=style,
             fed_width=fed_width,
+            min_period_ns=min_period_ns,
         )
 
     return build(fn) if fn is not None else build

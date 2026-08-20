@@ -79,6 +79,9 @@ struct OperatorEntry {
   bool pipelined = true; // accepts a new input every cycle
   double inDelay = 0.0;  // ns, IP rows: the signature pins the width
   double outDelay = 0.0;
+  /// The least clock period the row's internal stages are warranted at (ns).
+  /// Zero claims nothing; the boundary cones are the only gate then.
+  double minPeriod = 0.0;
   /// Nonzero on a row measured with its inputs extensions of this many
   /// significant bits: a candidate only for operations proven that narrow.
   unsigned fedWidth = 0;
@@ -118,6 +121,7 @@ struct NodeTiming {
   uint32_t latency = 0;
   double inDelay = 0.0;  // ns, from an operand to this node
   double outDelay = 0.0; // ns, from this node to its consumer
+  double minPeriod = 0.0; // ns, the least period the unit behind it holds
 };
 
 /// What a lookup resolves for one operation: the timing row it is scheduled

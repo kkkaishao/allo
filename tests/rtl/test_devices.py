@@ -25,6 +25,8 @@ from allo.backend.rtl.devices import (
 )
 from allo.backend.rtl.devices.spec import IPRow
 
+from _common import FMUL
+
 
 def _tables():
     return [
@@ -270,7 +272,10 @@ def test_scaffold_writes_split_rtl_and_realization(tmp_path):
     manifest = json.loads((root / "manifest.json").read_text())
     assert "sf_top" in manifest
     # The realizer's contribution rides along.
-    assert "module mul_f32_f32_f32_l4(" in (root / "shims.v").read_text()
+    # The shortest multiply the CLOCK CAN HOLD is the one the library binds, so
+    # the depth comes off the table rather than being restated here; a row
+    # declared for a slower clock is not a candidate at this one.
+    assert f"module mul_f32_f32_f32_l{FMUL}(" in (root / "shims.v").read_text()
     assert "create_ip" in (root / "gen_ip.tcl").read_text()
     # Split emission ran on a copy: the compiled module still exports whole.
     assert rtl.verilog

@@ -19,10 +19,32 @@ def _key(op):
     return (kind, op.parse_argument_annotations()[0].name)
 
 
-# The library binds the shortest candidate of a kind and signature, so that is
-# the latency a test predicts a schedule against.
+# The default clock the chaining scheduler cuts to. A test that picks a clock to
+# make a chain fit or not fit derives the period from these rather than
+# restating the device's numbers.
+PERIOD_NS = 1000.0 / default_device.default_freq_mhz
+
+# What one register-to-register hop costs before any logic. Paid once per cycle
+# rather than once per operator, so a chain of n operators costs
+# `REG_NS + n * comb_step_ns(...)` and not `n * comb_ns(...)`.
+REG_NS = default_device.reg_delay_ns
+
+
+# The library binds the shortest candidate of a kind and signature THAT THE
+# CLOCK CAN HOLD, so that is the latency a test predicts a schedule against. A
+# row whose cone or warranted period needs more than a clock -- a core declared
+# for slower clocks -- is not a candidate here any more than it is there.
 _LAT: dict[tuple[str, str], int] = {}
 for _o in default_device.operators:
+    if (
+        max(
+            REG_NS + _o.timing.in_delay_ns,
+            _o.timing.out_delay_ns,
+            _o.timing.min_period_ns,
+        )
+        > PERIOD_NS
+    ):
+        continue
     _k = _key(_o)
     _LAT[_k] = min(_LAT.get(_k, _o.timing.latency), _o.timing.latency)
 
@@ -34,17 +56,6 @@ IMUL64 = _LAT[("mul", "int64")]  # 64-bit integer multiply, the reciprocal's rid
 IDIV = _LAT[("divsi", "int32")]  # 32-bit signed integer divide
 MEM = default_device.storage["lutram"].read_latency  # default read/write
 MEM_URAM = default_device.storage["uram"].read_latency
-
-# The default clock the chaining scheduler cuts to. A test that picks a clock to
-# make a chain fit or not fit derives the period from these rather than
-# restating the device's numbers.
-PERIOD_NS = 1000.0 / default_device.default_freq_mhz
-
-# What one register-to-register hop costs before any logic. Paid once per cycle
-# rather than once per operator, so a chain of n operators costs
-# `REG_NS + n * comb_step_ns(...)` and not `n * comb_ns(...)`.
-REG_NS = default_device.reg_delay_ns
-
 
 # A device delay row is a curve over operand width, so a caller names the width
 # it means. 32 is the default because these kernels are i32.

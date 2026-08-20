@@ -344,9 +344,14 @@ class RTL(Backend[P, R]):
         QoR's ``fmax``) by construction, so the operating clock moves there,
         with ``clock_margin`` withheld on top of it. Honest in both directions:
         a design whose paths came in under the target speeds up, one that
-        missed it slows down. Returns the new ``freq_mhz``, which ``cosim``
-        then drives. Runs by itself at compile under ``O="freq"``."""
+        missed it slows down. A bound row's warranted period caps the move:
+        internal pipeline stages are not paths the estimator can see. Returns
+        the new ``freq_mhz``, which ``cosim`` then drives. Runs by itself at
+        compile under ``O="freq"``."""
         period = 1000.0 / self.estimation.fmax
+        floors = {o.symbol: o.timing.min_period_ns for o in self._device.operators}
+        bound = {op.impl for m in self.interfaces.values() for op in m.operators}
+        period = max(period, *(floors[i] for i in bound)) if bound else period
         self._set_clock(period / (1.0 - self._sched_opts.clock_margin))
         return self.freq_mhz
 

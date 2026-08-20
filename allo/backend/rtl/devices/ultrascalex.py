@@ -214,46 +214,112 @@ SCATTER_STORAGE = "register"
 #: the number covers the whole path a caller sees. The trailing comment on each
 #: row is that core's achieved Fmax in MHz, a record of the characterization run
 #: and not an input to the cost model. Several rows under one archetype declare
-#: several cores for the library to choose between; every row closes at the
-#: part's default frequency. ``lut`` is logic sites only: the shift registers a
+#: several cores for the library to choose between. A row is warranted at the
+#: part's default clock unless ``min_period_ns`` declares its own floor: below
+#: the default it is the fastest clock a routed design has closed with the row
+#: inside, above the default it marks a core only a slower clock holds, derated
+#: from the wrapper measurement. The latency-1 rows are combinational up to
+#: their output register and carry the measured cone in ``in_delay_ns``, which
+#: gates them the same way. ``lut`` is logic sites only: the shift registers a
 #: core holds internally are split out as ``slicem_lut``.
 IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ip.fadd: (
         IPRow(
-            7, {"lut": 257, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry8": 10}
+            7,
+            {"lut": 257, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry8": 10},
+            min_period_ns=3.11,
         ),  # 432
-        IPRow(5, {"lut": 370, "slicem_lut": 13, "ff": 242, "carry8": 17}),  # 439
+        IPRow(
+            5,
+            {"lut": 370, "slicem_lut": 13, "ff": 242, "carry8": 17},
+            min_period_ns=2.47,
+        ),  # 439
+        IPRow(3, {"lut": 385, "ff": 152, "carry8": 17}, min_period_ns=2.04),  # 425
+        IPRow(2, {"lut": 382, "ff": 75, "carry8": 17}, min_period_ns=4.09),  # 326
+        IPRow(1, {"lut": 392, "ff": 33, "carry8": 17}, in_delay_ns=4.51),  # 203
     ),
     ip.fsub: (
         IPRow(
             7, {"lut": 257, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry8": 10}
         ),  # 432
         IPRow(5, {"lut": 370, "slicem_lut": 13, "ff": 242, "carry8": 17}),  # 439
+        IPRow(3, {"lut": 385, "ff": 152, "carry8": 17}, min_period_ns=2.79),  # 425
+        IPRow(2, {"lut": 382, "ff": 75, "carry8": 17}, min_period_ns=4.09),  # 326
+        IPRow(1, {"lut": 392, "ff": 33, "carry8": 17}, in_delay_ns=4.51),  # 203
     ),
-    ip.fmul: IPRow(
-        4, {"lut": 114, "slicem_lut": 1, "ff": 109, "dsp": 2, "carry8": 9}
-    ),  # 570
-    ip.fdiv: IPRow(12, {"lut": 771, "slicem_lut": 39, "ff": 477, "carry8": 109}),  # 374
-    ip.fcmp: IPRow(1, {"lut": 63, "ff": 2, "carry8": 7}),  # 610
+    # The 2-cycle multiply measures 376 MHz here and routes below 300 in a
+    # module (taking it cost dft, symm, atax and bicg the clock), so its floor
+    # derates the wrapper number and admits it only below the default clock.
+    ip.fmul: (
+        IPRow(
+            4,
+            {"lut": 114, "slicem_lut": 1, "ff": 109, "dsp": 2, "carry8": 9},
+            min_period_ns=2.65,
+        ),  # 570
+        IPRow(3, {"lut": 80, "ff": 94, "dsp": 2, "carry8": 8}, min_period_ns=2.06),  # 473
+        IPRow(2, {"lut": 81, "ff": 51, "dsp": 2, "carry8": 8}, min_period_ns=3.55),  # 376
+        IPRow(1, {"lut": 79, "ff": 33, "dsp": 2, "carry8": 8}, in_delay_ns=3.37),  # 264
+    ),
+    # The 10-cycle divide measures the same frequency as the 12 beside it, two
+    # cycles shorter and no dearer, so the pick takes it at this grade; the
+    # deeper row stays declared for a clock the shorter one cannot hold.
+    ip.fdiv: (
+        IPRow(
+            12,
+            {"lut": 771, "slicem_lut": 39, "ff": 477, "carry8": 109},
+            min_period_ns=2.39,
+        ),  # 374
+        IPRow(10, {"lut": 771, "slicem_lut": 34, "ff": 478, "carry8": 109}),  # 371
+    ),
+    ip.fcmp: IPRow(1, {"lut": 63, "ff": 2, "carry8": 7}, min_period_ns=1.87),  # 610
     ip.dadd: (
         IPRow(
             14, {"lut": 721, "slicem_lut": 90, "ff": 872, "dsp": 3, "carry8": 30}
         ),  # 575
         IPRow(6, {"lut": 719, "slicem_lut": 16, "ff": 542, "carry8": 40}),  # 519
+        IPRow(
+            4,
+            {"lut": 722, "slicem_lut": 13, "ff": 355, "carry8": 38},
+            min_period_ns=2.12,
+        ),  # 430
+        IPRow(3, {"lut": 726, "ff": 282, "carry8": 38}, min_period_ns=3.71),  # 360
+        IPRow(1, {"lut": 822, "ff": 65, "carry8": 38}, in_delay_ns=6.02),  # 155
     ),
     ip.dsub: (
         IPRow(
             14, {"lut": 721, "slicem_lut": 90, "ff": 872, "dsp": 3, "carry8": 30}
         ),  # 575
         IPRow(6, {"lut": 719, "slicem_lut": 16, "ff": 542, "carry8": 40}),  # 519
+        IPRow(
+            4,
+            {"lut": 722, "slicem_lut": 13, "ff": 355, "carry8": 38},
+            min_period_ns=2.90,
+        ),  # 430
+        IPRow(3, {"lut": 726, "ff": 282, "carry8": 38}, min_period_ns=3.71),  # 360
+        IPRow(1, {"lut": 822, "ff": 65, "carry8": 38}, in_delay_ns=6.02),  # 155
     ),
-    ip.dmul: IPRow(
-        9, {"lut": 200, "slicem_lut": 62, "ff": 397, "dsp": 7, "carry8": 15}
-    ),  # 498
+    ip.dmul: (
+        IPRow(
+            9,
+            {"lut": 200, "slicem_lut": 62, "ff": 397, "dsp": 7, "carry8": 15},
+            min_period_ns=2.12,
+        ),  # 498
+        IPRow(
+            5,
+            {"lut": 136, "slicem_lut": 19, "ff": 184, "dsp": 7, "carry8": 15},
+            min_period_ns=2.12,
+        ),  # 389
+        IPRow(
+            3, {"lut": 135, "ff": 133, "dsp": 7, "carry8": 15}, min_period_ns=3.85
+        ),  # 347
+        IPRow(
+            1, {"lut": 137, "ff": 65, "dsp": 7, "carry8": 15}, in_delay_ns=6.65
+        ),  # 141
+    ),
     ip.ddiv: IPRow(
         32, {"lut": 3195, "slicem_lut": 72, "ff": 3027, "carry8": 398}
     ),  # 398
-    ip.dcmp: IPRow(1, {"lut": 117, "ff": 2, "carry8": 12}),  # 564
+    ip.dcmp: IPRow(1, {"lut": 117, "ff": 2, "carry8": 12}, min_period_ns=2.90),  # 564
     ip.bfadd: IPRow(4, {"lut": 198, "slicem_lut": 1, "ff": 118, "carry8": 12}),  # 537
     ip.bfsub: IPRow(4, {"lut": 198, "slicem_lut": 1, "ff": 118, "carry8": 12}),  # 537
     ip.bfmul: IPRow(2, {"lut": 60, "ff": 34, "dsp": 1, "carry8": 6}),  # 521
@@ -266,7 +332,7 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
         IPRow(1, {"dsp": 1}),  # 544
     ),
     ip.imul32: (
-        IPRow(2, {"ff": 32, "dsp": 3}),  # 341
+        IPRow(2, {"ff": 32, "dsp": 3}, min_period_ns=2.94),  # 341
         # The 1-cycle row is a combinational 3-DSP cascade up to its output
         # register. Routed in context the cone runs 3.0 ns (2.9 of DSP logic
         # plus route), so the row is honestly unfit at 300 MHz and the 2-cycle
@@ -331,7 +397,9 @@ IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
                 32, {"lut": 3195, "slicem_lut": 72, "ff": 3027, "carry8": 398}
             ),  # 398
             IPRow(
-                24, {"lut": 3198, "slicem_lut": 72, "ff": 2064, "carry8": 398}
+                24,
+                {"lut": 3198, "slicem_lut": 72, "ff": 2064, "carry8": 398},
+                min_period_ns=2.90,
             ),  # 308
         ),
     },
@@ -339,6 +407,67 @@ IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
     # needs a deeper multiply, so most of its integer arithmetic is a row of
     # its own.
     GRADE_2LV: {
+        # The low-voltage grade's float ladder is slower throughout: each
+        # archetype keeps its depth at the default clock, the shallow rows
+        # carry correspondingly higher floors, and only the double multiply
+        # moves.
+        ip.fadd: (
+            IPRow(
+                7, {"lut": 257, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry8": 10}
+            ),  # 350
+            IPRow(5, {"lut": 370, "slicem_lut": 13, "ff": 242, "carry8": 17}),  # 349
+            IPRow(2, {"lut": 382, "ff": 75, "carry8": 17}, min_period_ns=4.63),  # 289
+            IPRow(1, {"lut": 392, "ff": 33, "carry8": 17}, in_delay_ns=6.36),  # 143
+        ),
+        ip.fsub: (
+            IPRow(
+                7, {"lut": 257, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry8": 10}
+            ),  # 350
+            IPRow(5, {"lut": 370, "slicem_lut": 13, "ff": 242, "carry8": 17}),  # 349
+            IPRow(2, {"lut": 382, "ff": 75, "carry8": 17}, min_period_ns=4.63),  # 289
+            IPRow(1, {"lut": 392, "ff": 33, "carry8": 17}, in_delay_ns=6.36),  # 143
+        ),
+        ip.fmul: (
+            IPRow(
+                4, {"lut": 114, "slicem_lut": 1, "ff": 109, "dsp": 2, "carry8": 9}
+            ),  # 421
+            IPRow(
+                2, {"lut": 81, "ff": 51, "dsp": 2, "carry8": 8}, min_period_ns=4.53
+            ),  # 294
+            IPRow(
+                1, {"lut": 79, "ff": 33, "dsp": 2, "carry8": 8}, in_delay_ns=4.40
+            ),  # 198
+        ),
+        ip.dadd: (
+            IPRow(
+                14, {"lut": 721, "slicem_lut": 90, "ff": 872, "dsp": 3, "carry8": 30}
+            ),  # 398
+            IPRow(6, {"lut": 719, "slicem_lut": 16, "ff": 542, "carry8": 40}),  # 361
+            IPRow(3, {"lut": 726, "ff": 282, "carry8": 38}, min_period_ns=4.28),  # 312
+            IPRow(1, {"lut": 822, "ff": 65, "carry8": 38}, in_delay_ns=10.07),  # 93
+        ),
+        ip.dsub: (
+            IPRow(
+                14, {"lut": 721, "slicem_lut": 90, "ff": 872, "dsp": 3, "carry8": 30}
+            ),  # 398
+            IPRow(6, {"lut": 719, "slicem_lut": 16, "ff": 542, "carry8": 40}),  # 361
+            IPRow(3, {"lut": 726, "ff": 282, "carry8": 38}, min_period_ns=4.28),  # 312
+            IPRow(1, {"lut": 822, "ff": 65, "carry8": 38}, in_delay_ns=10.07),  # 93
+        ),
+        ip.dmul: (
+            IPRow(
+                9, {"lut": 200, "slicem_lut": 62, "ff": 397, "dsp": 7, "carry8": 15}
+            ),  # 443
+            IPRow(
+                8, {"lut": 198, "slicem_lut": 63, "ff": 360, "dsp": 7, "carry8": 15}
+            ),  # 386
+            IPRow(
+                3, {"lut": 135, "ff": 133, "dsp": 7, "carry8": 15}, min_period_ns=5.03
+            ),  # 265
+            IPRow(
+                1, {"lut": 137, "ff": 65, "dsp": 7, "carry8": 15}, in_delay_ns=8.75
+            ),  # 107
+        ),
         ip.fdiv: IPRow(
             16, {"lut": 765, "slicem_lut": 39, "ff": 699, "carry8": 111}
         ),  # 361
@@ -574,7 +703,15 @@ def build(part: Part) -> Device:
 
     for core, rows in {**IP, **IP_BY_GRADE.get(part.grade, {})}.items():
         for row in (rows,) if isinstance(rows, IPRow) else rows:
-            operator = core.retimed(row.latency, row.in_delay_ns)
+            operator = core.retimed(
+                row.latency,
+                row.in_delay_ns,
+                # A row is warranted at the clock it was characterized to
+                # close unless it declares its own floor.
+                row.min_period_ns
+                if row.min_period_ns is not None
+                else 1000.0 / part.grade.default_freq_mhz,
+            )
             if row.mnemonic is not None:
                 operator.mnemonic = row.mnemonic
             d.add_operator(operator)

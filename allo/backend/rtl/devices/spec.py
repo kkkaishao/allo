@@ -191,3 +191,7 @@ class IPRow(NamedTuple):
     #: A single-cycle core is combinational up to its output register, so its
     #: cone is nearly the whole measured period, not the registered-input 0.5.
     in_delay_ns: float | None = None
+    #: Least clock period the row's internal stages are warranted at. ``None``
+    #: takes the grade's characterization period: a row is only ever warranted
+    #: at the clock it was measured to close.
+    min_period_ns: float | None = None

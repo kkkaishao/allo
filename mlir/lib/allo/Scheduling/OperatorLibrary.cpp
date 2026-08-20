@@ -335,6 +335,7 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
     e.pipelined = op.getPipelined();
     e.inDelay = op.getInDelay().convertToDouble();
     e.outDelay = op.getOutDelay().convertToDouble();
+    e.minPeriod = op.getMinPeriod().convertToDouble();
     e.symbol = op.getSymName().str();
     e.uses = op.getUsesAttr();
     e.fedWidth = (unsigned)op.getFedWidth().value_or(0);
@@ -361,8 +362,9 @@ const OperatorEntry *OperatorLibrary::selectImplementation(
   // What a row needs for a cycle of its own, in the same float arithmetic the
   // derate walk prices it at (`minSchedulablePeriod`).
   auto needOf = [floor = static_cast<float>(regFloor)](const OperatorEntry *e) {
-    return std::max(floor + static_cast<float>(e->inDelay),
-                    static_cast<float>(e->outDelay));
+    return std::max({floor + static_cast<float>(e->inDelay),
+                     static_cast<float>(e->outDelay),
+                     static_cast<float>(e->minPeriod)});
   };
   // Fitting the selection period ranks first, so a deep pipeline beats a
   // shallow core the clock cannot hold; among misses the least need wins,
@@ -749,6 +751,7 @@ OperatorChar OperatorLibrary::characterize(Operation *op,
   else {
     c.timing.inDelay = e.inDelay;
     c.timing.outDelay = e.outDelay;
+    c.timing.minPeriod = e.minPeriod;
   }
   c.pipelined = e.pipelined;
   // An IP's signature pins the width, so there the factors are constants and
@@ -789,8 +792,9 @@ OperatorLibrary::candidateChars(Operation *op) const {
     // The same float fit test `selectImplementation` ranks by, so the set here
     // and the row `lookup` picks never disagree about what fits.
     float need =
-        std::max(static_cast<float>(regFloor) + static_cast<float>(e->inDelay),
-                 static_cast<float>(e->outDelay));
+        std::max({static_cast<float>(regFloor) + static_cast<float>(e->inDelay),
+                  static_cast<float>(e->outDelay),
+                  static_cast<float>(e->minPeriod)});
     if (need > selectionPeriodNs)
       continue;
     if (!priceOf(e->uses, {width}))

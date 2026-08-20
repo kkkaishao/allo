@@ -42,6 +42,7 @@ from _common import (
     _latency,
     _walk,
     FADD,
+    FMUL,
     comb_ns,
     comb_step_ns,
     REG_NS,
@@ -157,7 +158,7 @@ def test_an_operator_declares_what_its_core_spends():
         return a + b
 
     text = _to_rtl(addk).dcp
-    core = "add_f32_f32_f32_l7"
+    core = f"add_f32_f32_f32_l{FADD}"
     assert f"allo.dcp.operator @{core}" in text
     scope = default_device.name  # the device the reference reaches through
     # The count is read back off the device rather than restated: what this pins
@@ -342,8 +343,8 @@ def test_integer_ops_never_error():
     assert res.func("intk").latency is not None
 
 
-# A custom fast fadd (latency 3) injects as a dcp.operator, is referenced
-# by the reifier, and beats the built-in latency-7 fadd; the default path is
+# A custom fast fadd (latency 1) injects as a dcp.operator, is referenced
+# by the reifier, and beats the shallowest built-in fadd; the default path is
 # untouched (a separate export never sees the IP).
 def test_operator_ip_overlay_shifts_schedule():
     @kernel
@@ -355,7 +356,8 @@ def test_operator_ip_overlay_shifts_schedule():
 
     @operator_ip(
         optype=OperatorType.ADD,
-        latency=3,
+        mnemonic="add_fast",
+        latency=1,
         in_delay_ns=0.5,
         pipelined=True,
         style="ce",
@@ -371,7 +373,8 @@ def test_operator_ip_overlay_shifts_schedule():
     r1 = addk2.schedule().export("rtl", device=dev)
     lat1 = r1.schedule().func("addk2").latency
 
-    # A faster core than the built-in add, so it takes a symbol of its own.
+    # The fabric's own ladder reaches latency 1 for slower clocks, so the
+    # overlay is named apart by its mnemonic and is the faster candidate here.
     assert fadd_fast.symbol not in Dcp(r0).attrs("allo.dcp.operator", "sym_name")
     assert fadd_fast.symbol in Dcp(r1).attrs("allo.dcp.operator", "sym_name")
     assert fadd_fast.symbol in _impls(r1.schedule())
@@ -384,7 +387,7 @@ def test_the_shorter_of_two_candidates_is_selected():
     @operator_ip(
         optype=OperatorType.ADD,
         mnemonic="add_dsp",
-        latency=3,
+        latency=FADD - 1,
         in_delay_ns=0.5,
         pipelined=True,
         style="ce",
@@ -398,7 +401,7 @@ def test_the_shorter_of_two_candidates_is_selected():
 
     dev = default_device.copy()
     dev.add_operator(add_dsp)
-    assert add_dsp.symbol == "add_dsp_f32_f32_f32_l3"
+    assert add_dsp.symbol == f"add_dsp_f32_f32_f32_l{FADD - 1}"
     impls = _impls(_to_rtl(addk, device=dev).schedule())
     assert add_dsp.symbol in impls
     assert f"add_f32_f32_f32_l{FADD}" not in impls
@@ -552,7 +555,7 @@ def test_free_running_operator_cosim():
     @operator_ip(
         optype=OperatorType.ADD,
         mnemonic="add_free",
-        latency=FADD - 2,
+        latency=FADD - 1,
         in_delay_ns=0.5,
         pipelined=True,
         style="free",
@@ -615,7 +618,14 @@ def test_custom_c_model_for_uncharacterized_kind_cosim():
 # Nothing stalls outside a stream region, so a free-style IP is emitted
 # as declared: a plain extern instance with no ce port at all.
 def test_free_running_ip_outside_stream_region_emits():
-    @operator_ip(optype="mul", latency=3, in_delay_ns=0.5, pipelined=True, style="free")
+    @operator_ip(
+        optype="mul",
+        mnemonic="mul_free",
+        latency=FMUL - 1,
+        in_delay_ns=0.5,
+        pipelined=True,
+        style="free",
+    )
     def freemul(a: f32, b: f32) -> f32: ...
 
     dev = default_device.copy()
@@ -937,6 +947,35 @@ def test_selection_reranks_at_the_derated_period():
     assert add_slow.symbol in _impls(sched)
     assert add_shallow.symbol in _impls(sched)
     assert add_deep.symbol not in _impls(sched)
+
+
+# A row's warranted period gates it exactly like its boundary cones: the
+# depth-2 float adder is a candidate only below its own floor, and a clock past
+# every row's warranty derates to the fastest period a row is warranted at,
+# where selection re-ranks.
+def test_selection_honors_a_rows_warranted_period():
+    @kernel
+    def axpy(x: f32[8], y: f32[8]):
+        for k in range(8):
+            y[k] = x[k] + y[k]
+
+    at_default = _to_rtl(axpy).schedule()
+    assert "add_f32_f32_f32_l3" in _impls(at_default)
+
+    # 240 MHz sits between the depth-2 floor and the latency-1 cone.
+    slower = _to_rtl(axpy, freq_mhz=240).schedule()
+    assert "add_f32_f32_f32_l2" in _impls(slower)
+
+    @kernel
+    def ratio(x: f32[8], y: f32[8]):
+        for k in range(8):
+            y[k] = x[k] / y[k]
+
+    # 450 MHz is past both dividers' warranties: the clock derates to the
+    # 12-cycle row's floor, where that row wins back over the 10-cycle one.
+    derated = _to_rtl(ratio, freq_mhz=450).schedule()
+    assert derated.cycle_ns == pytest.approx(2.39)
+    assert "div_f32_f32_f32_l12" in _impls(derated)
 
 
 # The stall contract holds for every candidate core, not only the one selection
@@ -1347,7 +1386,7 @@ def test_float_and_int_arithmetic():
 
 
 def test_exact_share_folds_profitable_ip():
-    # Two chained float multiplies (fmul latency 4) issue at disjoint cycles,
+    # Two chained float multiplies (fmul latency 2) issue at disjoint cycles,
     # so the MRT lets them share one physical unit. 'exact-share' minimizes
     # modelled area under the clock, and saving an fmul against a 2:1 mux per
     # port sits in that optimum, so one instance drops and the shared datapath
@@ -2024,7 +2063,7 @@ def test_a_fabric_declares_every_row_of_an_archetype():
     from allo.backend.rtl.devices import ip as catalog
     from allo.backend.rtl.devices.spec import IPRow, Part
 
-    fast = IPRow(FADD - 2, {"lut": 400, "ff": 300, "dsp": 3}, mnemonic="add_dsp")
+    fast = IPRow(FADD - 1, {"lut": 400, "ff": 300, "dsp": 3}, mnemonic="add_dsp")
     part = Part(
         name="twoadds",
         part="xcu55c-fsvh2892-2L-e",
@@ -2051,8 +2090,8 @@ def test_a_fabric_declares_every_row_of_an_archetype():
 
     symbols = {o.symbol for o in dev.operators}
     assert f"add_f32_f32_f32_l{FADD}" in symbols  # the archetype's own name
-    assert f"add_dsp_f32_f32_f32_l{FADD - 2}" in symbols
-    assert dev.operator_uses[f"add_dsp_f32_f32_f32_l{FADD - 2}"]
+    assert f"add_dsp_f32_f32_f32_l{FADD - 1}" in symbols
+    assert dev.operator_uses[f"add_dsp_f32_f32_f32_l{FADD - 1}"]
 
     @kernel
     def addk(A: f32[8], B: f32[8], C: f32[8]):
@@ -2061,11 +2100,11 @@ def test_a_fabric_declares_every_row_of_an_archetype():
 
     rtl = _to_rtl(addk, device=dev)
     injected = Dcp(rtl).attrs("allo.dcp.operator", "sym_name")
-    assert {f"add_f32_f32_f32_l{FADD}", f"add_dsp_f32_f32_f32_l{FADD - 2}"} <= set(
+    assert {f"add_f32_f32_f32_l{FADD}", f"add_dsp_f32_f32_f32_l{FADD - 1}"} <= set(
         injected
     )
     impls = _impls(rtl.schedule())
-    assert f"add_dsp_f32_f32_f32_l{FADD - 2}" in impls
+    assert f"add_dsp_f32_f32_f32_l{FADD - 1}" in impls
     assert f"add_f32_f32_f32_l{FADD}" not in impls
 
 
@@ -2073,7 +2112,7 @@ def test_remove_operator_withdraws_a_candidate_and_its_cost():
     @operator_ip(
         optype=OperatorType.ADD,
         mnemonic="add_fast",
-        latency=FADD - 2,
+        latency=FADD - 1,
         in_delay_ns=0.5,
         pipelined=True,
         style="ce",

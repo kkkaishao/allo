@@ -385,7 +385,15 @@ def build(part: Part) -> Device:
 
     for core, rows in IP.items():
         for row in (rows,) if isinstance(rows, IPRow) else rows:
-            operator = core.retimed(row.latency, row.in_delay_ns)
+            operator = core.retimed(
+                row.latency,
+                row.in_delay_ns,
+                # A row is warranted at the clock it was characterized to
+                # close unless it declares its own floor.
+                row.min_period_ns
+                if row.min_period_ns is not None
+                else 1000.0 / part.grade.default_freq_mhz,
+            )
             if row.mnemonic is not None:
                 operator.mnemonic = row.mnemonic
             d.add_operator(operator)

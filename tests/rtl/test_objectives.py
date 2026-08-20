@@ -14,7 +14,8 @@ from allo import kernel
 from allo.lang import i32
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import _to_rtl  # noqa: E402
+from _common import _impls, _to_rtl  # noqa: E402
+from allo.backend.rtl.devices import default_device  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -73,7 +74,8 @@ def test_heuristic_ignores_the_objective():
 def test_freq_objective_sweeps_the_period_and_writes_the_clock_back():
     # O="freq" probes periods below the requested clock, holds the span within
     # span_tolerance, and the handle's clock follows the winner; compile then
-    # tightens it once more to the realized critical path.
+    # tightens it once more to the realized critical path, held under every
+    # bound row's warranted period.
     rtl = _to_rtl(_mixed_kernel(), freq_mhz=50.0).set_scheduler_opt(O="freq")
     result = rtl.schedule()
     assert result.sweep and result.sweep[0].cycle_ns == pytest.approx(20.0)
@@ -82,7 +84,9 @@ def test_freq_objective_sweeps_the_period_and_writes_the_clock_back():
     fn = result.func("mx")
     assert fn.latency <= n0 * 1.1
     est = rtl.estimation  # compiles, which tightens the clock to fmax
-    assert rtl.freq_mhz == pytest.approx(est.fmax)
+    floors = {o.symbol: o.timing.min_period_ns for o in default_device.operators}
+    cap = max(floors[i] for i in _impls(result))
+    assert rtl.freq_mhz == pytest.approx(min(est.fmax, 1000.0 / cap))
     assert est.clock_mhz == pytest.approx(rtl.freq_mhz)
     _run(rtl)
 
