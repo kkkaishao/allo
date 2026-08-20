@@ -577,12 +577,122 @@ struct ForwardRelaxation {
       originalTypes;
 };
 
-// The most pairs one problem may forward. Every pair costs a compare, a
-// select chain and a datum chain, so a heavily unrolled body whose may-alias
-// pairs number in the hundreds is a partitioning problem, not a forwarding
-// one; relaxing it also floods the modulo placement with same-cycle freedom
-// the greedy search chokes on.
+// The most pairs one problem relaxes outright. Every pair costs a compare, a
+// select chain and a datum chain, and relaxing hundreds floods the modulo
+// placement with same-cycle freedom the greedy search chokes on.
 constexpr size_t kMaxForwardPairs = 16;
+
+// A body whose may-alias pairs outnumber that spends a larger budget on the
+// circuits that bind the II (`selectCriticalPairs`): the walk stops by itself
+// once the recurrence no longer binds, so this is a backstop sized for an
+// unrolled read-modify-write, not a target.
+constexpr size_t kMaxTargetedPairs = 64;
+
+// The candidate pairs worth the budget: walk the circuit that binds the II,
+// relax the candidate edges it carries, and repeat until the recurrence no
+// longer binds, a binding circuit carries none (the bound cannot drop past
+// that circuit whatever is forwarded), or the budget is spent. The weights
+// mirror `recurrenceMinII`, with the selection so far at zero latency.
+static SmallVector<circt::scheduling::Problem::Dependence>
+selectCriticalPairs(ChainingModuloProblem &problem,
+                    ArrayRef<circt::scheduling::Problem::Dependence> cands,
+                    unsigned floorII, size_t budget) {
+  using Dependence = circt::scheduling::Problem::Dependence;
+  struct Edge {
+    unsigned src, dst;
+    int64_t lat, dist;
+    Dependence dep;
+  };
+  DenseMap<Operation *, unsigned> index;
+  for (Operation *op : problem.getOperations())
+    index.try_emplace(op, index.size());
+  SmallVector<Edge> edges;
+  int64_t latSum = 1;
+  for (Operation *op : problem.getOperations())
+    for (auto &dep : problem.getDependences(op)) {
+      int64_t lat = problem.latencyOf(dep.getSource());
+      edges.push_back(
+          {index[dep.getSource()], index[op], lat,
+           static_cast<int64_t>(problem.getDistance(dep).value_or(0)), dep});
+      latSum += lat;
+    }
+  llvm::DenseSet<Dependence> candSet(cands.begin(), cands.end());
+  llvm::DenseSet<Dependence> selected;
+  SmallVector<int64_t> dist;
+  SmallVector<int> pred;
+  int lastMoved = -1;
+  auto feasible = [&](int64_t ii) {
+    dist.assign(index.size(), 0);
+    pred.assign(index.size(), -1);
+    lastMoved = -1;
+    for (unsigned round = 0; round <= index.size(); ++round) {
+      bool moved = false;
+      for (auto [i, e] : llvm::enumerate(edges)) {
+        int64_t w =
+            dist[e.src] + (selected.contains(e.dep) ? 0 : e.lat) - ii * e.dist;
+        if (w > dist[e.dst]) {
+          dist[e.dst] = w;
+          pred[e.dst] = static_cast<int>(i);
+          lastMoved = static_cast<int>(e.dst);
+          moved = true;
+        }
+      }
+      if (!moved)
+        return true;
+    }
+    return false; // a positive circuit survives at this ii
+  };
+  if (!feasible(latSum))
+    return {}; // a zero-distance positive circuit; the solve will report it
+  int64_t hi = latSum;
+  while (selected.size() < budget) {
+    int64_t lo = 1, top = hi;
+    while (lo < top) {
+      int64_t mid = (lo + top) / 2;
+      if (feasible(mid))
+        top = mid;
+      else
+        lo = mid + 1;
+    }
+    if (lo <= floorII)
+      break; // the recurrence no longer binds
+    // One positive circuit at lo - 1: every node reached backward from the
+    // last update has been updated itself, so the predecessor walk cannot
+    // fall off and must revisit a node, closing the circuit.
+    bool quiesced = feasible(lo - 1);
+    assert(!quiesced && lastMoved >= 0 &&
+           "the bound's own circuit is positive one step below it");
+    (void)quiesced;
+    SmallVector<unsigned> stamp(index.size(), 0);
+    int x = lastMoved;
+    while (!stamp[x]) {
+      stamp[x] = 1;
+      x = static_cast<int>(edges[pred[x]].src);
+    }
+    SmallVector<Dependence> take;
+    int y = x;
+    do {
+      const Edge &e = edges[pred[y]];
+      if (candSet.contains(e.dep) && !selected.contains(e.dep))
+        take.push_back(e.dep);
+      y = static_cast<int>(e.src);
+    } while (y != x);
+    if (take.empty())
+      break; // the bound runs through edges forwarding cannot serve
+    for (Dependence dep : take) {
+      if (selected.size() >= budget)
+        break;
+      selected.insert(dep);
+    }
+    hi = lo;
+  }
+  // In the candidates' own (deterministic) order.
+  SmallVector<Dependence> out;
+  for (Dependence dep : cands)
+    if (selected.contains(dep))
+      out.push_back(dep);
+  return out;
+}
 
 // Relax the forwardable RAW edges of \p problem when, and only when, a storage
 // recurrence is what binds the II and relaxing moves that bound: anything less
@@ -598,8 +708,15 @@ relaxForwardableEdges(ChainingModuloProblem &problem, const DeviceModel &dev,
   using Dependence = circt::scheduling::Problem::Dependence;
   SmallVector<Dependence> cands =
       forwardableEdges(problem, dev, cycleTime, regFloor);
-  if (cands.empty() || cands.size() > kMaxForwardPairs)
+  if (cands.empty())
     return {};
+  if (cands.size() > kMaxForwardPairs) {
+    cands = selectCriticalPairs(problem, cands,
+                                std::max(resourceMinII(problem), minII),
+                                kMaxTargetedPairs);
+    if (cands.empty())
+      return {};
+  }
   // The data-mux price per load, over its real arm count; a load whose bumped
   // output no longer fits the period drops its pairs (an operator must fit a
   // cycle of its own).
