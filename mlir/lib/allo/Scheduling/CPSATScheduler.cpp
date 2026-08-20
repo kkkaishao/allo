@@ -65,6 +65,21 @@ SatParameters solverParameters(const SchedulerOptions &opts) {
   return params;
 }
 
+/// Solve \p model under \p params. A tiny model solves inside the portfolio's
+/// first batch, where or-tools 9.15's interleaved startup races itself
+/// (`ConfigureSearchHeuristics` check-fails on a worker whose model already
+/// finished), so below this size one worker runs alone; it is the more
+/// deterministic setting and the portfolio buys nothing there anyway.
+constexpr int kPortfolioFloorVars = 256;
+CpSolverResponse solveBuilt(CpModelBuilder &model, SatParameters params) {
+  CpModelProto proto = model.Build();
+  if (proto.variables_size() < kPortfolioFloorVars) {
+    params.set_num_workers(1);
+    params.set_interleave_search(false);
+  }
+  return SolveWithParameters(proto, params);
+}
+
 /// How the model states the clock period: the chain-breaking edges the
 /// pre-pass computed, each costing a cycle on top of plain precedence. The
 /// edges hold the period exactly over integer start times (see
@@ -1549,7 +1564,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                                 &prob, &structural);
     model.Minimize(structural);
     CpSolverResponse boot =
-        SolveWithParameters(model.Build(), solverParameters(opts));
+        solveBuilt(model, solverParameters(opts));
     if (!solved(boot)) {
       reportUnsolved(prob, boot, opts.budget);
       applyFallbackAllocation(prob, span.device, opts.allocate, /*ii=*/0,
@@ -1561,7 +1576,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     SchedulerOptions restArea = opts;
     restArea.budget = std::max(opts.budget - boot.deterministic_time(), 0.0);
     CpSolverResponse first =
-        SolveWithParameters(model.Build(), solverParameters(restArea));
+        solveBuilt(model, solverParameters(restArea));
     assert(first.status() != CpSolverStatus::INFEASIBLE &&
            "the bootstrap's schedule satisfies the same model");
     bool areaProven = solved(first) && first.status() == CpSolverStatus::OPTIMAL;
@@ -1589,7 +1604,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
       SchedulerOptions restDrain = restArea;
       restDrain.budget =
           std::max(restArea.budget - first.deterministic_time(), 0.0);
-      second = SolveWithParameters(model.Build(), solverParameters(restDrain));
+      second = solveBuilt(model, solverParameters(restDrain));
       assert(second.status() != CpSolverStatus::INFEASIBLE &&
              "the area solve's schedule satisfies the pinned model");
       if (solved(second))
@@ -1621,7 +1636,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   bool ranFirst = false;
   if (!spanProven) {
     model.Minimize(drain);
-    first = SolveWithParameters(model.Build(), solverParameters(opts));
+    first = solveBuilt(model, solverParameters(opts));
     if (!solved(first)) {
       reportUnsolved(prob, first, opts.budget);
       applyFallbackAllocation(prob, span.device, opts.allocate, /*ii=*/0,
@@ -1649,7 +1664,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
   }
   CpSolverResponse second =
-      SolveWithParameters(model.Build(), solverParameters(rest));
+      solveBuilt(model, solverParameters(rest));
   assert(second.status() != CpSolverStatus::INFEASIBLE &&
          "the span solve's schedule satisfies the pinned model");
   if (!solved(second) && !ranFirst) {
@@ -1910,7 +1925,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
                                 hint ? &prob : nullptr, &structural);
     model.Minimize(structural);
     CpSolverResponse boot =
-        SolveWithParameters(model.Build(), solverParameters(opts));
+        solveBuilt(model, solverParameters(opts));
     if (boot.status() == CpSolverStatus::INFEASIBLE)
       return ModuloOutcome::Infeasible;
     if (!solved(boot)) {
@@ -1926,15 +1941,19 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     // The full-area solve. INFEASIBLE under \p areaBound means nothing here
     // beats the incumbent. A run out of budget ships the bootstrap, whose
     // chain terms hold feasible but unminimized values (nothing priced them),
-    // so the area recorded for it overstates.
-    rehintAll(model, boot);
+    // so the area recorded for it overstates. The boot minimized structure
+    // alone, so its full area can exceed the bound added below: a complete
+    // hint violating a model constraint must not be handed over (the
+    // interleaved portfolio check-fails repairing it).
+    if (!areaBound || SolutionIntegerValue(boot, area) <= *areaBound)
+      rehintAll(model, boot);
     if (areaBound)
       model.AddLessOrEqual(area, *areaBound);
     model.Minimize(area);
     SchedulerOptions restArea = opts;
     restArea.budget = std::max(opts.budget - boot.deterministic_time(), 0.0);
     CpSolverResponse first =
-        SolveWithParameters(model.Build(), solverParameters(restArea));
+        solveBuilt(model, solverParameters(restArea));
     if (first.status() == CpSolverStatus::INFEASIBLE)
       return ModuloOutcome::Infeasible;
     areaProven = solved(first) && first.status() == CpSolverStatus::OPTIMAL;
@@ -1962,7 +1981,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       SchedulerOptions restDrain = restArea;
       restDrain.budget =
           std::max(restArea.budget - first.deterministic_time(), 0.0);
-      second = SolveWithParameters(model.Build(), solverParameters(restDrain));
+      second = solveBuilt(model, solverParameters(restDrain));
       assert(second.status() != CpSolverStatus::INFEASIBLE &&
              "the area solve's schedule satisfies the pinned model");
       spanProven = second.status() == CpSolverStatus::OPTIMAL;
@@ -1981,7 +2000,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
 
   model.Minimize(primary);
   CpSolverResponse first =
-      SolveWithParameters(model.Build(), solverParameters(opts));
+      solveBuilt(model, solverParameters(opts));
   if (first.status() == CpSolverStatus::INFEASIBLE)
     return ModuloOutcome::Infeasible;
   if (!solved(first)) {
@@ -2002,7 +2021,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   SchedulerOptions rest = opts;
   rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
   CpSolverResponse second =
-      SolveWithParameters(model.Build(), solverParameters(rest));
+      solveBuilt(model, solverParameters(rest));
   assert(second.status() != CpSolverStatus::INFEASIBLE &&
          "the span solve's schedule satisfies the pinned model");
   areaProven = second.status() == CpSolverStatus::OPTIMAL;
@@ -2135,6 +2154,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   // drain bound below, so a slack grant buys interval room alone.
   std::optional<int64_t> tightLeash = leash;
   if (areaMode) {
+    // The user's own slack widens the leash first: paid span, spent the same
+    // way a grant is, as interval room for the unit folds.
+    if (leash && opts.areaSlack > 0.0)
+      *leash += static_cast<int64_t>(*leash * opts.areaSlack);
     // Composition slack the kernel's sibling DAG proved free widens the
     // leash: this region may run that much longer without moving the
     // composed span.
@@ -2279,7 +2302,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
       bestClassUnits = std::move(classUnits);
       adopted = true;
       if (areaMode && !leash) {
-        leash = solved + std::max<int64_t>(slackGrant, 0);
+        leash = solved + static_cast<int64_t>(solved * opts.areaSlack) +
+                std::max<int64_t>(slackGrant, 0);
         tightLeash = solved;
       }
     }
@@ -2548,7 +2572,7 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
   SchedulerOptions opts;
   opts.budget = kSharingSolveBudget;
   CpSolverResponse response =
-      SolveWithParameters(model.Build(), solverParameters(opts));
+      solveBuilt(model, solverParameters(opts));
   if (response.status() != CpSolverStatus::OPTIMAL &&
       response.status() != CpSolverStatus::FEASIBLE) {
     assert(response.status() != CpSolverStatus::INFEASIBLE &&

@@ -510,6 +510,13 @@ struct SchedulerOptions {
   bool allocate = false;
   int workers = kDefaultSolveWorkers;
   int seed = kDefaultSolveSeed;
+  /// The span the area objective may pay beyond its leash, as a fraction of
+  /// the reference span (the heuristic's, or the first solved interval where
+  /// the greedy did not place). Zero ships no slower than the heuristic. The
+  /// slack is spent the way a composition grant is, as interval room for unit
+  /// folds: an interval the ungranted leash already admits keeps its tight
+  /// drain bound.
+  double areaSlack = 0.0;
   /// The fabric's register-to-register floor (ns): the earliest sub-cycle time
   /// any operation may start at. Combinational rows carry their measured delay
   /// less the floor, so a cycle pays it once however many operators chain.

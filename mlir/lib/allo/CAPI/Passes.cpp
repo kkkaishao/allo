@@ -77,8 +77,8 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
 MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
     MlirStringRef scheduler, MlirStringRef objective, double budget,
-    bool allocate, int workers, int seed, MlirStringCallback callback,
-    void *userData) {
+    bool allocate, int workers, int seed, double areaSlack,
+    MlirStringCallback callback, void *userData) {
   ModuleOp mod = unwrap(module);
   StringRef topName = unwrap(top);
   StringRef schedulerName = unwrap(scheduler);
@@ -107,7 +107,8 @@ MlirLogicalResult alloRunSDCSchedulingPipeline(
   float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
   allo::SchedulerOptions opts{
       *kind, *obj, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate,
-      workers > 0 ? workers : allo::kDefaultSolveWorkers, seed};
+      workers > 0 ? workers : allo::kDefaultSolveWorkers, seed,
+      areaSlack > 0.0 ? areaSlack : 0.0};
   // The storage decision, taken once and recorded on every array before any
   // layer below reads it.
   allo::recordArrayStorage(mod, allo::MemoryLibrary::fromModule(mod));

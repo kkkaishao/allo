@@ -55,8 +55,8 @@ alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
 MLIR_CAPI_EXPORTED MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
     MlirStringRef scheduler, MlirStringRef objective, double budget,
-    bool allocate, int workers, int seed, MlirStringCallback callback,
-    void *userData);
+    bool allocate, int workers, int seed, double areaSlack,
+    MlirStringCallback callback, void *userData);
 
 #ifdef __cplusplus
 }

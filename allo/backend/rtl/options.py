@@ -72,6 +72,12 @@ class SchedulerOptions:
             to ``(1 - clock_margin) * cycle_ns`` while the design is clocked
             at ``cycle_ns``, so placement and routing surprises the model
             cannot see fit inside the difference.
+        area_slack: the span the area objective may pay beyond its leash, as
+            a fraction of the reference span (the heuristic schedule's). Zero,
+            the default, ships no slower than the heuristic; the slack buys
+            interval room for unit folds, the way a composition grant does.
+            It is a permission, not a bargain: any legal area reduction
+            inside the widened leash is taken, whatever span it costs.
         span_tolerance: the cycle-count regression ``O="freq"`` may trade for
             a faster clock: the period sweep keeps a candidate only while the
             span stays within ``(1 + span_tolerance)`` of the span at the
@@ -94,6 +100,7 @@ class SchedulerOptions:
     O: str = "cycles"
     cycle_ns: float = 5.0
     clock_margin: float = 0.0
+    area_slack: float = 0.0
     span_tolerance: float = 0.1
     budget: float = 30.0
     workers: int = 8

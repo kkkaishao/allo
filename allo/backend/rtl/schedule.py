@@ -95,6 +95,7 @@ def run_schedule(
             allocate,
             options.workers,
             options.seed,
+            options.area_slack,
         )
     finally:
         handler.detach()

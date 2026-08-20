@@ -117,6 +117,40 @@ def test_freq_objective_sweeps_a_kernel_with_no_composed_span():
     assert out[0] == 5
 
 
+def test_area_slack_pays_span_for_unit_folds():
+    # Two independent float adds need two units at the natural II=1, and the
+    # strict leash refuses the II that folds them; a paid slack admits it.
+    @kernel
+    def pairsum(A: f32[8], B: f32[8], C: f32[8], D: f32[8], out: f32[8]):
+        for i in range(8):
+            out[i] = (A[i] + B[i]) + (C[i] + D[i])
+
+    def units(rtl):
+        rtl.compile()
+        return sum(
+            1
+            for f in rtl.microarch.funcs
+            for r in f.regions
+            for u in r.units
+            if (u.impl or "").startswith("add_f32")
+        )
+
+    strict = _to_rtl(pairsum).set_scheduler_opt(
+        scheduler="exact", O="area", budget=2.0
+    )
+    n_strict = strict.schedule().func("pairsum").latency
+    slack = _to_rtl(pairsum).set_scheduler_opt(
+        scheduler="exact", O="area", area_slack=1.0, budget=2.0
+    )
+    n_slack = slack.schedule().func("pairsum").latency
+    assert units(slack) < units(strict)
+    assert n_slack <= n_strict * 2.0
+    A = np.arange(8, dtype=np.float32)
+    out = np.zeros(8, dtype=np.float32)
+    slack.cosim(A, A, A, A, out)
+    assert np.array_equal(out, 4.0 * A)
+
+
 def test_wall_objective_trades_the_clock_for_iterations():
     # O="wall" minimizes span times period. A float accumulation is II-bound
     # by the adder's depth at the default clock; the latency-1 row at a slower
