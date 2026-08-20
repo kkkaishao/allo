@@ -29,7 +29,7 @@ from .device import (
 )
 from .devices import default_device
 from .interface import Interfaces
-from .options import PrepassOptions, SchedulerOptions
+from .options import PERIOD_POLICIES, PrepassOptions, SchedulerOptions
 from .qor import QoR, estimate
 from .reports import CompileReport, MicroarchReport, ScheduleResult
 from .schedule import run_schedule, sweep_freq, sweep_wall
@@ -47,6 +47,22 @@ _NORMALIZE_PIPELINE = "builtin.module(dcp-resolve-banking)"
 # The one option the handle derives rather than takes: the scheduler's view of
 # `freq_mhz`, which the emitter and the cosim clock read too.
 _DERIVED_OPTIONS = {"cycle_ns"}
+
+
+def _operator_period_cap(device: Device) -> float:
+    """The slowest period any operator row is built for, which caps the wall
+    ladder. Zero where the device declares no operator."""
+    return max(
+        (
+            max(
+                device.reg_delay_ns + o.timing.in_delay_ns,
+                o.timing.out_delay_ns,
+                o.timing.min_period_ns,
+            )
+            for o in device.operators
+        ),
+        default=0.0,
+    )
 
 
 class LatencyModelWarning(UserWarning):
@@ -181,6 +197,7 @@ class RTL(Backend[P, R]):
                     if self._sched_opts.scheduler == "heuristic"
                     else "planned"
                 )
+
             # The schedule is reified in place, so it runs on a copy. Operator
             # and device timing is injected into that copy only, keeping the CPU
             # functional path clear of it.
@@ -193,7 +210,7 @@ class RTL(Backend[P, R]):
             # An allocation is only worth deciding where the emitter builds it:
             # the trivial binding keeps one unit per operation.
             allocate = self.binding != "trivial"
-            if self._sched_opts.O in ("freq", "wall"):
+            if self._sched_opts.O in PERIOD_POLICIES:
                 # The clock is an output: the sweep probes candidates on
                 # fresh copies and the handle follows the winner.
                 if self._sched_opts.O == "freq":
@@ -206,28 +223,14 @@ class RTL(Backend[P, R]):
                         self._device.reg_delay_ns,
                     )
                 else:
-                    # The slowest period any operator row is built for caps
-                    # the wall ladder.
-                    reg = self._device.reg_delay_ns
-                    cap = max(
-                        (
-                            max(
-                                reg + o.timing.in_delay_ns,
-                                o.timing.out_delay_ns,
-                                o.timing.min_period_ns,
-                            )
-                            for o in self._device.operators
-                        ),
-                        default=0.0,
-                    )
                     self._dcp_ir, self._schedule_result = sweep_wall(
                         self.top,
                         make_module,
                         self._sched_opts,
                         self._prepass_opts,
                         allocate,
-                        reg,
-                        cap,
+                        self._device.reg_delay_ns,
+                        _operator_period_cap(self._device),
                     )
                 self._set_clock(
                     self._schedule_result.cycle_ns
@@ -315,7 +318,7 @@ class RTL(Backend[P, R]):
             self._hw_ir = work
             # Last step of the period policies: clock at the realized
             # critical path.
-            if self._sched_opts.O in ("freq", "wall"):
+            if self._sched_opts.O in PERIOD_POLICIES:
                 self.tighten_clock()
         return self._hw_ir
 

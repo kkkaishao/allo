@@ -5,14 +5,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
-from typing import Callable
 
 from ..base import run_pipeline
 from ..._mlir.ir import Module
 from ..._mlir.dialects.allo import run_sdc_scheduling
 
-from .options import PrepassOptions, SchedulerOptions
+from .options import PERIOD_POLICIES, PrepassOptions, SchedulerOptions
 from .reports.schedule import ScheduleResult, SweepPoint
 
 RTL_PREPARE_PIPELINE = """
@@ -90,7 +90,7 @@ def run_schedule(
             options.scheduler,
             # "freq" and "wall" are period policies this driver sweeps; their
             # region solves run under the cycles order.
-            "cycles" if options.O in ("freq", "wall") else options.O,
+            "cycles" if options.O in PERIOD_POLICIES else options.O,
             options.budget,
             allocate,
             options.workers,
@@ -127,6 +127,58 @@ def _region_vector(result) -> dict:
     return out
 
 
+def _probe(
+    top,
+    make_module: Callable[[], Module],
+    options: SchedulerOptions,
+    prepass: PrepassOptions,
+    allocate: bool,
+    period: float,
+) -> tuple[SweepPoint, dict]:
+    """One heuristic probe at ``period``, on a fresh copy of the pristine IR:
+    the sweep point and the region vector its span composes from."""
+    opts = replace(options, scheduler="heuristic", cycle_ns=period)
+    result = run_schedule(top, make_module(), opts, prepass, allocate)
+    fn = result.func(top)
+    point = SweepPoint(
+        cycle_ns=period,
+        achieved_ns=result.cycle_ns / (1.0 - options.clock_margin),
+        latency=fn.latency,
+        latency_is_bound=fn.latency_is_bound,
+    )
+    return point, _region_vector(result)
+
+
+def _dedup(points: list[SweepPoint]) -> list[SweepPoint]:
+    """Candidates that derate onto the same achieved period are one design;
+    keep the laxest ask of each."""
+    seen: set[float] = set()
+    curve: list[SweepPoint] = []
+    for p in sorted(points, key=lambda p: p.cycle_ns, reverse=True):
+        if (key := round(p.achieved_ns, 3)) not in seen:
+            seen.add(key)
+            curve.append(p)
+    return curve
+
+
+def _solve_at(
+    top,
+    make_module: Callable[[], Module],
+    options: SchedulerOptions,
+    prepass: PrepassOptions,
+    allocate: bool,
+    period: float,
+    curve: list[SweepPoint],
+) -> tuple[Module, ScheduleResult]:
+    """Solve once at the winning period under the caller's own scheduler
+    settings, publishing the probed curve."""
+    module = make_module()
+    result = run_schedule(
+        top, module, replace(options, cycle_ns=period), prepass, allocate
+    )
+    return module, replace(result, sweep=tuple(curve))
+
+
 def sweep_freq(
     top,
     make_module: Callable[[], Module],
@@ -154,16 +206,10 @@ def sweep_freq(
     vectors: dict[float, dict] = {}
 
     def probe(period: float) -> SweepPoint:
-        opts = replace(options, scheduler="heuristic", cycle_ns=period)
-        result = run_schedule(top, make_module(), opts, prepass, allocate)
-        vectors[period] = _region_vector(result)
-        fn = result.func(top)
-        return SweepPoint(
-            cycle_ns=period,
-            achieved_ns=result.cycle_ns / margin,
-            latency=fn.latency,
-            latency_is_bound=fn.latency_is_bound,
+        point, vectors[period] = _probe(
+            top, make_module, options, prepass, allocate, period
         )
+        return point
 
     asked = probe(options.cycle_ns)
     # The aggressive probe: twice the device's register floor, or an 8x faster
@@ -182,14 +228,7 @@ def sweep_freq(
             probe(lo * ratio ** (k / (_SWEEP_RUNGS + 1)))
             for k in range(1, _SWEEP_RUNGS + 1)
         ]
-    # Candidates that derate onto the same achieved period are one design;
-    # keep the laxest ask of each.
-    seen: set[float] = set()
-    curve: list[SweepPoint] = []
-    for p in sorted(points, key=lambda p: p.cycle_ns, reverse=True):
-        if (key := round(p.achieved_ns, 3)) not in seen:
-            seen.add(key)
-            curve.append(p)
+    curve = _dedup(points)
     # A bounded span compares as its worst case; `asked` always qualifies, so
     # there is a winner. With no span to compare, the per-region vector is
     # leashed instead.
@@ -206,11 +245,9 @@ def sweep_freq(
             and all(vectors[p.cycle_ns][k] <= v * tol for k, v in ref.items())
         ]
     winner = min(eligible, key=lambda p: (p.achieved_ns, p.latency or 0))
-    module = make_module()
-    result = run_schedule(
-        top, module, replace(options, cycle_ns=winner.cycle_ns), prepass, allocate
+    return _solve_at(
+        top, make_module, options, prepass, allocate, winner.cycle_ns, curve
     )
-    return module, replace(result, sweep=tuple(curve))
 
 
 # The wall sweep's ladder: this many geometric rungs between the aggressive
@@ -240,15 +277,7 @@ def sweep_wall(
     margin = 1.0 - options.clock_margin
 
     def probe(period: float) -> SweepPoint:
-        opts = replace(options, scheduler="heuristic", cycle_ns=period)
-        result = run_schedule(top, make_module(), opts, prepass, allocate)
-        fn = result.func(top)
-        return SweepPoint(
-            cycle_ns=period,
-            achieved_ns=result.cycle_ns / margin,
-            latency=fn.latency,
-            latency_is_bound=fn.latency_is_bound,
-        )
+        return _probe(top, make_module, options, prepass, allocate, period)[0]
 
     asked = probe(options.cycle_ns)
     if asked.latency is None:
@@ -279,19 +308,10 @@ def sweep_wall(
         floor_span = floor_span if floor_span is not None else p.latency
         best = min(best, p.latency * p.achieved_ns)
         points.append(p)
-    # Candidates that derate onto the same achieved period are one design;
-    # keep the laxest ask of each.
-    seen: set[float] = set()
-    curve: list[SweepPoint] = []
-    for p in sorted(points, key=lambda p: p.cycle_ns, reverse=True):
-        if (key := round(p.achieved_ns, 3)) not in seen:
-            seen.add(key)
-            curve.append(p)
+    curve = _dedup(points)
     # Fewer cycles breaks a wall tie: the shorter schedule spends less on
     # pipeline registers.
     winner = min(curve, key=lambda p: (p.latency * p.achieved_ns, p.latency))
-    module = make_module()
-    result = run_schedule(
-        top, module, replace(options, cycle_ns=winner.cycle_ns), prepass, allocate
+    return _solve_at(
+        top, make_module, options, prepass, allocate, winner.cycle_ns, curve
     )
-    return module, replace(result, sweep=tuple(curve))

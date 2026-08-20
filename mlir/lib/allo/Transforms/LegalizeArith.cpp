@@ -244,9 +244,9 @@ struct ReduceRemSI : OpRewritePattern<arith::RemSIOp> {
 // An index op matches no device IP row, since a row is declared at concrete
 // widths, and prices as a full-width combinational divider, so it expands
 // regardless; one the reciprocal cannot take moves to the typed width instead
-// (`IndexDivToTyped`). A typed op has a pipelined divider IP to fall back on,
-// so it expands only where the reciprocal's product fits, either whole in the
-// stated clock period or registered inside a pipelined multiplier row.
+// (`RebuildDivAtRowWidth`). A typed op has a pipelined divider IP to fall back
+// on, so it expands only where the reciprocal's product fits, either whole in
+// the stated clock period or registered inside a pipelined multiplier row.
 //===----------------------------------------------------------------------===//
 
 /// Largest value \p v can take, read as unsigned bits, walking constants,
@@ -373,6 +373,32 @@ struct MagicPlan {
   }
 };
 
+// What decides whether a division expands, is rebuilt at a row width, or keeps
+// its IP.
+struct DivPolicy {
+  bool expand = false;
+  unsigned maxMulWidth = 0;   // widest multiply the clock takes whole
+  unsigned maxIpMulWidth = 0; // widest a pipelined row carries registered
+};
+
+/// The widest product `magicPlan` can ask for, from a 64-bit dividend.
+constexpr unsigned kMaxProductWidth = 2 * 64 + 1;
+
+/// The policy the operator library and the stated period allow. With no period
+/// stated no multiply fits the clock, so every typed division keeps its IP.
+static DivPolicy divPolicy(const OperatorLibrary &lib, bool expand,
+                           double periodNs) {
+  DivPolicy pol;
+  pol.expand = expand;
+  if (expand && periodNs > 0.0)
+    for (unsigned w = 2; w <= kMaxProductWidth; ++w)
+      if (std::optional<double> delay = lib.measuredCombDelay(OpKind::Mul, w))
+        if (*delay <= periodNs)
+          pol.maxMulWidth = w;
+  pol.maxIpMulWidth = expand ? lib.maxPipelinedMulWidth() : 0;
+  return pol;
+}
+
 /// The plan when the reciprocal patterns apply to \p op, or nullopt. Shared by
 /// the patterns and the conversion target, so what is marked illegal is
 /// exactly what rewrites.
@@ -380,8 +406,7 @@ struct MagicPlan {
 /// TODO: a negative constant divisor keeps its op; it could expand as the
 /// magnitude's reciprocal with one more negation of the quotient.
 static std::optional<MagicPlan> magicPlan(Operation *op, bool isSigned,
-                                          unsigned maxMulWidth,
-                                          unsigned maxIpMulWidth) {
+                                          const DivPolicy &pol) {
   APInt cst;
   if (!matchPattern(op->getOperand(1), m_ConstantInt(&cst)) ||
       (isSigned && cst.isNegative()) || cst.getActiveBits() > 32)
@@ -392,12 +417,12 @@ static std::optional<MagicPlan> magicPlan(Operation *op, bool isSigned,
   Type t = op->getResult(0).getType();
   if (t.isIndex()) {
     if (isSigned)
-      return std::nullopt; // `IndexDivToTyped` routes it through the i32 form
+      return std::nullopt; // `RebuildDivAtRowWidth` routes it through i32
     MagicPlan p{d, boundWidth(op->getOperand(0), kIndexWidth), true};
     // The narrow form is kept even when its multiply misses the period: it
     // still beats the full combinational divider an `index` op would become.
-    if (!p.folds() && 2 * p.width + 1 > maxMulWidth &&
-        2 * kIndexWidth <= maxIpMulWidth) {
+    if (!p.folds() && 2 * p.width + 1 > pol.maxMulWidth &&
+        2 * kIndexWidth <= pol.maxIpMulWidth) {
       p.viaIp = true;
       p.width = kIndexWidth;
     }
@@ -417,9 +442,9 @@ static std::optional<MagicPlan> magicPlan(Operation *op, bool isSigned,
   } else {
     p.width = boundWidth(op->getOperand(0), n);
   }
-  if (p.folds() || 2 * p.width + 1 <= maxMulWidth)
+  if (p.folds() || 2 * p.width + 1 <= pol.maxMulWidth)
     return p;
-  if (2 * n <= maxIpMulWidth) {
+  if (2 * n <= pol.maxIpMulWidth) {
     p.viaIp = true;
     p.width = n;
     return p;
@@ -641,11 +666,9 @@ static Value ipMagicQuotientS(PatternRewriter &rewriter, Location loc, Value n,
 }
 
 template <typename OpT> struct MagicBase : OpRewritePattern<OpT> {
-  MagicBase(MLIRContext *ctx, unsigned maxMulWidth, unsigned maxIpMulWidth)
-      : OpRewritePattern<OpT>(ctx), maxMulWidth(maxMulWidth),
-        maxIpMulWidth(maxIpMulWidth) {}
-  unsigned maxMulWidth;
-  unsigned maxIpMulWidth;
+  MagicBase(MLIRContext *ctx, const DivPolicy &pol)
+      : OpRewritePattern<OpT>(ctx), pol(pol) {}
+  const DivPolicy &pol;
 
   /// The unsigned quotient in the plan's width, whichever form the plan asks.
   Value quotientU(PatternRewriter &rewriter, Location loc, Value n,
@@ -662,8 +685,7 @@ struct MagicDivUI : MagicBase<arith::DivUIOp> {
   using MagicBase::MagicBase;
   LogicalResult matchAndRewrite(arith::DivUIOp op,
                                 PatternRewriter &rewriter) const override {
-    std::optional<MagicPlan> p =
-        magicPlan(op, /*isSigned=*/false, maxMulWidth, maxIpMulWidth);
+    std::optional<MagicPlan> p = magicPlan(op, /*isSigned=*/false, pol);
     if (!p)
       return failure();
     if (p->folds()) {
@@ -682,8 +704,7 @@ struct MagicRemUI : MagicBase<arith::RemUIOp> {
   using MagicBase::MagicBase;
   LogicalResult matchAndRewrite(arith::RemUIOp op,
                                 PatternRewriter &rewriter) const override {
-    std::optional<MagicPlan> p =
-        magicPlan(op, /*isSigned=*/false, maxMulWidth, maxIpMulWidth);
+    std::optional<MagicPlan> p = magicPlan(op, /*isSigned=*/false, pol);
     if (!p)
       return failure();
     if (p->folds()) {
@@ -702,8 +723,7 @@ struct MagicDivSI : MagicBase<arith::DivSIOp> {
   using MagicBase::MagicBase;
   LogicalResult matchAndRewrite(arith::DivSIOp op,
                                 PatternRewriter &rewriter) const override {
-    std::optional<MagicPlan> p =
-        magicPlan(op, /*isSigned=*/true, maxMulWidth, maxIpMulWidth);
+    std::optional<MagicPlan> p = magicPlan(op, /*isSigned=*/true, pol);
     if (!p)
       return failure();
     Location loc = op.getLoc();
@@ -729,8 +749,7 @@ struct MagicRemSI : MagicBase<arith::RemSIOp> {
   using MagicBase::MagicBase;
   LogicalResult matchAndRewrite(arith::RemSIOp op,
                                 PatternRewriter &rewriter) const override {
-    std::optional<MagicPlan> p =
-        magicPlan(op, /*isSigned=*/true, maxMulWidth, maxIpMulWidth);
+    std::optional<MagicPlan> p = magicPlan(op, /*isSigned=*/true, pol);
     if (!p)
       return failure();
     Location loc = op.getLoc();
@@ -755,103 +774,68 @@ struct MagicRemSI : MagicBase<arith::RemSIOp> {
   }
 };
 
-// An `index` division no other pattern takes is rebuilt at `kIndexWidth`, the
-// width the datapath gives `index` anyway. At a concrete type it binds a
-// pipelined divider core; left at `index` it matches no row and becomes a
-// full-width combinational divider that derates the module's clock.
-struct IndexDivToTyped : RewritePattern {
-  IndexDivToTyped(MLIRContext *ctx, bool expand, unsigned maxMulWidth,
-                  unsigned maxIpMulWidth)
-      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx), expand(expand),
-        maxMulWidth(maxMulWidth), maxIpMulWidth(maxIpMulWidth) {}
-  bool expand;
-  unsigned maxMulWidth;
-  unsigned maxIpMulWidth;
-
-  LogicalResult matchAndRewrite(Operation *op,
-                                PatternRewriter &rewriter) const override {
-    if (!isa<arith::DivUIOp, arith::RemUIOp, arith::DivSIOp, arith::RemSIOp>(
-            op) ||
-        !op->getResult(0).getType().isIndex())
-      return failure();
-    bool isSigned = isa<arith::DivSIOp, arith::RemSIOp>(op);
-    // A power-of-two divisor is a shift and a planned constant one a
-    // reciprocal; both lower without any divider.
-    if (powerOfTwoDivisor(op->getOperand(1)) ||
-        (expand && magicPlan(op, isSigned, maxMulWidth, maxIpMulWidth)))
-      return failure();
-    Location loc = op->getLoc();
-    Type ty = rewriter.getIntegerType(kIndexWidth);
-    auto shrink = [&](Value v) -> Value {
-      if (isSigned)
-        return arith::IndexCastOp::create(rewriter, loc, ty, v);
-      return arith::IndexCastUIOp::create(rewriter, loc, ty, v);
-    };
-    OperationState state(loc, op->getName());
-    state.addOperands({shrink(op->getOperand(0)), shrink(op->getOperand(1))});
-    state.addTypes(ty);
-    Value r = rewriter.create(state)->getResult(0);
-    Type ity = op->getResult(0).getType();
-    rewriter.replaceOp(
-        op,
-        isSigned
-            ? arith::IndexCastOp::create(rewriter, loc, ity, r).getResult()
-            : arith::IndexCastUIOp::create(rewriter, loc, ity, r).getResult());
-    return success();
-  }
-};
-
-/// Whether \p op sits at an integer width no divider row declares while a
-/// wider row exists, such as the i33 a mixed-signedness promotion mints.
-static bool widensToDivRow(Operation *op, const OperatorLibrary &lib) {
+/// The width \p op should be rebuilt at when it sits at an integer width no
+/// divider row declares while a wider row exists, such as the i33 a mixed
+/// signedness promotion mints. 0 where it already sits on a row.
+static unsigned divRowWidth(Operation *op, const OperatorLibrary &lib) {
   auto ity = dyn_cast<IntegerType>(op->getResult(0).getType());
   if (!ity)
-    return false;
+    return 0;
   unsigned row = lib.smallestAdvancedRowWidth(op->getName().stripDialect(),
                                               ity.getWidth());
-  return row != 0 && row != ity.getWidth();
+  return row == ity.getWidth() ? 0 : row;
 }
 
-// A division at an off-row width no other pattern takes prices as a full-width
-// combinational divider and derates the module, like the `index` case above.
-// Widened to the narrowest declared row it binds that pipelined core; the
-// extension keeps quotient and remainder exact and the truncation back is free.
-struct WidenDivToRow : RewritePattern {
-  WidenDivToRow(MLIRContext *ctx, bool expand, unsigned maxMulWidth,
-                unsigned maxIpMulWidth, const OperatorLibrary &lib)
-      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx), expand(expand),
-        maxMulWidth(maxMulWidth), maxIpMulWidth(maxIpMulWidth), lib(lib) {}
-  bool expand;
-  unsigned maxMulWidth;
-  unsigned maxIpMulWidth;
+// A division no other pattern takes is rebuilt where the device declares a
+// divider row: `kIndexWidth` for an `index` result, the narrowest row above an
+// off-row integer width. Left as it stands it matches no row and prices as a
+// full-width combinational divider that derates the module's clock. Extending
+// both operands keeps quotient and remainder exact.
+struct RebuildDivAtRowWidth : RewritePattern {
+  RebuildDivAtRowWidth(MLIRContext *ctx, const DivPolicy &pol,
+                       const OperatorLibrary &lib)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx), pol(pol),
+        lib(lib) {}
+  const DivPolicy &pol;
   const OperatorLibrary &lib;
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
     if (!isa<arith::DivUIOp, arith::RemUIOp, arith::DivSIOp, arith::RemSIOp>(
-            op) ||
-        !widensToDivRow(op, lib))
+            op))
+      return failure();
+    Type ty = op->getResult(0).getType();
+    unsigned width = ty.isIndex() ? kIndexWidth : divRowWidth(op, lib);
+    if (!width)
       return failure();
     bool isSigned = isa<arith::DivSIOp, arith::RemSIOp>(op);
+    // A power-of-two divisor is a shift and a planned constant one a
+    // reciprocal; both lower without any divider.
     if (powerOfTwoDivisor(op->getOperand(1)) ||
-        (expand && magicPlan(op, isSigned, maxMulWidth, maxIpMulWidth)))
+        (pol.expand && magicPlan(op, isSigned, pol)))
       return failure();
     Location loc = op->getLoc();
-    unsigned row = lib.smallestAdvancedRowWidth(
-        op->getName().stripDialect(),
-        cast<IntegerType>(op->getResult(0).getType()).getWidth());
-    Type wide = rewriter.getIntegerType(row);
-    auto grow = [&](Value v) -> Value {
-      if (isSigned)
-        return arith::ExtSIOp::create(rewriter, loc, wide, v);
-      return arith::ExtUIOp::create(rewriter, loc, wide, v);
+    Type rowTy = rewriter.getIntegerType(width);
+    // `index` on either side takes an index cast; between integer widths the
+    // direction says extend or truncate.
+    auto cast = [&](Value v, Type to) -> Value {
+      if (v.getType().isIndex() || to.isIndex())
+        return isSigned ? arith::IndexCastOp::create(rewriter, loc, to, v)
+                              .getResult()
+                        : arith::IndexCastUIOp::create(rewriter, loc, to, v)
+                              .getResult();
+      if (to.getIntOrFloatBitWidth() > v.getType().getIntOrFloatBitWidth())
+        return isSigned
+                   ? arith::ExtSIOp::create(rewriter, loc, to, v).getResult()
+                   : arith::ExtUIOp::create(rewriter, loc, to, v).getResult();
+      return arith::TruncIOp::create(rewriter, loc, to, v).getResult();
     };
     OperationState state(loc, op->getName());
-    state.addOperands({grow(op->getOperand(0)), grow(op->getOperand(1))});
-    state.addTypes(wide);
+    state.addOperands(
+        {cast(op->getOperand(0), rowTy), cast(op->getOperand(1), rowTy)});
+    state.addTypes(rowTy);
     Value r = rewriter.create(state)->getResult(0);
-    rewriter.replaceOpWithNewOp<arith::TruncIOp>(op, op->getResult(0).getType(),
-                                                 r);
+    rewriter.replaceOp(op, cast(r, ty));
     return success();
   }
 };
@@ -1027,18 +1011,9 @@ struct LegalizeArithPass
     // Built from the injected `dcp.device` / `dcp.operator` IR
     OperatorLibrary lib = OperatorLibrary::fromModule(module);
 
-    // The widest multiply the clock takes whole, register floor included, and
-    // the widest one a pipelined multiplier row carries registered: a typed
-    // division expands where either form of the reciprocal's product fits and
-    // keeps its divider IP past both. With no period stated every typed
-    // division stays on its IP.
-    unsigned maxMulWidth = 0;
-    if (expandConstArith && periodNs > 0.0)
-      for (unsigned w = 2; w <= 129; ++w)
-        if (std::optional<double> delay = lib.measuredCombDelay(OpKind::Mul, w))
-          if (*delay <= periodNs)
-            maxMulWidth = w;
-    unsigned maxIpMulWidth = expandConstArith ? lib.maxPipelinedMulWidth() : 0;
+    // A typed division expands where either form of the reciprocal's product
+    // fits and keeps its divider IP past both.
+    DivPolicy pol = divPolicy(lib, expandConstArith, periodNs);
 
     // Table reads at literal indices fold to a fixpoint first, so a multiply
     // sees its literal factor before it is judged: the conversion below visits
@@ -1065,13 +1040,10 @@ struct LegalizeArithPass
     arith::populateArithExpandOpsPatterns(patterns);
     patterns.add<LowerBitGetSlice, LowerBitSetSlice, ReduceDivUI, ReduceRemUI,
                  ReduceDivSI, ReduceRemSI>(&getContext());
-    patterns.add<IndexDivToTyped>(&getContext(), expandConstArith, maxMulWidth,
-                                  maxIpMulWidth);
-    patterns.add<WidenDivToRow>(&getContext(), expandConstArith, maxMulWidth,
-                                maxIpMulWidth, lib);
+    patterns.add<RebuildDivAtRowWidth>(&getContext(), pol, lib);
     if (expandConstArith)
       patterns.add<MagicDivUI, MagicRemUI, MagicDivSI, MagicRemSI>(
-          &getContext(), maxMulWidth, maxIpMulWidth);
+          &getContext(), pol);
 
     ConversionTarget target(getContext());
     target.addLegalDialect<arith::ArithDialect>();
@@ -1093,23 +1065,14 @@ struct LegalizeArithPass
     // the flag asks; anything still at `index` moves to the typed width, and an
     // off-row width to the narrowest divider row above it. Every other divisor
     // stays and is bound to a device core.
-    bool expand = expandConstArith;
-    target.addDynamicallyLegalOp<arith::DivUIOp, arith::RemUIOp>(
-        [expand, maxMulWidth, maxIpMulWidth, &lib](Operation *op) {
-          if (powerOfTwoDivisor(op->getOperand(1)) ||
-              op->getResult(0).getType().isIndex() || widensToDivRow(op, lib))
-            return false;
-          return !(expand && magicPlan(op, /*isSigned=*/false, maxMulWidth,
-                                       maxIpMulWidth));
-        });
-    target.addDynamicallyLegalOp<arith::DivSIOp, arith::RemSIOp>(
-        [expand, maxMulWidth, maxIpMulWidth, &lib](Operation *op) {
-          if (powerOfTwoDivisor(op->getOperand(1)) ||
-              op->getResult(0).getType().isIndex() || widensToDivRow(op, lib))
-            return false;
-          return !(expand && magicPlan(op, /*isSigned=*/true, maxMulWidth,
-                                       maxIpMulWidth));
-        });
+    target.addDynamicallyLegalOp<arith::DivUIOp, arith::RemUIOp, arith::DivSIOp,
+                                 arith::RemSIOp>([&](Operation *op) {
+      if (powerOfTwoDivisor(op->getOperand(1)) ||
+          op->getResult(0).getType().isIndex() || divRowWidth(op, lib))
+        return false;
+      bool isSigned = isa<arith::DivSIOp, arith::RemSIOp>(op);
+      return !(pol.expand && magicPlan(op, isSigned, pol));
+    });
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();

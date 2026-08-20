@@ -70,14 +70,11 @@ std::optional<int64_t> mlir::allo::composeSpan(const SpanNode &n) {
                                                           : kContainerBoundary,
                          *n.trip, *body);
   }
-  // A LEAF issues on its own controller's cadence and then drains. The acyclic
-  // families are the one place the boundary depends on context rather than on
-  // the region: a nested one waits for its container's counter to settle.
+  // A LEAF issues on its own controller's cadence and then drains.
   if (!n.drain || (!n.acyclic && !n.ii))
     return std::nullopt;
   const BoundaryCost &boundary =
-      !n.acyclic ? kPipelinedBoundary
-                 : (n.nested ? kAcyclicNestedBoundary : kAcyclicTopBoundary);
+      !n.acyclic ? kPipelinedBoundary : kAcyclicBoundary;
   return leafSpan(boundary, *n.trip, n.acyclic ? 0 : *n.ii, *n.drain);
 }
 
@@ -352,16 +349,6 @@ std::vector<SpanNode> mlir::allo::dcpSpanNodes(Block &block, bool topLevel) {
   return nodes;
 }
 
-// Whether \p op is driven by an enclosing dcp region rather than by the func's
-// own sequencer. Asked of the op and not of the walk's `topLevel`, because
-// `dcpRegionTiming` enters the walk part-way down for a region of its own.
-static bool hasEnclosingRegion(Operation *op) {
-  for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
-    if (isa<DCPathRegionOpInterface>(p))
-      return true;
-  return false;
-}
-
 SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
   SpanNode n;
   if (auto inv = dyn_cast<DCPathInstanceOp>(op)) {
@@ -377,7 +364,6 @@ SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
   }
   auto region = cast<DCPathRegionOpInterface>(op);
   n.shape = dcpRegionShape(op);
-  n.nested = hasEnclosingRegion(op);
   n.elastic = isElastic(op);
   if (n.shape == RegionShape::Guard) {
     // A `dcp.select`: each arm is a done-paced sequence of its own, composed

@@ -36,6 +36,10 @@ class PrepassOptions:
     scalarize_threshold: int = 16
 
 
+#: `O` values the driver sweeps a period for, rather than passing to the solver.
+PERIOD_POLICIES = frozenset({"freq", "wall"})
+
+
 @dataclass(frozen=True)
 class SchedulerOptions:
     """What the scheduler itself was asked for.

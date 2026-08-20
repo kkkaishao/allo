@@ -167,6 +167,7 @@ class OperatorIP(IP[P, R]):
     between.
     """
 
+    # pylint: disable-next=too-many-arguments
     def __init__(
         self,
         fn: Callable[P, R],
@@ -242,11 +243,12 @@ class OperatorIP(IP[P, R]):
         ``in_delay_ns`` overrides the archetype's input cone for this depth;
         ``min_period_ns`` states the clock the depth's internal stages hold."""
         core = copy.copy(self)
-        core.timing = replace(self.timing, latency=latency)
+        overrides = {"latency": latency}
         if in_delay_ns is not None:
-            core.timing = replace(core.timing, in_delay_ns=in_delay_ns)
+            overrides["in_delay_ns"] = in_delay_ns
         if min_period_ns is not None:
-            core.timing = replace(core.timing, min_period_ns=min_period_ns)
+            overrides["min_period_ns"] = min_period_ns
+        core.timing = replace(self.timing, **overrides)
         verify_timing(core.timing)
         return core
 
@@ -282,37 +284,14 @@ def operator_ip(
 ) -> Callable[[Callable[P, R]], OperatorIP[P, R]]: ...
 
 
-def operator_ip(
-    fn: Callable[P, R] | None = None,
-    *,
-    optype: OperatorType | str,
-    mnemonic: str | None = None,
-    latency: int = 1,
-    in_delay_ns: float = 0.0,
-    out_delay_ns: float = 0.0,
-    pipelined: bool = False,
-    style: Literal["free", "elastic", "ce"] | None = None,
-    fed_width: int | None = None,
-    min_period_ns: float = 0.0,
-) -> OperatorIP[P, R] | Callable[[Callable[P, R]], OperatorIP[P, R]]:
+def operator_ip(fn=None, **kw):
     """Declare an operator core: an external block the compiler binds ops of
     ``optype`` onto. The body is ``...``; the parameters declare the signature,
     which with ``optype`` and ``latency`` selects and names the core (see
     :attr:`OperatorIP.symbol`)."""
 
-    def build(fn: Callable[P, R]) -> OperatorIP[P, R]:
-        assert callable(fn), "The first argument must be a callable function."
-        return OperatorIP(
-            fn=fn,
-            optype=optype,
-            mnemonic=mnemonic,
-            latency=latency,
-            in_delay_ns=in_delay_ns,
-            out_delay_ns=out_delay_ns,
-            pipelined=pipelined,
-            style=style,
-            fed_width=fed_width,
-            min_period_ns=min_period_ns,
-        )
+    def build(f):
+        assert callable(f), "The first argument must be a callable function."
+        return OperatorIP(f, **kw)
 
     return build(fn) if fn is not None else build

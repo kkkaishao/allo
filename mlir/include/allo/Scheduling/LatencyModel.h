@@ -62,14 +62,10 @@ inline constexpr BoundaryCost kCheckedBoundary{/*arm=*/1, /*reArm=*/1};
 /// would otherwise leave no rising edge.
 inline constexpr BoundaryCost kGuardBoundary{/*arm=*/1, /*reArm=*/1};
 
-/// A nested acyclic region arms on `start` directly: its container's counter
-/// and iter-args commit at least a cycle before the launch pulse, so the pass
-/// reads settled values in the launch cycle itself.
-inline constexpr BoundaryCost kAcyclicNestedBoundary{/*arm=*/0, /*reArm=*/0};
-
-/// A TOP-LEVEL acyclic region has no outer counter to wait for, so it arms on
-/// `start` directly.
-inline constexpr BoundaryCost kAcyclicTopBoundary{/*arm=*/0, /*reArm=*/0};
+/// An acyclic region arms on `start` directly, nested or top-level: a
+/// container's counter and iter-args commit at least a cycle before the launch
+/// pulse, and a top-level one has no outer counter to wait for.
+inline constexpr BoundaryCost kAcyclicBoundary{/*arm=*/0, /*reArm=*/0};
 
 /// A pipelined leaf issues its first iteration on `start` itself: the counter,
 /// phase and scaled counters read their reload values through a start-cycle
@@ -140,10 +136,6 @@ struct SpanNode {
   /// it has no static span. Set on whichever node holds the stream access and
   /// on every node above it, though either alone would answer.
   bool elastic = false;
-  /// Whether an enclosing region drives this one, the one boundary cost that
-  /// depends on CONTEXT rather than on the node (`kAcyclicNestedBoundary`
-  /// against `kAcyclicTopBoundary`).
-  bool nested = false;
   /// An INSTANCE element rather than a region of this func: `contract` is the
   /// callee's whole start->done span, counted to its own `done` rising.
   bool instance = false;

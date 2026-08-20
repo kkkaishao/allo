@@ -2476,9 +2476,7 @@ def test_a_callee_write_shares_the_port_of_ordered_regions():
             out[t] = buf[2] + buf[3]
 
     mod = _to_rtl(seqw)
-    buf = next(
-        m for f in mod.microarch.funcs for m in f.mems if m.realization == "ram"
-    )
+    buf = next(m for f in mod.microarch.funcs for m in f.mems if m.realization == "ram")
     assert buf.cost.write_ports == 1
     out = np.zeros(8, np.int32)
     mod.cosim(A8, out)
@@ -3114,9 +3112,7 @@ def test_the_auto_partition_threshold_is_a_boundary(depth):
     out = np.zeros(16, np.int32)
     mod.cosim(A16, out)
     doubled = A16 * 2
-    expect = (
-        doubled[A16 & 15] + doubled[(A16 + 1) & 15] + doubled[(A16 + 2) & 15]
-    )
+    expect = doubled[A16 & 15] + doubled[(A16 + 1) & 15] + doubled[(A16 + 2) & 15]
     assert np.array_equal(out, expect)
 
 

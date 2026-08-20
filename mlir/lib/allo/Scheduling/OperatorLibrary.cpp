@@ -362,9 +362,7 @@ const OperatorEntry *OperatorLibrary::selectImplementation(
   // What a row needs for a cycle of its own, in the same float arithmetic the
   // derate walk prices it at (`minSchedulablePeriod`).
   auto needOf = [floor = static_cast<float>(regFloor)](const OperatorEntry *e) {
-    return std::max({floor + static_cast<float>(e->inDelay),
-                     static_cast<float>(e->outDelay),
-                     static_cast<float>(e->minPeriod)});
+    return periodNeed(floor, e->inDelay, e->outDelay, e->minPeriod);
   };
   // Fitting the selection period ranks first, so a deep pipeline beats a
   // shallow core the clock cannot hold; among misses the least need wins,
@@ -791,10 +789,8 @@ OperatorLibrary::candidateChars(Operation *op) const {
       continue;
     // The same float fit test `selectImplementation` ranks by, so the set here
     // and the row `lookup` picks never disagree about what fits.
-    float need =
-        std::max({static_cast<float>(regFloor) + static_cast<float>(e->inDelay),
-                  static_cast<float>(e->outDelay),
-                  static_cast<float>(e->minPeriod)});
+    float need = periodNeed(static_cast<float>(regFloor), e->inDelay,
+                            e->outDelay, e->minPeriod);
     if (need > selectionPeriodNs)
       continue;
     if (!priceOf(e->uses, {width}))

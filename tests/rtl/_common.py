@@ -56,6 +56,7 @@ IDIV = _LAT[("divsi", "int32")]  # 32-bit signed integer divide
 MEM = default_device.storage["lutram"].read_latency  # default read/write
 MEM_URAM = default_device.storage["uram"].read_latency
 
+
 # A device delay row is a curve over operand width, so a caller names the width
 # it means. 32 is the default because these kernels are i32.
 def comb_ns(kind: str, width: int = 32) -> float:

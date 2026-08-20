@@ -70,7 +70,9 @@ std::optional<Hull> hullOf(Value v, unsigned depth);
 std::optional<Hull> hullOfExpr(AffineExpr e, unsigned numDims,
                                ValueRange operands, unsigned depth) {
   auto operand = [&](unsigned pos) -> std::optional<Hull> {
-    return pos < operands.size() ? hullOf(operands[pos], depth) : std::nullopt;
+    assert(pos < operands.size() &&
+           "an affine map's operands cover its dims and symbols");
+    return hullOf(operands[pos], depth);
   };
   if (auto c = dyn_cast<AffineConstantExpr>(e))
     return Hull{c.getValue(), c.getValue()};
@@ -587,20 +589,25 @@ struct NarrowIterArgs : OpRewritePattern<affine::AffineForOp> {
     SmallVector<Type> ntys;
     bool any = false;
     for (OpResult r : fo.getResults()) {
+      ntys.push_back(r.getType());
       auto ity = dyn_cast<IntegerType>(r.getType());
+      if (!ity || ity.getWidth() <= 1)
+        continue;
       // A returned or re-yielded result keeps the carrier: its widening cast
       // would be stranded in a span of its own, spending a region boundary on
       // pure wiring.
-      bool escapes = llvm::any_of(r.getUsers(), [](Operation *u) {
-        return u->hasTrait<OpTrait::IsTerminator>();
-      });
-      std::optional<Hull> h = ity && !escapes && ity.getWidth() > 1
-                                  ? hullOf(r, kHullDepth)
-                                  : std::nullopt;
-      bool narrows = h && bitsOfHull(*h) < ity.getWidth();
-      ntys.push_back(narrows ? rewriter.getIntegerType(bitsOfHull(*h))
-                             : r.getType());
-      any |= narrows;
+      if (llvm::any_of(r.getUsers(), [](Operation *u) {
+            return u->hasTrait<OpTrait::IsTerminator>();
+          }))
+        continue;
+      std::optional<Hull> h = hullOf(r, kHullDepth);
+      if (!h)
+        continue;
+      unsigned w = bitsOfHull(*h);
+      if (w >= ity.getWidth())
+        continue;
+      ntys.back() = rewriter.getIntegerType(w);
+      any = true;
     }
     if (!any)
       return failure();
@@ -682,39 +689,45 @@ struct MaskToTrunc : OpRewritePattern<arith::AndIOp> {
   }
 };
 
+// trunci(cast(x: index -> iA) -> iB)  =>  cast(x -> iB)
+struct FoldTruncOfIndexCast : OpRewritePattern<arith::TruncIOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::TruncIOp op,
+                                PatternRewriter &rewriter) const override {
+    Operation *inner = op.getIn().getDefiningOp();
+    if (!inner || !isa<arith::IndexCastOp, arith::IndexCastUIOp>(inner) ||
+        !isa<IndexType>(inner->getOperand(0).getType()))
+      return failure();
+    // Both steps keep the low bits, so one truncating cast does.
+    rewriter.replaceOpWithNewOp<arith::IndexCastOp>(op, op.getType(),
+                                                    inner->getOperand(0));
+    return success();
+  }
+};
+
 // A resize that hops through `index` is a resize: fold the pair to one direct
 // cast so a truncation keeps moving toward its producer.
 //   cast(cast(x: iA -> index) -> iB)  =>  trunci/ext(x -> iB)
-//   trunci(cast(x: index -> iA) -> iB)  =>  cast(x -> iB)
 struct FoldCastThroughIndex : RewritePattern {
   FoldCastThroughIndex(MLIRContext *ctx)
       : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx) {}
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    if (isa<arith::TruncIOp>(op)) {
-      Operation *inner = op->getOperand(0).getDefiningOp();
-      if (!inner || !isa<arith::IndexCastOp, arith::IndexCastUIOp>(inner) ||
-          !isa<IndexType>(inner->getOperand(0).getType()))
-        return failure();
-      // Both steps keep the low bits, so one truncating cast does.
-      rewriter.replaceOpWithNewOp<arith::IndexCastOp>(
-          op, op->getResult(0).getType(), inner->getOperand(0));
-      return success();
-    }
     if (!isa<arith::IndexCastOp, arith::IndexCastUIOp>(op) ||
         !isa<IntegerType>(op->getResult(0).getType()))
       return failure();
     Operation *inner = op->getOperand(0).getDefiningOp();
     if (!inner || !isa<arith::IndexCastOp, arith::IndexCastUIOp>(inner))
       return failure();
-    auto ity = dyn_cast<IntegerType>(inner->getOperand(0).getType());
+    Value x = inner->getOperand(0);
+    auto ity = dyn_cast<IntegerType>(x.getType());
     if (!ity)
       return failure();
-    Value x = inner->getOperand(0);
     unsigned a = ity.getWidth();
-    unsigned b = cast<IntegerType>(op->getResult(0).getType()).getWidth();
     Type bty = op->getResult(0).getType();
+    unsigned b = cast<IntegerType>(bty).getWidth();
     if (b == a) {
       rewriter.replaceOp(op, x);
     } else if (b < a) {
@@ -734,7 +747,8 @@ struct NarrowDemandedBitsPass
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
     patterns.add<SinkTruncThroughRingOp, DropRedundantMask, NarrowFromHull,
-                 NarrowIterArgs, MaskToTrunc, FoldCastThroughIndex>(ctx);
+                 NarrowIterArgs, MaskToTrunc, FoldCastThroughIndex,
+                 FoldTruncOfIndexCast>(ctx);
     // The cast folds are what make the rewrite chain: without them a sunk
     // truncation stops on top of an extend instead of collapsing into it.
     arith::TruncIOp::getCanonicalizationPatterns(patterns, ctx);

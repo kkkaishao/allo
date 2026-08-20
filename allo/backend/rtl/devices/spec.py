@@ -9,7 +9,18 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from ..device import CombKind, Const, Cost, Linear, Piecewise, Resource, Table, Tiled
+from ....lang.ip import OperatorIP
+from ..device import (
+    CombKind,
+    Const,
+    Cost,
+    Device,
+    Linear,
+    Piecewise,
+    Resource,
+    Table,
+    Tiled,
+)
 
 #: Below this depth a delay chain stays in flip-flops; at or above it Vivado
 #: extracts a shift register, even with every stage reset. An SRL32E holds 32
@@ -194,3 +205,31 @@ class IPRow(NamedTuple):
     #: Least clock period in ns the row's internal stages are warranted at.
     #: ``None`` takes the grade's characterization period.
     min_period_ns: float | None = None
+
+
+def add_ip_rows(
+    device: Device,
+    rows_by_core: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]],
+    res: Mapping[str, Resource],
+    default_freq_mhz: float,
+) -> None:
+    """Declare one operator per IP row, retimed to the row's depth and priced
+    from its area."""
+    for core, rows in rows_by_core.items():
+        for row in (rows,) if isinstance(rows, IPRow) else rows:
+            operator = core.retimed(
+                row.latency,
+                row.in_delay_ns,
+                # A row defaults to the clock it was characterized at.
+                (
+                    row.min_period_ns
+                    if row.min_period_ns is not None
+                    else 1000.0 / default_freq_mhz
+                ),
+            )
+            if row.mnemonic is not None:
+                operator.mnemonic = row.mnemonic
+            device.add_operator(operator)
+            device.set_operator_uses(
+                operator, {res[n]: Const(v) for n, v in row.area.items()}
+            )

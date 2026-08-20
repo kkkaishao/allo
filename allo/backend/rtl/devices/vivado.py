@@ -197,7 +197,7 @@ _CMP_OPCODE = {
 def _cmp_opcode(predicate: str) -> int | None:
     if predicate == "uno":
         return _CMP_OPCODE["uno"]
-    if predicate[:1] in ("o", "u"):
+    if predicate[:1] in {"o", "u"}:
         return _CMP_OPCODE.get(predicate[1:])
     return None  # ord / true / false have no single opcode
 
@@ -214,7 +214,7 @@ class Generated(NamedTuple):
     missing: tuple[str, ...]  # `module: reason` for what cannot be built
 
 
-def config(recipe: VivadoCore, latency: int, no_dsp: bool = False) -> str:
+def _config(recipe: VivadoCore, latency: int, no_dsp: bool = False) -> str:
     """The full core configuration, `Key=Value` comma separated, in apply
     order: clock-enable base, shape, the DSP-free fragment if the row was
     measured without DSPs, the pipeline depth last."""
@@ -245,23 +245,19 @@ def _split(op: Operator):
     return data, clk, ce, out
 
 
-def _fp_shim(op: Operator, recipe: VivadoCore) -> str:
+def _fp_shim(op: Operator, recipe: VivadoCore, opcode: int | None) -> str:
     """The floating_point core: one AXI channel per operand, named as the
     operand is; `tvalid` ties high (non-blocking flow control computes every
     cycle) and the result `tvalid` is ignored. A core whose shape leaves an
-    operation channel gets its constant, the predicate's opcode on a compare.
-    The core pads `tdata` to a byte boundary, so a narrower result (a compare's
-    single bit) slices a wire."""
+    operation channel gets its constant, ``opcode`` on a compare. The core pads
+    `tdata` to a byte boundary, so a narrower result (a compare's single bit)
+    slices a wire."""
     data, clk, ce, out = _split(op)
     conns = [f".aclk({clk})", f".aclken({ce})"]
     for p in data:
         conns.append(f".s_axis_{p.name}_tvalid(1'b1)")
         conns.append(f".s_axis_{p.name}_tdata({p.name})")
-    operation = recipe.operation
-    if op.predicate:
-        opcode = _cmp_opcode(op.predicate)
-        assert opcode is not None
-        operation = f"{opcode:08b}"
+    operation = f"{opcode:08b}" if opcode is not None else recipe.operation
     if operation:
         conns.append(".s_axis_operation_tvalid(1'b1)")
         conns.append(f".s_axis_operation_tdata(8'b{operation})")
@@ -337,7 +333,7 @@ def _rtl_shim(op: Operator, arche: OperatorIP, expr: str) -> str:
     widths = {p.name: p.width for p in data}
     regs = [f"  reg [{widths[n] - 1}:0] {n}_q;" for n in (x, y)]
     shifts = [f"      {n}_q <= {n};" for n in (x, y)]
-    prod, addend = "m0", f"{z}"
+    prod, addend = "m0", z
     regs.append(f"  reg [{w - 1}:0] m0;")
     shifts.append(f"      m0 <= {x}_q * {y}_q;")
     for k in range(1, lat - 2):
@@ -404,7 +400,8 @@ def generate(interfaces: Interfaces, device: Device) -> Generated:
                 what = "device operator" if arche is None else "recipe"
                 missing.append(f"{op.module}: no {what} for '{op.impl}'")
                 continue
-            if op.predicate and _cmp_opcode(op.predicate) is None:
+            opcode = _cmp_opcode(op.predicate) if op.predicate else None
+            if op.predicate and opcode is None:
                 missing.append(
                     f"{op.module}: predicate '{op.predicate}' has no compare opcode"
                 )
@@ -412,18 +409,19 @@ def generate(interfaces: Interfaces, device: Device) -> Generated:
             if recipe.core == "rtl":
                 shims[op.module] = _rtl_shim(op, arche, recipe.shape)
                 continue
-            no_dsp = bool(recipe.no_dsp) and "dsp" not in dict(
-                device.operator_uses.get(op.impl, ())
+            no_dsp = bool(recipe.no_dsp) and not any(
+                n == "dsp" for n, _ in device.operator_uses.get(op.impl, ())
             )
             cores[op.impl] = (
                 recipe.core,
-                config(recipe, arche.timing.latency, no_dsp),
+                _config(recipe, arche.timing.latency, no_dsp),
             )
             if recipe.core == "floating_point":
-                shims[op.module] = _fp_shim(op, recipe)
+                shims[op.module] = _fp_shim(op, recipe, opcode)
             elif recipe.core == "mult_gen":
                 shims[op.module] = _mult_shim(op, arche)
             else:
+                assert recipe.core == "div_gen"
                 shims[op.module] = _div_shim(op, arche)
     return Generated(
         shims="\n".join(shims.values()),

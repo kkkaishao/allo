@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .device import CombKind, Device
 from .devices import default_device
@@ -358,9 +358,7 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
 
         def packed(u: Utilization) -> Utilization:
             logic = round(u.logic_lut * device.lut_packing)
-            return Utilization(
-                logic + u.srl, logic, u.srl, u.ff, u.dsp, u.carry8, u.bram36, u.uram288
-            )
+            return replace(u, lut=logic + u.srl, logic_lut=logic)
 
         by_kind = {k: packed(v) for k, v in by_kind.items()}
         by_func = {k: packed(v) for k, v in by_func.items()}
@@ -397,9 +395,7 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
         fmax=1000.0 / critical_paths[0].total,
         fmax_target=1000.0 / report.microarch.cycle_time,
         clock_mhz=(
-            1000.0 / sched.compiler.options.cycle_ns
-            if sched.compiler.options
-            else None
+            1000.0 / sched.compiler.options.cycle_ns if sched.compiler.options else None
         ),
         critical_paths=critical_paths,
         area=area,

@@ -986,14 +986,13 @@ static void reportAddressCost(func::FuncOp funcOp, const DeviceModel &dev) {
       return;
     ++nonTrivial;
     worstNow = std::max(worstNow, cost.delay);
-    if (cost.dividers || cost.reciprocals)
-      ++withDivider;
     std::string addr;
     llvm::raw_string_ostream os(addr);
     os << e.offset;
     if (e.bank)
       os << " (bank " << e.bank << ")";
-    if (cost.dividers || cost.reciprocals)
+    if (cost.dividers || cost.reciprocals) {
+      ++withDivider;
       warn(Stage::Prep, op)
           << "The address " << addr << " costs "
           << llvm::format("%.2f", cost.delay)
@@ -1003,6 +1002,7 @@ static void reportAddressCost(func::FuncOp funcOp, const DeviceModel &dev) {
              "controller maintains; a subscript that is neither pays a "
              "reciprocal multiply in the cone. Choose a power-of-two "
              "partition factor, or index the array by a loop counter";
+    }
     debug(Stage::Prep, op) << "Address " << addr << ": "
                            << llvm::format("%.2f", cost.delay) << " ns at "
                            << e.width << "b [" << cost.adders << " add, "

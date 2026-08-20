@@ -716,7 +716,7 @@ void DCPathOperatorOp::print(OpAsmPrinter &p) {
   printNum(p, getInDelayAttr().getValueAsDouble());
   p << " out_delay ";
   printNum(p, getOutDelayAttr().getValueAsDouble());
-  if (double mp = getMinPeriodAttr().getValueAsDouble()) {
+  if (double mp = getMinPeriod().convertToDouble()) {
     p << " min_period ";
     printNum(p, mp);
   }

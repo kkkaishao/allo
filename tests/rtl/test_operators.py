@@ -1895,9 +1895,7 @@ def test_a_carried_scalar_narrows_to_its_recurrence_envelope():
     m = rtl.mlir
     widths = {
         name: width
-        for name, width in re.findall(
-            r"%(r\d+_sv\d+) = seq\.compreg[^\n]*: (i\d+)", m
-        )
+        for name, width in re.findall(r"%(r\d+_sv\d+) = seq\.compreg[^\n]*: (i\d+)", m)
     }
     svw = sorted(widths.values())
     # t rides [0, 100] (i8), idx [0, 49] (i7); the data-stepped s keeps i32.
@@ -2359,16 +2357,10 @@ def test_a_typed_constant_division_expands_where_the_multiply_fits():
     rtl = _to_rtl(wide)
     rtl.schedule()
     rtl.compile()
-    impls = [
-        op.impl for iface in rtl.interfaces.values() for op in iface.operators
-    ]
+    impls = [op.impl for iface in rtl.interfaces.values() for op in iface.operators]
     assert impls and all(im.startswith("mulw_i64") for im in impls)
-    A = np.array(
-        [0, 1, 17, 18, 4294967295, 4294967294, 2147483647, 12345], np.uint32
-    )
-    B = np.array(
-        [-2147483648, 2147483647, -7, 7, -1, 1, 0, -123456789], np.int32
-    )
+    A = np.array([0, 1, 17, 18, 4294967295, 4294967294, 2147483647, 12345], np.uint32)
+    B = np.array([-2147483648, 2147483647, -7, 7, -1, 1, 0, -123456789], np.int32)
     q = np.zeros(8, np.uint32)
     u = np.zeros(8, np.uint32)
     s = np.zeros(8, np.int32)
@@ -2388,9 +2380,9 @@ def test_a_typed_constant_division_expands_where_the_multiply_fits():
     rtl = _to_rtl(past_the_row)
     rtl.schedule()
     rtl.compile()
-    assert [
-        op.impl for iface in rtl.interfaces.values() for op in iface.operators
-    ] == ["divsi_i64_i64_i64_l68"]
+    assert [op.impl for iface in rtl.interfaces.values() for op in iface.operators] == [
+        "divsi_i64_i64_i64_l68"
+    ]
 
 
 # A genuinely wide product of narrow operands binds the narrow widening core:
@@ -2406,9 +2398,9 @@ def test_a_widening_product_binds_the_narrow_multiplier():
     rtl = _to_rtl(widen)
     rtl.schedule()
     rtl.compile()
-    assert [
-        op.impl for iface in rtl.interfaces.values() for op in iface.operators
-    ] == ["mulw_i64_i64_i64_l3"]
+    assert [op.impl for iface in rtl.interfaces.values() for op in iface.operators] == [
+        "mulw_i64_i64_i64_l3"
+    ]
     rng = np.random.default_rng(11)
     A = rng.integers(-(2**31), 2**31, 16).astype(np.int32)
     B = rng.integers(-(2**31), 2**31, 16).astype(np.int32)
@@ -2426,9 +2418,9 @@ def test_a_widening_product_binds_the_narrow_multiplier():
     rtl = _to_rtl(full)
     rtl.schedule()
     rtl.compile()
-    assert [
-        op.impl for iface in rtl.interfaces.values() for op in iface.operators
-    ] == ["mul_i64_i64_i64_l6"]
+    assert [op.impl for iface in rtl.interfaces.values() for op in iface.operators] == [
+        "mul_i64_i64_i64_l6"
+    ]
 
 
 # A constant table read at literal indices folds to the element it names, and
@@ -2446,9 +2438,7 @@ def test_a_constant_table_coefficient_multiply_is_shift_adds():
     rtl = _to_rtl(fir)
     rtl.schedule()
     rtl.compile()
-    assert not [
-        op.impl for iface in rtl.interfaces.values() for op in iface.operators
-    ]
+    assert not [op.impl for iface in rtl.interfaces.values() for op in iface.operators]
     assert rtl.estimation.area.dsp == 0
     assert not [
         m for f in rtl.microarch.funcs for m in f.mems if m.realization == "rom"
@@ -2475,9 +2465,7 @@ def test_a_small_constant_multiply_recodes_and_a_wide_one_keeps_the_ip():
     rtl = _to_rtl(scale)
     rtl.schedule()
     rtl.compile()
-    impls = [
-        op.impl for iface in rtl.interfaces.values() for op in iface.operators
-    ]
+    impls = [op.impl for iface in rtl.interfaces.values() for op in iface.operators]
     assert len(impls) == 1 and impls[0].startswith("mul_i32")
     A = (np.arange(32, dtype=np.int32) - 16) * 1000
     b = np.zeros(32, np.int32)
@@ -2505,9 +2493,7 @@ def test_a_masked_counter_product_narrows_past_the_index_width():
     rtl = _to_rtl(twiddle)
     rtl.schedule()
     rtl.compile()
-    assert not [
-        op.impl for iface in rtl.interfaces.values() for op in iface.operators
-    ]
+    assert not [op.impl for iface in rtl.interfaces.values() for op in iface.operators]
     assert rtl.estimation.area.dsp == 0
     out = np.zeros((16, 16), np.int32)
     rtl.cosim(out)
@@ -2562,9 +2548,7 @@ def test_a_mixed_sign_pair_computes_values_not_bit_patterns():
     assert any(m.startswith("remsi_i32") for m in impls)
     rtl.compile()
     av = np.arange(-8, 8, dtype=np.int64)
-    bv = np.array(
-        [3, 40000, 7, 65535, 5, 50000, 3, 40000] * 2, dtype=np.int64
-    )
+    bv = np.array([3, 40000, 7, 65535, 5, 50000, 3, 40000] * 2, dtype=np.int64)
     lt_out = np.zeros(16, np.int32)
     q_out = np.zeros(16, np.int32)
     r_out = np.zeros(16, np.int32)
@@ -2639,9 +2623,7 @@ def test_an_apply_residue_builds_the_reciprocal():
     rtl = _to_rtl(rmod)
     _inject_apply(
         rtl,
-        lambda d0: ir.AffineExpr.get_mod(
-            d0 * 3 + 2, ir.AffineConstantExpr.get(5)
-        ),
+        lambda d0: ir.AffineExpr.get_mod(d0 * 3 + 2, ir.AffineConstantExpr.get(5)),
     )
     rtl.schedule()
     units = [

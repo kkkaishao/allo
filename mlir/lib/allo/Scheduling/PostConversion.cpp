@@ -237,17 +237,20 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
 static void stampForwards(ScheduleModel &model,
                           DenseMap<Operation *, Operation *> &accessMap,
                           int64_t &nextFwdId) {
-  SmallVector<Operation *> loads;
+  SmallVector<std::pair<Operation *, ArrayRef<Operation *>>> pairs;
   for (auto &[load, stores] : model.allForwards())
     if (accessMap.contains(load))
-      loads.push_back(load);
-  llvm::sort(loads, [&](Operation *a, Operation *b) {
-    return accessMap.lookup(a)->isBeforeInBlock(accessMap.lookup(b));
+      pairs.push_back({load, stores});
+  if (pairs.empty())
+    return;
+  llvm::sort(pairs, [&](const auto &a, const auto &b) {
+    return accessMap.lookup(a.first)->isBeforeInBlock(
+        accessMap.lookup(b.first));
   });
-  for (Operation *load : loads) {
-    Builder ab(load->getContext());
+  Builder ab(pairs.front().first->getContext());
+  for (auto [load, stores] : pairs) {
     SmallVector<int64_t> ids;
-    for (Operation *store : model.allForwards().find(load)->second) {
+    for (Operation *store : stores) {
       Operation *reifiedStore = accessMap.lookup(store);
       assert(reifiedStore && "a forwarded pair reifies within one block, so "
                              "its store is in the same access map as its load");

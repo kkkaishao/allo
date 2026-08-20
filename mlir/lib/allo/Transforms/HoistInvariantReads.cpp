@@ -102,7 +102,7 @@ bool lowersPortFloor(affine::AffineForOp loop, ArrayRef<Operation *> hoistable) 
   DenseMap<Value, std::pair<unsigned, unsigned>> traffic; // total, hoistable
   loop.getBody()->walk([&](Operation *op) {
     Value memref = accessedMemref(op);
-    if (!memref || scattersToRegisters(memref))
+    if (!memref)
       return;
     auto &counts = traffic[memref];
     ++counts.first;
@@ -111,6 +111,8 @@ bool lowersPortFloor(affine::AffineForOp loop, ArrayRef<Operation *> hoistable) 
   });
   double before = 0, after = 0;
   for (auto &[memref, counts] : traffic) {
+    if (scattersToRegisters(memref))
+      continue;
     double banks = bankCount(memref);
     before = std::max(before, counts.first / banks);
     after = std::max(after, (counts.first - counts.second) / banks);
@@ -118,13 +120,25 @@ bool lowersPortFloor(affine::AffineForOp loop, ArrayRef<Operation *> hoistable) 
   return after < before;
 }
 
-void hoistFrom(affine::AffineForOp loop) {
-  // A hoisted read runs unconditionally, so the loop needs a known non-zero
-  // trip count. Only reads directly in the body move, one loop level at a
-  // time, which keeps their order against writes between nested loops.
-  std::optional<uint64_t> trip = affine::getConstantTripCount(loop);
-  if (!trip || *trip == 0)
-    return;
+// The reads directly in \p loop's body whose operands are all loop-invariant
+// and whose array is safe to preload. Only reads at this level move, one loop
+// level at a time, which keeps their order against writes between nested loops.
+SmallVector<Operation *> invariantReads(affine::AffineForOp loop) {
+  // One verdict per array: an unrolled body reads the same small array many
+  // times, and the array's own properties do not change between those reads.
+  DenseMap<Value, bool> preloadable;
+  auto arrayAllows = [&](Value memref) {
+    auto [it, fresh] = preloadable.try_emplace(memref, false);
+    if (fresh)
+      // Any write inside the loop, or any user this pass cannot read (a call
+      // mastering the array's ports), pins every read of the array.
+      it->second = writersAreVisible(memref) && !scattersToRegisters(memref) &&
+                   !llvm::any_of(memref.getUsers(), [&](Operation *user) {
+                     return loop->isProperAncestor(user) &&
+                            !isa<affine::AffineLoadOp, memref::LoadOp>(user);
+                   });
+    return it->second;
+  };
   SmallVector<Operation *> reads;
   for (Operation &op : *loop.getBody()) {
     if (!isa<affine::AffineLoadOp, memref::LoadOp>(op))
@@ -133,18 +147,20 @@ void hoistFrom(affine::AffineForOp loop) {
           return loop.isDefinedOutsideOfLoop(v);
         }))
       continue;
-    Value memref = accessedMemref(&op);
-    if (!writersAreVisible(memref) || scattersToRegisters(memref))
-      continue;
-    // Any write inside the loop, or any user this pass cannot read (a call
-    // mastering the array's ports), pins every read of the array.
-    if (llvm::any_of(memref.getUsers(), [&](Operation *user) {
-          return loop->isProperAncestor(user) &&
-                 !isa<affine::AffineLoadOp, memref::LoadOp>(user);
-        }))
+    if (!arrayAllows(accessedMemref(&op)))
       continue;
     reads.push_back(&op);
   }
+  return reads;
+}
+
+void hoistFrom(affine::AffineForOp loop) {
+  // A hoisted read runs unconditionally, so the loop needs a known non-zero
+  // trip count.
+  std::optional<uint64_t> trip = affine::getConstantTripCount(loop);
+  if (!trip || *trip == 0)
+    return;
+  SmallVector<Operation *> reads = invariantReads(loop);
   if (reads.empty())
     return;
   // A leaf body is what the modulo scheduler paces, so a preload there must

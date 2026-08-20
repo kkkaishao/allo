@@ -124,7 +124,9 @@ struct IterationControl {
   RegionControl rc;
   Value done;
   /// The pulse that sets `done`: high in the completion cycle itself, one
-  /// cycle before the latched level.
+  /// cycle before the latched level. Consumed only for the checked controller;
+  /// a counted region's pulse is its commit cycle and no successor may start
+  /// on it.
   Value donePulse;
 };
 
@@ -153,15 +155,16 @@ struct ControlEmitter {
   /// doomed iteration issues); no backpressure. \p sh gates issue as
   /// `wantIssue & sh.issueEnable` and runs the phase counter on
   /// `sh.chainEnable`; a rigid shell leaves both ungated.
-  /// \p region names the emitted state cells (`r<id>_run` / `_iv` / `_phase`).
-  RegionControl emitPipelined(unsigned region, llvm::StringRef counterName,
-                              int64_t ii, const Terminator &term, Value start,
+  /// \p rb names the emitted state cells (`r<id>_run` / `_iv` / `_phase`) and
+  /// carries the II the phase counter runs at.
+  RegionControl emitPipelined(const uarch::RegionBlock &rb,
+                              const Terminator &term, Value start,
                               const StallShell &sh) const;
   /// The straight-line control skeleton: one pass, no counter. The pass is
   /// DEFERRED while `sh.issueEnable` is low rather than dropped, which lets a
   /// stage-0 stream access wait for its handshake. A rigid shell issues
   /// unconditionally and builds no state at all.
-  RegionControl emitAcyclic(unsigned region, Value start, bool topLevel,
+  RegionControl emitAcyclic(unsigned region, Value start,
                             const StallShell &sh) const;
 
   /// The counted done-driven controller: `Container` and `CallNode` x
@@ -711,11 +714,11 @@ struct HWEmitter {
   /// launches in the latch cycle itself and reads the D wire in place of the
   /// stale output.
   llvm::DenseMap<uint64_t, Value> throughValue;
-  /// A guard survivor's capture terms {enable, datum}, keyed
-  /// accKey(region, port). The survivor latches on the guard's completion
-  /// pulse itself, so a container sampling in that cycle rebuilds the latch's
-  /// D wire from these instead of reading the stale register.
-  llvm::DenseMap<uint64_t, std::pair<Value, Value>> guardCapture;
+  /// A guard survivor's captured datum, keyed accKey(region, port). The
+  /// survivor latches on the guard's completion pulse (`donePulse`) itself, so
+  /// a container sampling in that cycle rebuilds the latch's D wire from the
+  /// datum and that pulse instead of reading the stale register.
+  llvm::DenseMap<uint64_t, Value> guardCapture;
 
   HWEmitter(OpBuilder &b, Location loc, const uarch::Datapath &dp,
             circt::hw::HWModulePortAccessor &pa,
@@ -782,7 +785,8 @@ struct HWEmitter {
   /// Whether \p rb also relaunches in that same cycle (advance = launch,
   /// boundary {0,0}). Requires the first child to sample the counter and
   /// iter-args no earlier than one cycle after launch, which a conditional
-  /// child and a guard child both guarantee.
+  /// child and a guard child both guarantee. Asked only of a counted container
+  /// that already advances on the pulse.
   bool chainsTurnover(const uarch::RegionBlock &rb) const;
   /// The next-value wire container \p rb's iter-arg \p k latches on advance.
   /// Normally the producing child's survivor register. With \p onPulse the

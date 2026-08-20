@@ -43,19 +43,31 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
-import subprocess
 import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from benchmark._child import run_child
+
 REPO = Path(__file__).resolve().parents[1]
 MARK = "@@VERIFY@@"
+
+
+@dataclass(frozen=True)
+class Knobs:
+    """What one run is compiled and simulated under, off the command line."""
+
+    scheduler: str
+    seed: int
+    cycles: int
+    objective: str
+
 
 # What one cosim may run for, derived from the model rather than fixed: a design
 # that hangs then aborts at a multiple of what it should have taken, instead of
@@ -106,30 +118,23 @@ def _mismatch(bench, args, expected) -> dict | None:
 # --- one run -----------------------------------------------------------------
 
 
-def verify_one(
-    key: str,
-    variant: str,
-    binding: str,
-    scheduler: str = "heuristic",
-    seed: int = 0,
-    cycles: int = 0,
-    objective: str = "cycles",
-) -> dict:
+def verify_one(item, knobs: Knobs) -> dict:
     """Compile one variant under one binding, cosim it and compare.
 
-    ``binding`` is the operator-sharing policy; ``cycles`` overrides the
-    derived simulation budget; ``objective`` is the exact solver's
+    ``binding`` is the operator-sharing policy; ``knobs.cycles`` overrides the
+    derived simulation budget; ``knobs.objective`` is the exact solver's
     optimization direction (the ``O`` knob)."""
     from allo.backend.rtl import LatencyModelWarning
     from benchmark.spec import find
 
+    key, variant, binding = item
     bench = find(key)
     out: dict = {
         "key": key,
         "variant": variant,
         "binding": binding,
-        "scheduler": scheduler,
-        "objective": objective,
+        "scheduler": knobs.scheduler,
+        "objective": knobs.objective,
         "stage": "build",
         "status": "error",
     }
@@ -141,14 +146,16 @@ def verify_one(
     try:
         parts = bench.build()
         sched = bench.schedules[variant](parts)
-        rtl = sched.export("rtl").set_scheduler_opt(scheduler=scheduler, O=objective)
+        rtl = sched.export("rtl").set_scheduler_opt(
+            scheduler=knobs.scheduler, O=knobs.objective
+        )
         if binding == "trivial":
             rtl.use_trivial_binding()
 
         out["stage"] = "schedule"
         fn = rtl.schedule().func(rtl.top)
         assert rtl.binding == binding, (
-            f"binding follows the scheduler: {scheduler!r} implies "
+            f"binding follows the scheduler: {knobs.scheduler!r} implies "
             f"{rtl.binding!r}, not {binding!r}"
         )
         out["latency"] = fn.latency
@@ -159,7 +166,7 @@ def verify_one(
         rtl.compile()
         out["rtl_sha"] = hashlib.sha256(rtl.verilog.encode()).hexdigest()[:16]
 
-        rng = np.random.default_rng(seed)
+        rng = np.random.default_rng(knobs.seed)
         args = bench.inputs(rng)
         # `reference` takes the kernel's arguments, output buffers included, so
         # it gets copies: one that accumulated into a buffer it was handed would
@@ -175,7 +182,7 @@ def verify_one(
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", LatencyModelWarning)
             out["cycles"] = rtl.cosim(
-                *args, timeout=cycles or _cycle_budget(fn.latency)
+                *args, timeout=knobs.cycles or _cycle_budget(fn.latency)
             ).cycles
         early = [w for w in caught if issubclass(w.category, LatencyModelWarning)]
         if early:
@@ -194,52 +201,31 @@ def verify_one(
     return out
 
 
-def _run_child(
-    item, scheduler: str, seed: int, cycles: int, timeout: int, objective: str
-) -> dict:
+def _run_child(item, knobs: Knobs, timeout: int) -> dict:
     key, variant, binding = item
-    env = dict(os.environ)
-    env["XILINX_VITIS"] = "/nonexistent"
-    env["PYTHONPATH"] = str(REPO)
-    env.setdefault("ALLO_LOG_LEVEL", "warn")
-    cmd = [
-        sys.executable,
-        "-m",
-        "benchmark.verify",
+    argv = [
         "--one",
         f"{key}::{variant}::{binding}",
         "--scheduler",
-        scheduler,
+        knobs.scheduler,
         "--seed",
-        str(seed),
+        str(knobs.seed),
         "--cycles",
-        str(cycles),
+        str(knobs.cycles),
         "--objective",
-        objective,
+        knobs.objective,
     ]
     t0 = time.time()
-    base = {"key": key, "variant": variant, "binding": binding, "scheduler": scheduler}
-    try:
-        p = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=env, cwd=str(REPO)
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            **base,
-            "status": "timeout",
-            "stage": "?",
-            "seconds": round(time.time() - t0, 1),
-        }
-    for line in p.stdout.splitlines():
-        if line.startswith(MARK):
-            return json.loads(line[len(MARK) :])
-    return {
-        **base,
-        "status": "crash",
-        "stage": "?",
-        "seconds": round(time.time() - t0, 1),
-        "error": (p.stdout + p.stderr)[-3000:],
+    base = {
+        "key": key,
+        "variant": variant,
+        "binding": binding,
+        "scheduler": knobs.scheduler,
     }
+    row, _ = run_child("benchmark.verify", MARK, argv, timeout, base)
+    if row["status"] in ("timeout", "crash"):
+        row.update(stage="?", seconds=round(time.time() - t0, 1))
+    return row
 
 
 # --- tables ------------------------------------------------------------------
@@ -378,23 +364,15 @@ def main():
     ap.add_argument("--timeout", type=int, default=1800, help="wall seconds per run")
     ap.add_argument("-o", "--out", default="verify.json")
     args = ap.parse_args()
+    knobs = Knobs(
+        scheduler=args.scheduler,
+        seed=args.seed,
+        cycles=args.cycles,
+        objective=args.objective,
+    )
 
     if args.one:
-        key, variant, binding = args.one.split("::")
-        print(
-            MARK
-            + json.dumps(
-                verify_one(
-                    key,
-                    variant,
-                    binding,
-                    args.scheduler,
-                    args.seed,
-                    args.cycles,
-                    args.objective,
-                )
-            )
-        )
+        print(MARK + json.dumps(verify_one(args.one.split("::"), knobs)))
         return
 
     sys.path.insert(0, str(REPO))
@@ -428,18 +406,7 @@ def main():
 
     results, done = [], 0
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futs = [
-            pool.submit(
-                _run_child,
-                w,
-                args.scheduler,
-                args.seed,
-                args.cycles,
-                args.timeout,
-                args.objective,
-            )
-            for w in work
-        ]
+        futs = [pool.submit(_run_child, w, knobs, args.timeout) for w in work]
         for f in futs:
             r = f.result()
             results.append(r)

@@ -135,9 +135,7 @@ def test_area_slack_pays_span_for_unit_folds():
             if (u.impl or "").startswith("add_f32")
         )
 
-    strict = _to_rtl(pairsum).set_scheduler_opt(
-        scheduler="exact", O="area", budget=2.0
-    )
+    strict = _to_rtl(pairsum).set_scheduler_opt(scheduler="exact", O="area", budget=2.0)
     n_strict = strict.schedule().func("pairsum").latency
     slack = _to_rtl(pairsum).set_scheduler_opt(
         scheduler="exact", O="area", area_slack=1.0, budget=2.0
@@ -207,9 +205,7 @@ def test_tighten_clock_moves_the_operating_clock_to_the_realized_path():
 def test_clock_margin_splits_model_from_operating_period():
     # A margin cuts every chain to (1 - u) * cycle_ns while the design stays
     # clocked at cycle_ns; the QoR reports both periods.
-    rtl = _to_rtl(_mixed_kernel(), freq_mhz=200.0).set_scheduler_opt(
-        clock_margin=0.25
-    )
+    rtl = _to_rtl(_mixed_kernel(), freq_mhz=200.0).set_scheduler_opt(clock_margin=0.25)
     assert rtl.schedule().cycle_ns == pytest.approx(3.75)
     est = rtl.estimation
     assert est.fmax_target == pytest.approx(1000.0 / 3.75)

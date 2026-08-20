@@ -138,18 +138,31 @@ struct ShareCone {
     return false;
   }
 
-  /// Load a whole assignment (unit -> representative, \p arms summed per
-  /// representative) and report whether every cone fits: the exact solve's
-  /// plan re-checked under this recursion before it is built.
-  bool holds(llvm::ArrayRef<unsigned> assign, llvm::ArrayRef<unsigned> arms) {
+  /// The arms unit \p i contributes to whatever bin it lands in: one source,
+  /// plus one for a recurrence identity re-injected on its own arm.
+  unsigned armsOf(unsigned i) const { return base[i]; }
+
+  /// Load a whole assignment (unit -> representative) and report whether every
+  /// cone fits: the exact solve's plan re-checked under this recursion before
+  /// it is built.
+  bool holds(llvm::ArrayRef<unsigned> assign) {
     for (auto [i, r] : llvm::enumerate(assign)) {
       if (r == i)
         continue;
       rep[i] = r;
       pack[r].push_back(static_cast<unsigned>(i));
     }
-    for (unsigned i = 0, e = rep.size(); i < e; ++i)
-      fanin[i] = pack[rep[i]].size() > 1 ? arms[rep[i]] : base[i];
+    for (unsigned i = 0, e = rep.size(); i < e; ++i) {
+      const auto &members = pack[rep[i]];
+      if (members.size() == 1) {
+        fanin[i] = base[i];
+        continue;
+      }
+      unsigned arms = 0;
+      for (unsigned m : members)
+        arms += base[m];
+      fanin[i] = arms;
+    }
     return fits();
   }
 
@@ -213,7 +226,7 @@ llvm::SmallVector<unsigned> greedyShare(const Datapath &dp,
   for (unsigned i = 0, e = rb.units.size(); i < e; ++i) {
     const FuncUnit &u = dp.units[rb.units[i]];
     auto ru = resOf(u);
-    unsigned own = readsRecurrence(rb, u.repOp()) ? 2 : 1;
+    unsigned own = cone.armsOf(i);
     Bin *dest = nullptr;
     for (Bin &bin : bins) {
       if (dp.units[rb.units[bin.members.front()]].identity != u.identity)
@@ -350,10 +363,7 @@ ExactShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
       // but the built mux is one structure whose every arm is a timed path.
       // Fall back to the greedy plan, admitted fold by fold, when a
       // cross-member arm would bust it.
-      llvm::SmallVector<unsigned> arms(rb.units.size(), 0);
-      for (auto [i, r] : llvm::enumerate(*solved))
-        arms[r] += readsRecurrence(rb, dp.units[rb.units[i]].repOp()) ? 2 : 1;
-      if (ShareCone(dp, rb, ctx).holds(*solved, arms))
+      if (ShareCone(dp, rb, ctx).holds(*solved))
         assign = std::move(*solved);
     }
     appendGroups(rb, assign, groups);

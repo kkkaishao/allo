@@ -27,9 +27,9 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
                                                   Value start,
                                                   const StallShell &sh) const {
   if (rb.kind == uarch::RegionBlock::Kind::Acyclic)
-    return emitAcyclic(rb.id, start, /*topLevel=*/!rb.parent, sh);
+    return emitAcyclic(rb.id, start, sh);
   assert(rb.ii && "a pipelined region reached control emission with no II");
-  auto rc = emitPipelined(rb.id, rb.counterName, *rb.ii, term, start, sh);
+  auto rc = emitPipelined(rb, term, start, sh);
   // The same start-cycle bypass and update as the counter (`emitPipelined`),
   // with `lb` and `step` scaled.
   bool chained = bypassesStart(term, sh);
@@ -114,10 +114,8 @@ llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
 // iteration-0 recurrence-init injection. A conditional terminator
 // is non-speculative (II >= t_cond, so no doomed iteration issues and nothing
 // squashes) and stall-free (fixed-latency memory, no FIFO).
-RegionControl ControlEmitter::emitPipelined(unsigned region,
-                                            llvm::StringRef counterName,
-                                            int64_t ii, const Terminator &term,
-                                            Value start,
+RegionControl ControlEmitter::emitPipelined(const uarch::RegionBlock &rb,
+                                            const Terminator &term, Value start,
                                             const StallShell &sh) const {
   // G's half of H: a rigid region issues unconditionally. The phase counter
   // below takes F's half instead, being a time base rather than a gate.
@@ -126,22 +124,21 @@ RegionControl ControlEmitter::emitPipelined(unsigned region,
                 "the start-cycle bypass below is what a zero arm cost means in "
                 "hardware; a different declared arm would have to be built "
                 "here, not just written down");
-  bool chained = bypassesStart(term, sh);
-  Value first = chained ? term.gateStart(c, start) : Value();
+  Value first = bypassesStart(term, sh) ? term.gateStart(c, start) : Value();
   auto runNext = c.bb.get(c.i1);
   Value running = c.reg(runNext, c.f1);
-  nameValue(running, regionSignal(region, "run"));
+  nameValue(running, regionSignal(rb.id, "run"));
   // The ungated per-cycle issue desire: a [0,II) phase counter gates it to once
   // per II; II==1 (and a while) wants to issue every running cycle.
   Value wantIssue = running;
   Value phase;
-  if (ii > 1) {
+  if (*rb.ii > 1) {
     // The phase runs [0, ii), so it is built at clog2(ii) bits.
-    IntegerType phaseTy = c.b.getIntegerType(llvm::Log2_64_Ceil(ii));
+    IntegerType phaseTy = c.b.getIntegerType(llvm::Log2_64_Ceil(*rb.ii));
     auto phaseNext = c.bb.get(phaseTy);
     Value pz = c.konst(phaseTy, 0);
     Value phaseReg = c.reg(phaseNext, pz, RegRole::Counter);
-    nameValue(phaseReg, regionSignal(region, "phase"));
+    nameValue(phaseReg, regionSignal(rb.id, "phase"));
     // The effective phase, 0 in the bypassed start cycle whatever the register
     // held between runs; every consumer (the issue gate, the folded chains)
     // reads this one.
@@ -150,24 +147,22 @@ RegionControl ControlEmitter::emitPipelined(unsigned region,
         comb::AndOp::create(c.b, c.loc, running, c.icmpEq(phase, 0), false));
     Value phasep1 =
         c.R(comb::AddOp::create(c.b, c.loc, phase, c.konst(phaseTy, 1), false));
-    Value phaseAdv = c.mux(c.icmpEq(phase, ii - 1), pz, phasep1);
+    Value phaseAdv = c.mux(c.icmpEq(phase, *rb.ii - 1), pz, phasep1);
     // The phase is the region's time base rather than an issue gate: it
     // free-runs with the chains folded onto it, so a frozen cycle holds them
     // together and the cadence resumes where it paused. A pass deferred by a
     // starved input stays a whole `ii` late, keeping the modulo reservation
     // intact. Advancing from the effective phase re-times the cadence at the
     // bypassed start; the registered families reload on `start`.
-    phaseNext.setValue(
-        chained ? c.mux(sh ? sh.chainEnable : c.t1, phaseAdv, phase)
-                : c.mux(term.gateStart(c, start), pz,
-                        c.mux(sh ? sh.chainEnable : c.t1, phaseAdv, phase)));
+    Value adv = c.mux(sh ? sh.chainEnable : c.t1, phaseAdv, phase);
+    phaseNext.setValue(first ? adv : c.mux(term.gateStart(c, start), pz, adv));
   }
-  if (chained)
+  if (first)
     wantIssue = c.orBits(wantIssue, first);
   // Gated issue: a stalled cycle (enable low) issues nothing, so the counter,
   // `running`, and (with the enabled shift chains) the whole datapath hold.
   Value issue = c.andBits(wantIssue, enable);
-  nameValue(issue, regionSignal(region, "issue"));
+  nameValue(issue, regionSignal(rb.id, "issue"));
   // The counter IS the source IV, holding `lb` at start and advancing by `step`
   // on each gated issue, so a `lb != 0` / `step != 1` loop needs no body
   // rewriting. The bypassed family reads `lb` combinationally in the start
@@ -177,13 +172,12 @@ RegionControl ControlEmitter::emitPipelined(unsigned region,
   Value ivReg = c.reg(iterNext, term.lb, RegRole::Counter);
   // Label the counter register after the source loop variable; the bypass mux
   // below stays anonymous.
-  nameValue(ivReg, counterName.empty() ? regionSignal(region, "iv")
-                                       : std::string(counterName));
-  Value iv = chained ? c.mux(first, term.lb, ivReg) : ivReg;
+  nameValue(ivReg, rb.counterName.empty() ? regionSignal(rb.id, "iv")
+                                          : rb.counterName);
+  Value iv = first ? c.mux(first, term.lb, ivReg) : ivReg;
   Value ivStep = c.R(comb::AddOp::create(c.b, c.loc, iv, term.step, false));
-  iterNext.setValue(chained
-                        ? c.mux(issue, ivStep, c.mux(running, ivReg, term.lb))
-                        : c.mux(running, c.mux(issue, ivStep, iv), term.lb));
+  iterNext.setValue(first ? c.mux(issue, ivStep, c.mux(running, ivReg, term.lb))
+                          : c.mux(running, c.mux(issue, ivStep, iv), term.lb));
   // Terminate on the last issued iteration (the next induction value reaches
   // the bound, or the condition is false), clearing running the next cycle. A
   // bypassed single-iteration run terminates in its own start cycle, so
@@ -192,7 +186,7 @@ RegionControl ControlEmitter::emitPipelined(unsigned region,
       comb::AndOp::create(c.b, c.loc, issue, term.isLast(c, ivStep), false));
   Value runAfterLast = c.mux(terminate, c.f1, running);
   runNext.setValue(c.mux(term.gateStart(c, start),
-                         chained ? c.notBit(terminate) : c.t1, runAfterLast));
+                         first ? c.notBit(terminate) : c.t1, runAfterLast));
   return {/*issue=*/issue,         /*counter=*/iv,
           /*wantIssue=*/wantIssue, /*running=*/running,
           /*phase=*/phase,         /*scaledCounters=*/{}};
@@ -317,11 +311,8 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
 // arming pulse rather than replacing it, so an available token still issues at
 // the arming cycle. A rigid region has nothing to defer and stays a bare pulse.
 RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
-                                          bool topLevel,
                                           const StallShell &sh) const {
-  const BoundaryCost &boundary =
-      topLevel ? kAcyclicTopBoundary : kAcyclicNestedBoundary;
-  Value armed = c.delayValid(start, boundary.arm, StallShell{});
+  Value armed = c.delayValid(start, kAcyclicBoundary.arm, StallShell{});
   if (!sh) {
     // At zero arm cost `armed` is the caller's start wire, which may already
     // be named for its first role (a container's `fire`); keep that name.

@@ -49,17 +49,33 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
-import subprocess
 import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
+
+from benchmark._child import run_child
 
 REPO = Path(__file__).resolve().parents[1]
 MARK = "@@QOR@@"
+
+
+@dataclass(frozen=True)
+class Knobs:
+    """What one run is measured under, off the command line. The scheduler is
+    not here: it is the axis, so it travels with the case."""
+
+    stage: str
+    binding: str
+    objective: str
+    freq: float | None
+    budget: float | None
+    workers: int | None
+    area_slack: float
+
 
 # --- what the emitter built --------------------------------------------------
 
@@ -198,25 +214,7 @@ _RAISED = re.compile(r"Raised (\d+) loop\(s\) and (\d+) further memref access")
 _PROBE = re.compile(r"^ALLOPROBE(?:II)? .*$", re.M)
 
 
-def _load(key):
-    sys.path.insert(0, str(REPO))
-    from benchmark.spec import find
-
-    return find(key)
-
-
-def measure_one(
-    key: str,
-    variant: str,
-    scheduler: str,
-    stage: str,
-    freq: float | None = None,
-    budget: float | None = None,
-    binding: str = "trivial",
-    workers: int | None = None,
-    objective: str = "cycles",
-    area_slack: float = 0.0,
-) -> dict:
+def measure_one(item, knobs: Knobs) -> dict:
     """Schedule (and by default compile) one variant, returning its metrics.
 
     ``freq`` overrides the device's default clock (MHz), i.e. the period the
@@ -227,17 +225,20 @@ def measure_one(
     row carries the resolved name. ``objective`` is the exact solver's
     optimization direction (the ``O`` knob); the heuristic ignores it.
     ``area_slack`` widens the area solve's span limit by that fraction."""
-    bench = _load(key)
+    from benchmark.spec import find
+
+    key, variant, scheduler = item
+    bench = find(key)
     out: dict = {
         "key": key,
         "variant": variant,
         "scheduler": scheduler,
-        "freq_mhz": freq,
-        "budget": budget,
-        "workers": workers,
-        "binding": binding,
-        "objective": objective,
-        "area_slack": area_slack,
+        "freq_mhz": knobs.freq,
+        "budget": knobs.budget,
+        "workers": knobs.workers,
+        "binding": knobs.binding,
+        "objective": knobs.objective,
+        "area_slack": knobs.area_slack,
         "stage": "build",
         "status": "error",
     }
@@ -251,19 +252,21 @@ def measure_one(
         sched = bench.schedules[variant](parts)
 
         out["stage"] = "schedule"
-        assert binding in ("trivial", "auto"), binding
+        assert knobs.binding in ("trivial", "auto"), knobs.binding
         opts = {}
-        if freq is not None:
-            opts["freq_mhz"] = freq
-        knobs = {"scheduler": scheduler, "O": objective}
-        if budget is not None:
-            knobs["budget"] = budget
-        if workers is not None:
-            knobs["workers"] = workers
-        if area_slack:
-            knobs["area_slack"] = area_slack
-        rtl = sched.export("rtl", **opts).set_scheduler_opt(**knobs)
-        if binding == "trivial":
+        if knobs.freq is not None:
+            opts["freq_mhz"] = knobs.freq
+        solver = {
+            "scheduler": scheduler,
+            "O": knobs.objective,
+            "area_slack": knobs.area_slack,
+        }
+        if knobs.budget is not None:
+            solver["budget"] = knobs.budget
+        if knobs.workers is not None:
+            solver["workers"] = knobs.workers
+        rtl = sched.export("rtl", **opts).set_scheduler_opt(**solver)
+        if knobs.binding == "trivial":
             rtl.use_trivial_binding()
         t1 = time.time()
         res = rtl.schedule()
@@ -311,7 +314,7 @@ def measure_one(
         )
         out["ops_max"] = max((s.ops for s in res.compiler.solves), default=0)
 
-        if stage != "schedule":
+        if knobs.stage != "schedule":
             out["stage"] = "compile"
             t1 = time.time()
             rtl.compile()
@@ -360,85 +363,40 @@ def measure_one(
     return out
 
 
-def _run_child(
-    item,
-    stage: str,
-    timeout: int,
-    freq: float | None,
-    budget: float | None,
-    binding: str,
-    workers: int | None,
-    objective: str,
-    area_slack: float,
-) -> dict:
+def _run_child(item, knobs: Knobs, timeout: int) -> dict:
     key, variant, scheduler = item
-    env = dict(os.environ)
-    env["XILINX_VITIS"] = "/nonexistent"
-    env["PYTHONPATH"] = str(REPO)
-    env.setdefault("ALLO_LOG_LEVEL", "warn")
-    cmd = [
-        sys.executable,
-        "-m",
-        "benchmark.report",
+    argv = [
         "--one",
         f"{key}::{variant}::{scheduler}",
         "--stage",
-        stage,
+        knobs.stage,
         "--binding",
-        binding,
+        knobs.binding,
         "--objective",
-        objective,
+        knobs.objective,
     ]
-    if freq is not None:
-        cmd += ["--freq", str(freq)]
-    if budget is not None:
-        cmd += ["--budget", str(budget)]
-    if workers is not None:
-        cmd += ["--workers", str(workers)]
-    if area_slack:
-        cmd += ["--area-slack", str(area_slack)]
+    if knobs.freq is not None:
+        argv += ["--freq", str(knobs.freq)]
+    if knobs.budget is not None:
+        argv += ["--budget", str(knobs.budget)]
+    if knobs.workers is not None:
+        argv += ["--workers", str(knobs.workers)]
+    if knobs.area_slack:
+        argv += ["--area-slack", str(knobs.area_slack)]
     t0 = time.time()
-    try:
-        p = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=env, cwd=str(REPO)
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "key": key,
-            "variant": variant,
-            "scheduler": scheduler,
-            "status": "timeout",
-            "stage": "?",
-            "seconds": round(time.time() - t0, 1),
-        }
-    text = p.stdout + p.stderr
-    for line in p.stdout.splitlines():
-        if line.startswith(MARK):
-            d = json.loads(line[len(MARK) :])
-            # The II-vs-bound warnings, which no field of the schedule result
-            # carries: the bound is settled inside the simplex and reported only
-            # as a diagnostic.
-            d["ii_gaps"] = [
-                {"ii": int(a), "bound": int(b)} for a, b in _II_GAP.findall(text)
-            ]
-            d["budget_exhausted"] = len(_BUDGET.findall(text))
-            d["probes"] = _PROBE.findall(text)
-            d["raised"] = [
-                sum(int(m[i]) for m in _RAISED.findall(text)) for i in (0, 1)
-            ]
-            d["warnings"] = [l.strip()[:300] for l in text.splitlines() if "WARN" in l][
-                :20
-            ]
-            return d
-    return {
-        "key": key,
-        "variant": variant,
-        "scheduler": scheduler,
-        "status": "crash",
-        "stage": "?",
-        "seconds": round(time.time() - t0, 1),
-        "error": text[-3000:],
-    }
+    base = {"key": key, "variant": variant, "scheduler": scheduler}
+    d, text = run_child("benchmark.report", MARK, argv, timeout, base)
+    if d["status"] in ("timeout", "crash"):
+        d.update(stage="?", seconds=round(time.time() - t0, 1))
+        return d
+    # The II-vs-bound warnings, which no field of the schedule result carries:
+    # the bound is settled inside the simplex and reported only as a diagnostic.
+    d["ii_gaps"] = [{"ii": int(a), "bound": int(b)} for a, b in _II_GAP.findall(text)]
+    d["budget_exhausted"] = len(_BUDGET.findall(text))
+    d["probes"] = _PROBE.findall(text)
+    d["raised"] = [sum(int(m[i]) for m in _RAISED.findall(text)) for i in (0, 1)]
+    d["warnings"] = [l.strip()[:300] for l in text.splitlines() if "WARN" in l][:20]
+    return d
 
 
 # --- tables ------------------------------------------------------------------
@@ -785,26 +743,18 @@ def main():
     )
     ap.add_argument("--compare", metavar="BASE.json", help="diff against a saved run")
     args = ap.parse_args()
+    knobs = Knobs(
+        stage=args.stage,
+        binding=args.binding,
+        objective=args.objective,
+        freq=args.freq,
+        budget=args.budget,
+        workers=args.workers,
+        area_slack=args.area_slack,
+    )
 
     if args.one:
-        key, variant, scheduler = args.one.split("::")
-        print(
-            MARK
-            + json.dumps(
-                measure_one(
-                    key,
-                    variant,
-                    scheduler,
-                    args.stage,
-                    args.freq,
-                    args.budget,
-                    args.binding,
-                    args.workers,
-                    args.objective,
-                    args.area_slack,
-                )
-            )
-        )
+        print(MARK + json.dumps(measure_one(args.one.split("::"), knobs)))
         return
 
     if args.compare:
@@ -840,21 +790,7 @@ def main():
 
     results, done = [], 0
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futs = [
-            pool.submit(
-                _run_child,
-                w,
-                args.stage,
-                args.timeout,
-                args.freq,
-                args.budget,
-                args.binding,
-                args.workers,
-                args.objective,
-                args.area_slack,
-            )
-            for w in work
-        ]
+        futs = [pool.submit(_run_child, w, knobs, args.timeout) for w in work]
         for f in futs:
             r = f.result()
             results.append(r)
@@ -880,9 +816,7 @@ def main():
     if args.area:
         print("\n" + area_table(ok))
 
-    tally = {}
-    for r in results:
-        tally[r["status"]] = tally.get(r["status"], 0) + 1
+    tally = Counter(r["status"] for r in results)
     print("\n" + "  ".join(f"{k}={v}" for k, v in sorted(tally.items())))
 
 

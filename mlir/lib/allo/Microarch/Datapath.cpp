@@ -486,17 +486,11 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
              regions[a.region].determinacy == DeterminacyEnum::Concurrent ||
              (!apart(x, y) && !apart(y, x));
     }
-    if (va.call < 0 && vb.call < 0) {
-      if (a.region == b.region)
-        return a.residue == b.residue;
-      return underConcurrent(a.region) || underConcurrent(b.region);
-    }
-    // A mixed pair, one access of this function against a port a child
-    // masters: a call's window lies inside its region's span, so different
-    // regions under a serial top hand off as two direct accesses do. Within
-    // one region the call runs beside the access and the pair is concurrent.
+    // Two direct accesses agree in one region only at the same residue; a mixed
+    // pair runs beside the access there. Across regions a call's window lies
+    // inside its region's span, so both kinds hand off under a serial top.
     if (a.region == b.region)
-      return true;
+      return va.call >= 0 || vb.call >= 0 || a.residue == b.residue;
     return underConcurrent(a.region) || underConcurrent(b.region);
   };
   rel.adj.assign(ws.size(), llvm::BitVector(ws.size()));

@@ -291,7 +291,10 @@ public:
                 const SchedulerOptions &opts, SlackLedger *ledger = nullptr,
                 const DenseMap<Operation *, int64_t> *grants = nullptr)
       : deps(deps), dev(dev), model(model), cycleTime(cycleTime), opts(opts),
-        ledger(ledger), grants(grants) {}
+        ledger(ledger), grants(grants) {
+    assert(!(ledger && grants) &&
+           "one pass collects slack, the other consumes it");
+  }
 
   /// Consume this function's assumption hints, solve its regions, and publish
   /// what the whole kernel costs.
@@ -490,61 +493,97 @@ forwardableEdges(ChainingModuloProblem &problem, const DeviceModel &dev,
   return out;
 }
 
-// The smallest II no dependence circuit of \p problem excludes, with the edges
-// in \p relaxed weighed at zero latency: binary search over Bellman-Ford
-// positive-circuit detection on the same weights `bindingRecurrence` uses.
-// Chain breaks are not built yet, so this is a floor, which is all the gate
-// below compares.
-static unsigned recurrenceMinII(
-    ChainingModuloProblem &problem,
-    const llvm::DenseSet<circt::scheduling::Problem::Dependence> &relaxed) {
+// The recurrence graph of a modulo problem: one node per operation, one edge
+// per dependence, weighted by its source's latency and its iteration distance.
+// Both II questions below are positive-circuit searches over it, and both
+// weigh a forwarded edge at zero, so they share the weights by construction.
+namespace {
+struct RecurrenceGraph {
+  using Dependence = circt::scheduling::Problem::Dependence;
   struct Edge {
     unsigned src, dst;
     int64_t lat, dist;
+    Dependence dep;
   };
+
   DenseMap<Operation *, unsigned> index;
-  for (Operation *op : problem.getOperations())
-    index.try_emplace(op, index.size());
   SmallVector<Edge> edges;
+  /// Edges weighed at zero latency; `latSum` is taken over the set this was
+  /// built with, and the walk below reads it as it stands.
+  llvm::DenseSet<Dependence> zeroed;
+  /// An II no circuit can exceed: the entry cut of every search below.
   int64_t latSum = 1;
-  for (Operation *op : problem.getOperations())
-    for (auto &dep : problem.getDependences(op)) {
-      int64_t lat =
-          relaxed.contains(dep) ? 0 : problem.latencyOf(dep.getSource());
-      edges.push_back(
-          {index[dep.getSource()], index[op], lat,
-           static_cast<int64_t>(problem.getDistance(dep).value_or(0))});
-      latSum += lat;
-    }
-  auto feasible = [&](int64_t ii) {
-    SmallVector<int64_t> dist(index.size(), 0);
-    for (unsigned round = 0; round < index.size(); ++round) {
+  // The last relaxation's state, which the circuit walk reads.
+  SmallVector<int64_t> dist;
+  SmallVector<int> pred;
+  int lastMoved = -1;
+
+  RecurrenceGraph(ChainingModuloProblem &problem,
+                  const llvm::DenseSet<Dependence> &relaxed)
+      : zeroed(relaxed) {
+    for (Operation *op : problem.getOperations())
+      index.try_emplace(op, index.size());
+    for (Operation *op : problem.getOperations())
+      for (auto &dep : problem.getDependences(op)) {
+        int64_t lat = problem.latencyOf(dep.getSource());
+        edges.push_back(
+            {index[dep.getSource()], index[op], lat,
+             static_cast<int64_t>(problem.getDistance(dep).value_or(0)), dep});
+        latSum += zeroed.contains(dep) ? 0 : lat;
+      }
+  }
+
+  /// Whether the longest-path relaxation quiesces at \p ii, i.e. no positive
+  /// circuit survives it.
+  bool feasible(int64_t ii) {
+    dist.assign(index.size(), 0);
+    pred.assign(index.size(), -1);
+    lastMoved = -1;
+    for (unsigned round = 0; round <= index.size(); ++round) {
       bool moved = false;
-      for (Edge &e : edges) {
-        int64_t w = dist[e.src] + e.lat - ii * e.dist;
+      for (auto [i, e] : llvm::enumerate(edges)) {
+        int64_t w =
+            dist[e.src] + (zeroed.contains(e.dep) ? 0 : e.lat) - ii * e.dist;
         if (w > dist[e.dst]) {
           dist[e.dst] = w;
+          pred[e.dst] = static_cast<int>(i);
+          lastMoved = static_cast<int>(e.dst);
           moved = true;
         }
       }
       if (!moved)
         return true;
     }
-    return false; // a positive circuit survives at this ii
-  };
+    return false;
+  }
+
+  /// The smallest feasible II in [1, \p hi], binary searched.
+  int64_t smallestFeasibleII(int64_t hi) {
+    int64_t lo = 1;
+    while (lo < hi) {
+      int64_t mid = (lo + hi) / 2;
+      if (feasible(mid))
+        hi = mid;
+      else
+        lo = mid + 1;
+    }
+    return lo;
+  }
+};
+} // namespace
+
+// The smallest II no dependence circuit of \p problem excludes, with the edges
+// in \p relaxed weighed at zero latency. Chain breaks are not built yet, so
+// this is a floor, which is all the gate below compares.
+static unsigned recurrenceMinII(
+    ChainingModuloProblem &problem,
+    const llvm::DenseSet<circt::scheduling::Problem::Dependence> &relaxed) {
+  RecurrenceGraph graph(problem, relaxed);
   // A zero-distance positive circuit is infeasible at every II; the solve will
   // fail and report it, so any answer here is moot.
-  if (!feasible(latSum))
-    return static_cast<unsigned>(latSum);
-  int64_t lo = 1, hi = latSum;
-  while (lo < hi) {
-    int64_t mid = (lo + hi) / 2;
-    if (feasible(mid))
-      hi = mid;
-    else
-      lo = mid + 1;
-  }
-  return static_cast<unsigned>(lo);
+  if (!graph.feasible(graph.latSum))
+    return static_cast<unsigned>(graph.latSum);
+  return static_cast<unsigned>(graph.smallestFeasibleII(graph.latSum));
 }
 
 // The resource-min II of \p problem: `ModuloSimplexScheduler::computeResMinII`'s
@@ -591,105 +630,55 @@ constexpr size_t kMaxTargetedPairs = 64;
 // The candidate pairs worth the budget: walk the circuit that binds the II,
 // relax the candidate edges it carries, and repeat until the recurrence no
 // longer binds, a binding circuit carries none (the bound cannot drop past
-// that circuit whatever is forwarded), or the budget is spent. The weights
-// mirror `recurrenceMinII`, with the selection so far at zero latency.
+// that circuit whatever is forwarded), or the budget is spent.
 static SmallVector<circt::scheduling::Problem::Dependence>
 selectCriticalPairs(ChainingModuloProblem &problem,
                     ArrayRef<circt::scheduling::Problem::Dependence> cands,
                     unsigned floorII, size_t budget) {
   using Dependence = circt::scheduling::Problem::Dependence;
-  struct Edge {
-    unsigned src, dst;
-    int64_t lat, dist;
-    Dependence dep;
-  };
-  DenseMap<Operation *, unsigned> index;
-  for (Operation *op : problem.getOperations())
-    index.try_emplace(op, index.size());
-  SmallVector<Edge> edges;
-  int64_t latSum = 1;
-  for (Operation *op : problem.getOperations())
-    for (auto &dep : problem.getDependences(op)) {
-      int64_t lat = problem.latencyOf(dep.getSource());
-      edges.push_back(
-          {index[dep.getSource()], index[op], lat,
-           static_cast<int64_t>(problem.getDistance(dep).value_or(0)), dep});
-      latSum += lat;
-    }
+  RecurrenceGraph graph(problem, {});
   llvm::DenseSet<Dependence> candSet(cands.begin(), cands.end());
-  llvm::DenseSet<Dependence> selected;
-  SmallVector<int64_t> dist;
-  SmallVector<int> pred;
-  int lastMoved = -1;
-  auto feasible = [&](int64_t ii) {
-    dist.assign(index.size(), 0);
-    pred.assign(index.size(), -1);
-    lastMoved = -1;
-    for (unsigned round = 0; round <= index.size(); ++round) {
-      bool moved = false;
-      for (auto [i, e] : llvm::enumerate(edges)) {
-        int64_t w =
-            dist[e.src] + (selected.contains(e.dep) ? 0 : e.lat) - ii * e.dist;
-        if (w > dist[e.dst]) {
-          dist[e.dst] = w;
-          pred[e.dst] = static_cast<int>(i);
-          lastMoved = static_cast<int>(e.dst);
-          moved = true;
-        }
-      }
-      if (!moved)
-        return true;
-    }
-    return false; // a positive circuit survives at this ii
-  };
-  if (!feasible(latSum))
+  if (!graph.feasible(graph.latSum))
     return {}; // a zero-distance positive circuit; the solve will report it
-  int64_t hi = latSum;
-  while (selected.size() < budget) {
-    int64_t lo = 1, top = hi;
-    while (lo < top) {
-      int64_t mid = (lo + top) / 2;
-      if (feasible(mid))
-        top = mid;
-      else
-        lo = mid + 1;
-    }
+  int64_t hi = graph.latSum;
+  while (graph.zeroed.size() < budget) {
+    int64_t lo = graph.smallestFeasibleII(hi);
     if (lo <= floorII)
       break; // the recurrence no longer binds
     // One positive circuit at lo - 1: every node reached backward from the
     // last update has been updated itself, so the predecessor walk cannot
     // fall off and must revisit a node, closing the circuit.
-    bool quiesced = feasible(lo - 1);
-    assert(!quiesced && lastMoved >= 0 &&
+    bool quiesced = graph.feasible(lo - 1);
+    assert(!quiesced && graph.lastMoved >= 0 &&
            "the bound's own circuit is positive one step below it");
     (void)quiesced;
-    SmallVector<unsigned> stamp(index.size(), 0);
-    int x = lastMoved;
+    SmallVector<unsigned> stamp(graph.index.size(), 0);
+    int x = graph.lastMoved;
     while (!stamp[x]) {
       stamp[x] = 1;
-      x = static_cast<int>(edges[pred[x]].src);
+      x = static_cast<int>(graph.edges[graph.pred[x]].src);
     }
     SmallVector<Dependence> take;
     int y = x;
     do {
-      const Edge &e = edges[pred[y]];
-      if (candSet.contains(e.dep) && !selected.contains(e.dep))
+      const RecurrenceGraph::Edge &e = graph.edges[graph.pred[y]];
+      if (candSet.contains(e.dep) && !graph.zeroed.contains(e.dep))
         take.push_back(e.dep);
       y = static_cast<int>(e.src);
     } while (y != x);
     if (take.empty())
       break; // the bound runs through edges forwarding cannot serve
     for (Dependence dep : take) {
-      if (selected.size() >= budget)
+      if (graph.zeroed.size() >= budget)
         break;
-      selected.insert(dep);
+      graph.zeroed.insert(dep);
     }
     hi = lo;
   }
   // In the candidates' own (deterministic) order.
   SmallVector<Dependence> out;
   for (Dependence dep : cands)
-    if (selected.contains(dep))
+    if (graph.zeroed.contains(dep))
       out.push_back(dep);
   return out;
 }
@@ -709,10 +698,12 @@ relaxForwardableEdges(ChainingModuloProblem &problem, const DeviceModel &dev,
       forwardableEdges(problem, dev, cycleTime, regFloor);
   if (cands.empty())
     return {};
+  unsigned floorII = std::max(resourceMinII(problem), minII);
+  unsigned recOrig = recurrenceMinII(problem, {});
+  if (recOrig <= floorII)
+    return {}; // the recurrence is not what binds the II
   if (cands.size() > kMaxForwardPairs) {
-    cands = selectCriticalPairs(problem, cands,
-                                std::max(resourceMinII(problem), minII),
-                                kMaxTargetedPairs);
+    cands = selectCriticalPairs(problem, cands, floorII, kMaxTargetedPairs);
     if (cands.empty())
       return {};
   }
@@ -736,9 +727,6 @@ relaxForwardableEdges(ChainingModuloProblem &problem, const DeviceModel &dev,
   if (cands.empty())
     return {};
   llvm::DenseSet<Dependence> relaxed(cands.begin(), cands.end());
-  unsigned recOrig = recurrenceMinII(problem, {});
-  if (recOrig <= std::max(resourceMinII(problem), minII))
-    return {}; // the recurrence is not what binds the II
   unsigned recRelaxed = recurrenceMinII(problem, relaxed);
   if (recRelaxed >= recOrig)
     return {}; // the bound runs through edges forwarding cannot serve
@@ -1130,7 +1118,6 @@ FuncScheduler::buildSpanNode(const SchedRegion &region) {
   SpanNode n;
   // Driven by an enclosing region rather than by the func's own sequencer, the
   // same question the reify side asks of a dcp op's parents.
-  n.nested = !isa<func::FuncOp>(region.anchor()->getParentOp());
   n.elastic =
       llvm::any_of(region.ops, [](Operation *o) { return isElastic(o); });
   if (region.kind == allo::RegionKind::StraightLine) {
@@ -1403,10 +1390,9 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
         d << ", target II=" << dir;
       d << ", using modulo-scheduling in the innermost body";
     }
-    return scheduleCyclic(innermost, region,
-                          dir >= 1 ? static_cast<unsigned>(dir) : 1,
-                          /*maxII=*/dir >= 1 ? static_cast<unsigned>(dir) : 0,
-                          /*pipelined=*/dir != -1);
+    unsigned target = dir >= 1 ? static_cast<unsigned>(dir) : 0;
+    return scheduleCyclic(innermost, region, std::max(target, 1u),
+                          /*maxII=*/target, /*pipelined=*/dir != -1);
   }
   // An uncounted while; counted ones are already scf.for.
   if (auto whileOp = dyn_cast<scf::WhileOp>(region.anchor())) {
@@ -1543,8 +1529,7 @@ static float minSchedulablePeriod(ArrayRef<func::FuncOp> funcs,
       NodeTiming t = asMemAccess(op)
                          ? accessCharacterization(op, dev.operators, dev.memory)
                          : dev.operators.lookup(op).timing;
-      float need = std::max(
-          {regFloor + (float)t.inDelay, (float)t.outDelay, (float)t.minPeriod});
+      float need = periodNeed(regFloor, t.inDelay, t.outDelay, t.minPeriod);
       if (need <= target)
         return;
       least = std::max(least, need);
@@ -1567,6 +1552,75 @@ static float minSchedulablePeriod(ArrayRef<func::FuncOp> funcs,
           << " ns clock period. " << advice;
     });
   return least;
+}
+
+// The area objective's slack pass: a cheap heuristic pre-schedule of the whole
+// module, whose composition prices each region's float off the sibling DAG's
+// longest path. What it proves free widens the real pass's leashes; the
+// composed kernel span stays within the heuristic's by construction, since
+// every float is charged once.
+static DenseMap<Operation *, int64_t>
+collectCompositionSlack(ModuleOp module, func::FuncOp topFunc,
+                        ArrayRef<func::FuncOp> order,
+                        ArrayRef<std::unique_ptr<DependenceAnalysis>> depsFor,
+                        const DeviceModel &dev, float cycleTime,
+                        const SchedulerOptions &opts) {
+  DenseMap<Operation *, int64_t> grants;
+  SlackLedger ledger;
+  module.walk([&](Operation *op) {
+    if (isSyncSubKernelCall(op))
+      if (Operation *callee = calleeOf(op))
+        ++ledger.callSites[callee];
+  });
+  ScheduleModel probe;
+  probe.cycleTimeNs = cycleTime;
+  SchedulerOptions heur = opts;
+  heur.kind = SchedulerKind::Heuristic;
+  bool preScheduled = true;
+  for (auto [fn, deps] : llvm::zip(order, depsFor)) {
+    FuncScheduler sched(*deps, dev, probe, cycleTime, heur, &ledger);
+    if (failed(sched.run(fn))) {
+      preScheduled = false;
+      break;
+    }
+  }
+  if (preScheduled) {
+    // A single-site callee's banked float lands on its one grantable top
+    // region, divided by the wrappers between the callee's span and it.
+    for (auto [calleeOp, budget] : ledger.calleeBudget) {
+      auto fn = cast<func::FuncOp>(calleeOp);
+      const auto *at = llvm::find(order, fn);
+      assert(at != order.end() && "a called func is in the order");
+      DependenceAnalysis &calleeDeps = *depsFor[at - order.begin()];
+      std::optional<std::pair<Operation *, int64_t>> target;
+      unsigned grantable = 0;
+      for (const SchedRegion &r : enumerateRegions(fn))
+        if (auto t = grantTarget(r, calleeDeps)) {
+          ++grantable;
+          target = t;
+        }
+      if (grantable != 1)
+        continue;
+      if (int64_t g = budget / target->second)
+        grants[target->first] += g;
+    }
+    for (auto [key, g] : ledger.grants)
+      grants[key] += g;
+    if (!grants.empty()) {
+      int64_t granted = 0;
+      for (auto [key, g] : grants)
+        granted += g;
+      info(Stage::Sched, topFunc)
+          << "Composition slack: " << grants.size()
+          << " region leash(es) widened by " << granted
+          << " cycle(s) in total";
+    }
+  } else {
+    info(Stage::Sched, topFunc)
+        << "The slack pre-schedule did not place; area leashes stay "
+           "region-local";
+  }
+  return grants;
 }
 
 LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
@@ -1637,75 +1691,15 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   for (func::FuncOp fn : *orderOr)
     depsFor.push_back(std::make_unique<DependenceAnalysis>(fn));
 
-  // The area objective's slack pass: a cheap heuristic pre-schedule of the
-  // whole module, whose composition prices each region's float off the
-  // sibling DAG's longest path. What it proves free widens the real pass's
-  // leashes; the composed kernel span stays within the heuristic's by
-  // construction, since every float is charged once.
   DenseMap<Operation *, int64_t> grants;
   if (opts.objective == ScheduleObjective::Area &&
-      usesExactScheduler(opts.kind)) {
-    SlackLedger ledger;
-    module.walk([&](Operation *op) {
-      if (isSyncSubKernelCall(op))
-        if (Operation *callee = calleeOf(op))
-          ++ledger.callSites[callee];
-    });
-    ScheduleModel probe;
-    probe.cycleTimeNs = scheduled;
-    SchedulerOptions heur = optsWithFloor;
-    heur.kind = SchedulerKind::Heuristic;
-    bool preScheduled = true;
-    for (auto [fn, deps] : llvm::zip(*orderOr, depsFor)) {
-      FuncScheduler sched(*deps, loadedDev, probe, scheduled, heur, &ledger);
-      if (failed(sched.run(fn))) {
-        preScheduled = false;
-        break;
-      }
-    }
-    if (preScheduled) {
-      // A single-site callee's banked float lands on its one grantable top
-      // region, divided by the wrappers between the callee's span and it.
-      for (auto [calleeOp, budget] : ledger.calleeBudget) {
-        auto fn = cast<func::FuncOp>(calleeOp);
-        const auto *at = llvm::find(*orderOr, fn);
-        assert(at != orderOr->end() && "a called func is in the order");
-        DependenceAnalysis &calleeDeps = *depsFor[at - orderOr->begin()];
-        std::optional<std::pair<Operation *, int64_t>> target;
-        unsigned grantable = 0;
-        for (const SchedRegion &r : enumerateRegions(fn))
-          if (auto t = grantTarget(r, calleeDeps)) {
-            ++grantable;
-            target = t;
-          }
-        if (grantable != 1)
-          continue;
-        if (int64_t g = budget / target->second)
-          grants[target->first] += g;
-      }
-      for (auto [key, g] : ledger.grants)
-        grants[key] += g;
-      if (!grants.empty()) {
-        int64_t granted = 0;
-        for (auto [key, g] : grants)
-          granted += g;
-        info(Stage::Sched, topFunc)
-            << "Composition slack: " << grants.size()
-            << " region leash(es) widened by " << granted
-            << " cycle(s) in total";
-      }
-    } else {
-      info(Stage::Sched, topFunc)
-          << "The slack pre-schedule did not place; area leashes stay "
-             "region-local";
-      grants.clear();
-    }
-  }
+      usesExactScheduler(opts.kind))
+    grants = collectCompositionSlack(module, topFunc, *orderOr, depsFor,
+                                     loadedDev, scheduled, optsWithFloor);
 
   for (auto [fn, deps] : llvm::zip(*orderOr, depsFor)) {
     FuncScheduler sched(*deps, loadedDev, model, scheduled, optsWithFloor,
-                        /*ledger=*/nullptr,
-                        grants.empty() ? nullptr : &grants);
+                        /*ledger=*/nullptr, &grants);
     if (failed(sched.run(fn)))
       return failure();
   }

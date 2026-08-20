@@ -28,38 +28,47 @@ import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
+
+from benchmark._child import run_child
 
 REPO = Path(__file__).resolve().parents[1]
 MARK = "@@SYNTH@@"
 
 
+@dataclass(frozen=True)
+class Knobs:
+    """What one design is compiled under, off the command line."""
+
+    binding: str
+    objective: str
+    freq: float | None
+    area_slack: float
+
+
+def _tag(key: str, variant: str, scheduler: str) -> str:
+    """One design's name, and the stem of every file its run writes."""
+    return f"{key}/{variant}/{scheduler}".replace("/", "_")
+
+
 # --- the child: emit and scaffold one design --------------------------------
 
 
-def emit_one(
-    key: str,
-    variant: str,
-    scheduler: str,
-    binding: str,
-    objective: str,
-    freq: float | None,
-    work: Path,
-    area_slack: float = 0.0,
-) -> dict:
+def emit_one(item, knobs: Knobs, work: Path) -> dict:
     """Compile one (benchmark, variant, scheduler) and scaffold it under
     ``work``, returning the row the synthesis phase consumes."""
-    sys.path.insert(0, str(REPO))
     from benchmark.report import area_of
     from benchmark.spec import find
 
-    tag = f"{key}/{variant}/{scheduler}".replace("/", "_")
+    key, variant, scheduler = item
+    tag = _tag(key, variant, scheduler)
     out: dict = {
         "tag": tag,
         "key": key,
         "variant": variant,
         "scheduler": scheduler,
-        "binding": binding,
+        "binding": knobs.binding,
         "status": "error",
     }
     bench = find(key)
@@ -69,11 +78,12 @@ def emit_one(
     try:
         parts = bench.build()
         sched = bench.schedules[variant](parts)
-        opts = {"freq_mhz": freq} if freq is not None else {}
+        opts = {"freq_mhz": knobs.freq} if knobs.freq is not None else {}
         rtl = sched.export("rtl", **opts).set_scheduler_opt(
-            scheduler=scheduler, O=objective, area_slack=area_slack
+            scheduler=scheduler, O=knobs.objective, area_slack=knobs.area_slack
         )
-        if binding == "trivial":
+        assert knobs.binding in ("trivial", "auto"), knobs.binding
+        if knobs.binding == "trivial":
             rtl.use_trivial_binding()
         res = rtl.schedule()
         rtl.compile()
@@ -81,12 +91,11 @@ def emit_one(
             warnings.simplefilter("always")
             rtl.scaffold_project(str(work / f"{tag}.prj"))
         q = rtl.estimation
+        period = 1000.0 / rtl.freq_mhz
         # Under a period-choosing objective the compile wrote its clock back
         # to the handle; otherwise the constraint is the derated model period.
         cycle_ns = (
-            1000.0 / rtl.freq_mhz
-            if objective in ("freq", "wall")
-            else res.cycle_ns or 1000.0 / rtl.freq_mhz
+            period if knobs.objective in ("freq", "wall") else res.cycle_ns or period
         )
         out.update(
             status="pass",
@@ -102,54 +111,30 @@ def emit_one(
     return out
 
 
-def _run_child(
-    item, binding: str, objective: str, freq: float | None, work: Path, timeout: int,
-    area_slack: float = 0.0,
-) -> dict:
+def _run_child(item, knobs: Knobs, work: Path, timeout: int) -> dict:
     key, variant, scheduler = item
-    env = dict(os.environ)
-    env["XILINX_VITIS"] = "/nonexistent"
-    env["PYTHONPATH"] = str(REPO)
-    env.setdefault("ALLO_LOG_LEVEL", "warn")
-    cmd = [
-        sys.executable,
-        "-m",
-        "benchmark.synth",
+    argv = [
         "--one",
         f"{key}::{variant}::{scheduler}",
         "--binding",
-        binding,
+        knobs.binding,
         "--objective",
-        objective,
+        knobs.objective,
         "--work",
         str(work),
     ]
-    if freq is not None:
-        cmd += ["--freq", str(freq)]
-    if area_slack:
-        cmd += ["--area-slack", str(area_slack)]
-    row = {
-        "tag": f"{key}/{variant}/{scheduler}".replace("/", "_"),
+    if knobs.freq is not None:
+        argv += ["--freq", str(knobs.freq)]
+    if knobs.area_slack:
+        argv += ["--area-slack", str(knobs.area_slack)]
+    base = {
+        "tag": _tag(key, variant, scheduler),
         "key": key,
         "variant": variant,
         "scheduler": scheduler,
     }
-    try:
-        p = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            cwd=str(REPO),
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {**row, "status": "timeout"}
-    for line in p.stdout.splitlines():
-        if line.startswith(MARK):
-            return json.loads(line[len(MARK) :])
-    return {**row, "status": "crash", "error": (p.stdout + p.stderr)[-3000:]}
+    row, _ = run_child("benchmark.synth", MARK, argv, timeout, base)
+    return row
 
 
 # --- the synthesis phase -----------------------------------------------------
@@ -271,14 +256,12 @@ def read_utilization(work: Path, tag: str) -> dict | None:
     p = work / f"{tag}_util.rpt"
     if not p.exists():
         return None
-    out = {v: 0.0 for v in _UTIL_ROWS.values()}
-    seen: set[str] = set()
+    first: dict = {}
     for line in p.read_text().splitlines():
         cells = [c.strip() for c in line.split("|")]
-        if len(cells) > 2 and (key := _UTIL_ROWS.get(cells[1])):
-            if key not in seen:
-                seen.add(key)
-                out[key] = float(cells[2])
+        if len(cells) > 2 and (key := _UTIL_ROWS.get(cells[1])) and key not in first:
+            first[key] = float(cells[2])
+    out = {v: first.get(v, 0.0) for v in _UTIL_ROWS.values()}
     # Total LUT sites, whichever role each is in.
     out["lut"] = out["lut_logic"] + out["lut_mem"] + out["srl"]
     return {k: int(v) if v == int(v) else v for k, v in out.items()}
@@ -291,17 +274,16 @@ def read_wns(work: Path, tag: str) -> float | None:
     if not p.exists():
         return None
     lines = p.read_text().splitlines()
-    for i, line in enumerate(lines):
-        if "WNS(ns)" not in line:
-            continue
-        for row in lines[i + 1 :]:
-            tok = row.split()
-            if tok and not set(row) <= set("- |"):
-                try:
-                    return float(tok[0])
-                except ValueError:
-                    break
-        break
+    head = next((i for i, line in enumerate(lines) if "WNS(ns)" in line), None)
+    if head is None:
+        return None
+    for row in lines[head + 1 :]:
+        tok = row.split()
+        if tok and not set(row) <= set("- |"):
+            try:
+                return float(tok[0])
+            except ValueError:
+                return None
     return None
 
 
@@ -343,11 +325,8 @@ def print_table(rows: list[dict], impl: bool) -> None:
     for r in rows:
         if r["status"] != "pass":
             note = r.get("note") or r.get("error", "")
-            print(
-                f"{r['tag']:<38} [{r['status']}] {note.splitlines()[0][:80]}"
-                if note
-                else f"{r['tag']:<38} [{r['status']}]"
-            )
+            head = f"{r['tag']:<38} [{r['status']}]"
+            print(f"{head} {note.splitlines()[0][:80]}" if note else head)
             continue
         p, a = r["predicted"], r.get("actual")
         note = "  [BLACK BOXES]" if r.get("blackboxes") else ""
@@ -435,13 +414,15 @@ def main() -> None:
 
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
+    knobs = Knobs(
+        binding=args.binding,
+        objective=args.objective,
+        freq=args.freq,
+        area_slack=args.area_slack,
+    )
 
     if args.one:
-        key, variant, scheduler = args.one.split("::")
-        row = emit_one(
-            key, variant, scheduler, args.binding, args.objective, args.freq, work,
-            args.area_slack,
-        )
+        row = emit_one(args.one.split("::"), knobs, work)
         print(MARK + json.dumps(row), flush=True)
         return
 
@@ -465,13 +446,7 @@ def main() -> None:
 
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futs = [
-            pool.submit(
-                _run_child, it, args.binding, args.objective, args.freq, work,
-                args.timeout, args.area_slack,
-            )
-            for it in items
-        ]
+        futs = [pool.submit(_run_child, it, knobs, work, args.timeout) for it in items]
         for i, f in enumerate(futs, 1):
             r = f.result()
             rows.append(r)
@@ -484,7 +459,7 @@ def main() -> None:
                 )
 
     designs = [r for r in rows if r["status"] == "pass"]
-    if not args.skip_synth and designs:
+    if not args.skip_synth:
 
         def synth(d):
             (work / f"{d['tag']}_util.rpt").unlink(missing_ok=True)

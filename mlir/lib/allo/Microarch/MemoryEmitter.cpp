@@ -62,13 +62,15 @@ static Value laneSelect(EmitContext &c, ArrayRef<Value> banks,
 Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
                                  const uarch::MemUnit::Access::Reduced &r,
                                  unsigned width) {
+  StallShell sh = shellFor(acc.region);
+  Value phase = controlOf.lookup(acc.region).phase;
+  unsigned ii = dp.regions[acc.region].ii.value_or(1);
   // The counters a delayed cone reads are fresh at cycle 0 of their iteration,
   // so under a published phase the delay folds onto it: `ceil(addrDelay / ii)`
   // registers instead of one per cycle of the access's stage.
   auto delayed = [&](Value v) {
-    StallShell sh = shellFor(acc.region);
-    Value phase = controlOf.lookup(acc.region).phase;
-    unsigned ii = dp.regions[acc.region].ii.value_or(1);
+    if (!acc.addrDelay)
+      return v;
     return phase && acc.addrDelay > 1
                ? c.foldedChain(v, acc.addrDelay, ii, phase, /*ready=*/0, sh)
                      .last()
@@ -87,7 +89,7 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
            "a reduced address term has no scaled counter in its region");
     add(addrAt(c.b, c.loc, rc.scaledCounters[t.slot], width));
   }
-  if (addr && acc.addrDelay)
+  if (addr)
     addr = delayed(addr);
   if (r.residual) {
     // A register the residual reads runs live like a counter, so each is
@@ -104,9 +106,7 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
              "a residual's digit has no scaled counter in its region");
       // Delayed at the counter's own width and widened after: the chain then
       // costs the digit's bits, not the datapath's.
-      Value v = rc.scaledCounters[t.slot];
-      if (acc.addrDelay)
-        v = delayed(v);
+      Value v = delayed(rc.scaledCounters[t.slot]);
       idx.push_back(addrAt(c.b, c.loc, v, kDatapathAddressWidth));
     }
     add(evalAffine(c.b, c.loc, r.residual, idx, acc.addrMap.getNumDims(),
@@ -856,6 +856,8 @@ void DatapathEmitter::finalizeForwards() {
       unsigned w = std::max(1u, llvm::Log2_64_Ceil(m.numBanks));
       return c.konst(c.b.getIntegerType(w), acc.staticBank.value_or(0));
     };
+    // The load's bank digit is one cone for every paired store.
+    Value loadBank = m.numBanks > 1 ? bankOf(load, p.bank) : Value();
     Value muxed = p.raw;
     for (const uarch::MemUnit::Forward &f : m.forwards) {
       if (f.load != p.load)
@@ -865,8 +867,7 @@ void DatapathEmitter::finalizeForwards() {
       const uarch::MemUnit::Access &store = m.accesses[f.store];
       Value match = c.icmpEqV(p.offset, st.offset);
       if (m.numBanks > 1)
-        match = c.andBits(
-            match, c.icmpEqV(bankOf(load, p.bank), bankOf(store, st.bank)));
+        match = c.andBits(match, c.icmpEqV(loadBank, bankOf(store, st.bank)));
       Value sel = c.delayValid(c.andBits(match, st.we), m.readLatency, sh);
       Value data = c.shiftChain(st.data, m.readLatency, sh).last();
       c.muxLedger.add(MuxRole::Crossbar, 2, m.width);

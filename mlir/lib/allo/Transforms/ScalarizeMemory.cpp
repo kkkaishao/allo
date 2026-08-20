@@ -51,6 +51,25 @@ struct ScalarizeMemoryPass
                                      /*factor=*/0,
                                      /*dim=*/0)});
 
+    // Whether every subscript of \p user is a literal, which makes its access
+    // wiring rather than a mux.
+    auto constantSubscripts = [](Operation *user) {
+      AffineMap map;
+      if (auto load = dyn_cast<affine::AffineLoadOp>(user))
+        map = load.getAffineMap();
+      else if (auto store = dyn_cast<affine::AffineStoreOp>(user))
+        map = store.getAffineMap();
+      else {
+        auto indices = isa<memref::LoadOp>(user)
+                           ? cast<memref::LoadOp>(user).getIndices()
+                           : cast<memref::StoreOp>(user).getIndices();
+        return llvm::all_of(indices, [](Value index) {
+          return matchPattern(index, m_Constant());
+        });
+      }
+      return llvm::all_of(map.getResults(), llvm::IsaPred<AffineConstantExpr>);
+    };
+
     for (Operation *op : survived) {
       // An explicit storage choice always wins over an automatic one.
       if (op->hasAttr(kPartitionAttr) || op->hasAttr(kBindStorageAttr))
@@ -67,34 +86,19 @@ struct ScalarizeMemoryPass
                         memref::LoadOp, memref::StoreOp>(user);
           }))
         continue;
+      bool allConst = true;
+      DenseMap<Block *, unsigned> perBlock;
+      unsigned most = 0;
+      for (Operation *user : op->getUsers()) {
+        allConst &= constantSubscripts(user);
+        most = std::max(most, ++perBlock[user->getBlock()]);
+      }
       // A register file pays a read mux and a write demux per variable
       // subscript, so it is worth it only when every subscript is a constant
       // (the accesses are wires) or one block issues more accesses than a
       // dual-ported row serves in a cycle.
-      auto constantSubscripts = [](Operation *user) {
-        AffineMap map;
-        if (auto load = dyn_cast<affine::AffineLoadOp>(user))
-          map = load.getAffineMap();
-        else if (auto store = dyn_cast<affine::AffineStoreOp>(user))
-          map = store.getAffineMap();
-        else {
-          auto indices = isa<memref::LoadOp>(user)
-                             ? cast<memref::LoadOp>(user).getIndices()
-                             : cast<memref::StoreOp>(user).getIndices();
-          return llvm::all_of(indices, [](Value index) {
-            return matchPattern(index, m_Constant());
-          });
-        }
-        return llvm::all_of(map.getResults(), llvm::IsaPred<AffineConstantExpr>);
-      };
-      if (!llvm::all_of(op->getUsers(), constantSubscripts)) {
-        DenseMap<Block *, unsigned> perBlock;
-        unsigned most = 0;
-        for (Operation *user : op->getUsers())
-          most = std::max(most, ++perBlock[user->getBlock()]);
-        if (most <= 2) // a dual-ported row serves this without a mux
-          continue;
-      }
+      if (!allConst && most <= 2) // a dual-ported row serves this without a mux
+        continue;
 
       op->setAttr(kPartitionAttr, complete);
     }

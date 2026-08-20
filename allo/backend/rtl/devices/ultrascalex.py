@@ -33,6 +33,7 @@ from .spec import (
     Part,
     StorageSpec,
     StorageTiming,
+    add_ip_rows,
 )
 
 NAME = "ultrascalex"
@@ -256,8 +257,12 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
             {"lut": 114, "slicem_lut": 1, "ff": 109, "dsp": 2, "carry8": 9},
             min_period_ns=2.65,
         ),  # 570
-        IPRow(3, {"lut": 80, "ff": 94, "dsp": 2, "carry8": 8}, min_period_ns=2.06),  # 473
-        IPRow(2, {"lut": 81, "ff": 51, "dsp": 2, "carry8": 8}, min_period_ns=3.55),  # 376
+        IPRow(
+            3, {"lut": 80, "ff": 94, "dsp": 2, "carry8": 8}, min_period_ns=2.06
+        ),  # 473
+        IPRow(
+            2, {"lut": 81, "ff": 51, "dsp": 2, "carry8": 8}, min_period_ns=3.55
+        ),  # 376
         IPRow(1, {"lut": 79, "ff": 33, "dsp": 2, "carry8": 8}, in_delay_ns=3.37),  # 264
     ),
     # The 10-cycle divide matches the 12-cycle row's frequency at no more area.
@@ -697,22 +702,9 @@ def build(part: Part) -> Device:
     for kind, delay in timing.comb.items():
         d.set_comb_delay(kind, delay, uses=comb[kind])
 
-    for core, rows in {**IP, **IP_BY_GRADE.get(part.grade, {})}.items():
-        for row in (rows,) if isinstance(rows, IPRow) else rows:
-            operator = core.retimed(
-                row.latency,
-                row.in_delay_ns,
-                # A row defaults to the clock it was characterized at.
-                row.min_period_ns
-                if row.min_period_ns is not None
-                else 1000.0 / part.grade.default_freq_mhz,
-            )
-            if row.mnemonic is not None:
-                operator.mnemonic = row.mnemonic
-            d.add_operator(operator)
-            d.set_operator_uses(
-                operator, {res[n]: Const(v) for n, v in row.area.items()}
-            )
+    add_ip_rows(
+        d, {**IP, **IP_BY_GRADE.get(part.grade, {})}, res, part.grade.default_freq_mhz
+    )
 
     d.set_mux_uses({res["lut"]: (MUX_LUT_COST, Linear(1.0))})
     if timing.mux:

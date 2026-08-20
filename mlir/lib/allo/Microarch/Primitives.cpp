@@ -247,7 +247,20 @@ Value addrAt(OpBuilder &b, Location loc, Value v, unsigned width) {
   return resize(b, loc, v, width, /*isSigned=*/false);
 }
 
-static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k);
+// Multiply by a compile-time constant. A power-of-two coefficient is a shift;
+// anything else stays a `comb.mul` deliberately, since synthesis recodes a
+// constant multiplier into a shift-add network better than a decomposition
+// emitted here could.
+static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k) {
+  if (k == 1)
+    return v;
+  if (k > 0 && llvm::isPowerOf2_64(static_cast<uint64_t>(k)))
+    return comb::ShlOp::create(b, loc, v,
+                               konstLike(b, loc, v, llvm::Log2_64(k)), false)
+        .getResult();
+  return comb::MulOp::create(b, loc, v, konstLike(b, loc, v, k), false)
+      .getResult();
+}
 
 // Unsigned divide by a compile-time constant: a shift for a power of two,
 // else the reciprocal multiply, `(v * M) >> shift` at the product's width,
@@ -273,21 +286,6 @@ static Value divConst(OpBuilder &b, Location loc, Value v, int64_t d) {
   return addrAt(b, loc, q, w);
 }
 
-// Multiply by a compile-time constant. A power-of-two coefficient is a shift;
-// anything else stays a `comb.mul` deliberately, since synthesis recodes a
-// constant multiplier into a shift-add network better than a decomposition
-// emitted here could.
-static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k) {
-  if (k == 1)
-    return v;
-  if (k > 0 && llvm::isPowerOf2_64(static_cast<uint64_t>(k)))
-    return comb::ShlOp::create(b, loc, v,
-                               konstLike(b, loc, v, llvm::Log2_64(k)), false)
-        .getResult();
-  return comb::MulOp::create(b, loc, v, konstLike(b, loc, v, k), false)
-      .getResult();
-}
-
 // A power-of-two divisor never reaches here: `evalAffine` builds that subtree
 // narrow instead, which is the same mask. Everything else is
 // `v - (v / d) * d` over the reciprocal quotient, in the operand's own width,
@@ -296,7 +294,8 @@ static Value modConst(OpBuilder &b, Location loc, Value v, int64_t d) {
   if (d == 1)
     return konstLike(b, loc, v, 0);
   unsigned w = cast<IntegerType>(v.getType()).getWidth();
-  if (static_cast<uint64_t>(d) >= (uint64_t(1) << std::min(w, 62u)))
+  assert(w <= 62 && "the reciprocal multiplier of a wider operand overflows");
+  if (static_cast<uint64_t>(d) >= (uint64_t(1) << w))
     return v;
   Value qd = mulConst(b, loc, divConst(b, loc, v, d), d);
   return comb::SubOp::create(b, loc, v, qd, false).getResult();

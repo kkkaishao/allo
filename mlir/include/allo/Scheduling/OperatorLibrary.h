@@ -26,6 +26,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -123,6 +124,13 @@ struct NodeTiming {
   double outDelay = 0.0; // ns, from this node to its consumer
   double minPeriod = 0.0; // ns, the least period the unit behind it holds
 };
+
+/// The least period one row or node needs for a cycle of its own.
+inline float periodNeed(float regFloor, double inDelay, double outDelay,
+                        double minPeriod) {
+  return std::max({regFloor + (float)inDelay, (float)outDelay,
+                   (float)minPeriod});
+}
 
 /// What a lookup resolves for one operation: the timing row it is scheduled
 /// under, and what the library additionally knows about the unit behind it.

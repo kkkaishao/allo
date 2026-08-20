@@ -33,6 +33,7 @@ from .spec import (
     Part,
     StorageSpec,
     StorageTiming,
+    add_ip_rows,
 )
 
 NAME = "series7"
@@ -145,26 +146,40 @@ SCATTER_STORAGE = "register"
 #: core holds internally are split out as ``slicem_lut``.
 IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ip.fadd: (
-        IPRow(7, {"lut": 252, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry4": 19}),  # 181
+        IPRow(
+            7, {"lut": 252, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry4": 19}
+        ),  # 181
         IPRow(5, {"lut": 363, "slicem_lut": 13, "ff": 242, "carry4": 36}),  # 157
     ),
     ip.fsub: (
-        IPRow(7, {"lut": 252, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry4": 19}),  # 181
+        IPRow(
+            7, {"lut": 252, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry4": 19}
+        ),  # 181
         IPRow(5, {"lut": 363, "slicem_lut": 13, "ff": 242, "carry4": 36}),  # 157
     ),
-    ip.fmul: IPRow(4, {"lut": 114, "slicem_lut": 1, "ff": 109, "dsp": 2, "carry4": 14}),  # 214
+    ip.fmul: IPRow(
+        4, {"lut": 114, "slicem_lut": 1, "ff": 109, "dsp": 2, "carry4": 14}
+    ),  # 214
     ip.fdiv: IPRow(12, {"lut": 760, "slicem_lut": 39, "ff": 477, "carry4": 194}),  # 114
     ip.fcmp: IPRow(1, {"lut": 64, "ff": 2, "carry4": 12}),  # 194
     ip.dadd: (
-        IPRow(14, {"lut": 721, "slicem_lut": 90, "ff": 872, "dsp": 3, "carry4": 51}),  # 210
+        IPRow(
+            14, {"lut": 721, "slicem_lut": 90, "ff": 872, "dsp": 3, "carry4": 51}
+        ),  # 210
         IPRow(6, {"lut": 719, "slicem_lut": 16, "ff": 542, "carry4": 72}),  # 169
     ),
     ip.dsub: (
-        IPRow(14, {"lut": 721, "slicem_lut": 90, "ff": 872, "dsp": 3, "carry4": 51}),  # 210
+        IPRow(
+            14, {"lut": 721, "slicem_lut": 90, "ff": 872, "dsp": 3, "carry4": 51}
+        ),  # 210
         IPRow(6, {"lut": 719, "slicem_lut": 16, "ff": 542, "carry4": 72}),  # 169
     ),
-    ip.dmul: IPRow(9, {"lut": 136, "slicem_lut": 36, "ff": 429, "dsp": 10, "carry4": 27}),  # 213
-    ip.ddiv: IPRow(32, {"lut": 3195, "slicem_lut": 72, "ff": 3027, "carry4": 794}),  # 119
+    ip.dmul: IPRow(
+        9, {"lut": 136, "slicem_lut": 36, "ff": 429, "dsp": 10, "carry4": 27}
+    ),  # 213
+    ip.ddiv: IPRow(
+        32, {"lut": 3195, "slicem_lut": 72, "ff": 3027, "carry4": 794}
+    ),  # 119
     ip.dcmp: IPRow(1, {"lut": 118, "ff": 2, "carry4": 21}),  # 182
     ip.bfadd: IPRow(4, {"lut": 175, "slicem_lut": 1, "ff": 118, "carry4": 24}),  # 175
     ip.bfsub: IPRow(4, {"lut": 175, "slicem_lut": 1, "ff": 118, "carry4": 24}),  # 175
@@ -196,16 +211,28 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ip.udiv16: IPRow(8, {"lut": 376, "slicem_lut": 2, "ff": 578, "carry4": 93}),  # 103
     ip.irem16: IPRow(8, {"lut": 376, "slicem_lut": 2, "ff": 578, "carry4": 93}),  # 103
     ip.urem16: IPRow(8, {"lut": 376, "slicem_lut": 2, "ff": 578, "carry4": 93}),  # 103
-    ip.idiv32: IPRow(16, {"lut": 1264, "slicem_lut": 2, "ff": 2170, "carry4": 313}),  # 102
-    ip.udiv32: IPRow(16, {"lut": 1264, "slicem_lut": 2, "ff": 2170, "carry4": 313}),  # 102
-    ip.irem32: IPRow(16, {"lut": 1264, "slicem_lut": 2, "ff": 2170, "carry4": 313}),  # 102
-    ip.urem32: IPRow(16, {"lut": 1264, "slicem_lut": 2, "ff": 2170, "carry4": 313}),  # 102
-    ip.idiv64: IPRow(68, {"lut": 4608, "slicem_lut": 6, "ff": 12808, "carry4": 1137}),  # 174
+    ip.idiv32: IPRow(
+        16, {"lut": 1264, "slicem_lut": 2, "ff": 2170, "carry4": 313}
+    ),  # 102
+    ip.udiv32: IPRow(
+        16, {"lut": 1264, "slicem_lut": 2, "ff": 2170, "carry4": 313}
+    ),  # 102
+    ip.irem32: IPRow(
+        16, {"lut": 1264, "slicem_lut": 2, "ff": 2170, "carry4": 313}
+    ),  # 102
+    ip.urem32: IPRow(
+        16, {"lut": 1264, "slicem_lut": 2, "ff": 2170, "carry4": 313}
+    ),  # 102
+    ip.idiv64: IPRow(
+        68, {"lut": 4608, "slicem_lut": 6, "ff": 12808, "carry4": 1137}
+    ),  # 174
     ip.udiv64: (
         IPRow(68, {"lut": 4608, "slicem_lut": 6, "ff": 12808, "carry4": 1137}),  # 174
         IPRow(66, {"lut": 4481, "slicem_lut": 2, "ff": 12677, "carry4": 1105}),  # 186
     ),
-    ip.irem64: IPRow(68, {"lut": 4608, "slicem_lut": 6, "ff": 12808, "carry4": 1137}),  # 174
+    ip.irem64: IPRow(
+        68, {"lut": 4608, "slicem_lut": 6, "ff": 12808, "carry4": 1137}
+    ),  # 174
     ip.urem64: (
         IPRow(68, {"lut": 4608, "slicem_lut": 6, "ff": 12808, "carry4": 1137}),  # 174
         IPRow(66, {"lut": 4481, "slicem_lut": 2, "ff": 12677, "carry4": 1105}),  # 186
@@ -386,22 +413,7 @@ def build(part: Part) -> Device:
     for kind, delay in timing.comb.items():
         d.set_comb_delay(kind, delay, uses=comb[kind])
 
-    for core, rows in IP.items():
-        for row in (rows,) if isinstance(rows, IPRow) else rows:
-            operator = core.retimed(
-                row.latency,
-                row.in_delay_ns,
-                # A row defaults to the clock it was characterized at.
-                row.min_period_ns
-                if row.min_period_ns is not None
-                else 1000.0 / part.grade.default_freq_mhz,
-            )
-            if row.mnemonic is not None:
-                operator.mnemonic = row.mnemonic
-            d.add_operator(operator)
-            d.set_operator_uses(
-                operator, {res[n]: Const(v) for n, v in row.area.items()}
-            )
+    add_ip_rows(d, IP, res, part.grade.default_freq_mhz)
 
     d.set_mux_uses({res["lut"]: (MUX_LUT_COST, Linear(1.0))})
     if timing.mux:
