@@ -200,11 +200,6 @@ def area_of(q) -> dict:
 # the heuristic as its warm start; the count is the same in both columns by
 # construction and describes the problem rather than the solver.
 _II_GAP = re.compile(r"Scheduled at II=(\d+) against a lower bound of II=(\d+)")
-# An exact solve that found a schedule but not the best one. Unlike a spent
-# budget with nothing in hand, this SHIPS: the region takes a legal placement
-# that no bound relates to the heuristic's, so it is the one way the exact path
-# can come back worse than the default one.
-_BUDGET = re.compile(r"ran out of budget")
 # How many `memref` accesses were raised into the dependence test's reach. Needs
 # ALLO_LOG_LEVEL=info and is absent otherwise; it prices what a better raise
 # could still recover.
@@ -305,6 +300,10 @@ def measure_one(item, knobs: Knobs) -> dict:
                 "limited_ops": s.limited_ops,
                 "ii": s.interval,
                 "ms": round(s.ms, 2),
+                "solver": s.solver,
+                "proven": s.proven,
+                "exhausted": s.budget_exhausted,
+                "fallback": s.fallback,
             }
             for s in res.compiler.solves
         ]
@@ -392,7 +391,9 @@ def _run_child(item, knobs: Knobs, timeout: int) -> dict:
     # The II-vs-bound warnings, which no field of the schedule result carries:
     # the bound is settled inside the simplex and reported only as a diagnostic.
     d["ii_gaps"] = [{"ii": int(a), "bound": int(b)} for a, b in _II_GAP.findall(text)]
-    d["budget_exhausted"] = len(_BUDGET.findall(text))
+    d["budget_exhausted"] = sum(
+        1 for s in d.get("solves", []) if s.get("exhausted")
+    )
     d["probes"] = _PROBE.findall(text)
     d["raised"] = [sum(int(m[i]) for m in _RAISED.findall(text)) for i in (0, 1)]
     d["warnings"] = [l.strip()[:300] for l in text.splitlines() if "WARN" in l][:20]
@@ -491,13 +492,26 @@ def solve_table(results: list[dict], top: int) -> str:
     rows.sort(reverse=True, key=lambda t: t[0])
     head = (
         f"{'ms':>9} {'sched':<5} {'benchmark/variant':<30} {'kind':<8}"
-        f" {'ops':>5} {'lim':>5} {'ii':>5}  where"
+        f" {'ops':>5} {'lim':>5} {'ii':>5} {'st':<4}  where"
     )
+
+    # The solver's verdict: proven optimal, ran out of budget (so the result
+    # may not reproduce), or fell back to the heuristic's schedule.
+    def verdict(s):
+        if s.get("fallback"):
+            return "fell"
+        if s.get("exhausted"):
+            return "bdgt"
+        if s.get("proven"):
+            return "opt"
+        return "-"
+
     lines = [head, "-" * len(head)]
     for ms, sched, name, s in rows[:top]:
         lines.append(
             f"{ms:>9.1f} {sched[:5]:<5} {name:<30} {s['kind']:<8}"
-            f" {s['ops']:>5} {s['limited_ops']:>5} {_fmt(s['ii'], 5)}  {s['where']}"
+            f" {s['ops']:>5} {s['limited_ops']:>5} {_fmt(s['ii'], 5)}"
+            f" {verdict(s):<4}  {s['where']}"
         )
     return "\n".join(lines)
 
@@ -693,7 +707,7 @@ def main():
     ap.add_argument(
         "--budget",
         type=float,
-        help="what ONE exact solve may spend, in the solver's "
+        help="what one exact solve may spend, in the solver's "
         "deterministic time units (default 10). The axis a budget policy is "
         "swept over; it does nothing to the heuristic",
     )

@@ -36,11 +36,26 @@ class OperatorLibrary;
 /// A limited operation may also have zero latency here (CIRCT requires
 /// non-zero): a combinational access still occupies its port for the cycle it
 /// issues in and contends like any other.
+/// How one region's solve ran, so a reader can judge the result without
+/// re-running it: `proven` means every deciding status was OPTIMAL, and a
+/// `budgetExhausted` solve may ship a different schedule on the next run of
+/// the same compile.
+struct SolveTelemetry {
+  bool proven = false;
+  bool budgetExhausted = false;
+  bool fallback = false; // shipped the heuristic's schedule instead
+  /// The interval whose solve exhausted the budget, ending the cyclic search.
+  std::optional<int64_t> exhaustedAtII;
+};
+
 class OccupancyProblem
     : public virtual circt::scheduling::SharedOperatorsProblem {
 public:
   static constexpr auto name = "OccupancyProblem";
   using circt::scheduling::SharedOperatorsProblem::SharedOperatorsProblem;
+
+  /// Filled by the exact solver; read back by the solve report.
+  SolveTelemetry telemetry;
 
 protected:
   OccupancyProblem() = default;

@@ -816,6 +816,20 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
   if (ii)
     s.interval = (int64_t)*ii;
   s.millis = std::chrono::duration<double, std::milli>(now() - since).count();
+  // Config from the options, outcome from the solver's own telemetry, so a
+  // reader can judge a result (optimal? reproducible?) without re-solving.
+  if (usesExactScheduler(opts.kind)) {
+    s.solver = "cpsat";
+    s.workers = opts.workers;
+    s.seed = opts.seed;
+    s.budgetSeconds = opts.budget;
+    s.proven = problem.telemetry.proven;
+    s.budgetExhausted = problem.telemetry.budgetExhausted;
+    s.fallback = problem.telemetry.fallback;
+    s.exhaustedAtII = problem.telemetry.exhaustedAtII;
+  } else {
+    s.solver = "simplex";
+  }
   model.solves.push_back(std::move(s));
 }
 
@@ -1690,6 +1704,12 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   SmallVector<std::unique_ptr<DependenceAnalysis>> depsFor;
   for (func::FuncOp fn : *orderOr)
     depsFor.push_back(std::make_unique<DependenceAnalysis>(fn));
+
+  if (usesExactScheduler(opts.kind))
+    info(Stage::Sched, module)
+        << "Exact scheduler: " << opts.workers << " workers, seed "
+        << opts.seed << ", budget " << format("%g", opts.budget)
+        << " deterministic units per region";
 
   DenseMap<Operation *, int64_t> grants;
   if (opts.objective == ScheduleObjective::Area &&

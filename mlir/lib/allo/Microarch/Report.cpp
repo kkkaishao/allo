@@ -241,6 +241,9 @@ std::optional<Hull> rangeOfSource(const Datapath &dp, const Source &s,
     return rangeOfSource(dp, dp.regs[s.id].input, fuel);
   case Source::Kind::Counter: {
     const RegionBlock &rb = dp.regions[s.id];
+    // A narrowed runtime-bound counter published its hull at derivation.
+    if (rb.counterHull)
+      return hull(rb.counterHull->first, rb.counterHull->second);
     auto pipe = dyn_cast_or_null<dcp::DCPathPipelineOp>(rb.op);
     std::optional<int64_t> trip = rb.tripCount ? rb.tripCount : rb.tripBound;
     if (!pipe || rb.conditional || !trip || pipe.getLbBound() ||
@@ -319,8 +322,15 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     if (rb.ii)
       r.interval = (int64_t)*rb.ii;
     r.cost.addrStrides = rb.addrStrides.size();
+    for (const RegionBlock::AddrStride &s : rb.addrStrides)
+      r.cost.strides.push_back({s.width, s.step != 0, s.hasCarry, s.wrap != 0});
     if (rb.counterType)
       r.cost.counterWidth = datapathWidth(rb.counterType);
+    // The phase counter exists exactly where `emitPipelined` builds one: a
+    // schedule-paced leaf issuing once per II.
+    if (rb.shape == RegionBlock::Shape::Leaf &&
+        rb.kind == RegionBlock::Kind::Cyclic && rb.ii && *rb.ii > 1)
+      r.cost.phaseWidth = llvm::Log2_64_Ceil(*rb.ii);
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
       r.computeOps += u.boundOps.size();
@@ -481,7 +491,17 @@ std::string MicroarchReport::toJSON() const {
                   j.attribute("mux_inputs", (int64_t)r.cost.muxInputs);
                   j.attribute("mux_bits", (int64_t)r.cost.muxBits);
                   j.attribute("counter_width", (int64_t)r.cost.counterWidth);
+                  j.attribute("phase_width", (int64_t)r.cost.phaseWidth);
                   j.attribute("addr_strides", (int64_t)r.cost.addrStrides);
+                  j.attributeArray("strides", [&] {
+                    for (const StrideCost &s : r.cost.strides)
+                      j.object([&] {
+                        j.attribute("width", (int64_t)s.width);
+                        j.attribute("step", s.step);
+                        j.attribute("carry", s.carry);
+                        j.attribute("wrap", s.wrap);
+                      });
+                  });
                 });
                 j.attributeArray("units", [&] {
                   for (const UnitReport &u : r.units)

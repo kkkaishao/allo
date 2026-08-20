@@ -67,6 +67,7 @@ class Knobs:
     seed: int
     cycles: int
     objective: str
+    budget: float | None
 
 
 # What one cosim may run for, derived from the model rather than fixed: a design
@@ -146,9 +147,10 @@ def verify_one(item, knobs: Knobs) -> dict:
     try:
         parts = bench.build()
         sched = bench.schedules[variant](parts)
-        rtl = sched.export("rtl").set_scheduler_opt(
-            scheduler=knobs.scheduler, O=knobs.objective
-        )
+        solver = {"scheduler": knobs.scheduler, "O": knobs.objective}
+        if knobs.budget is not None:
+            solver["budget"] = knobs.budget
+        rtl = sched.export("rtl").set_scheduler_opt(**solver)
         if binding == "trivial":
             rtl.use_trivial_binding()
 
@@ -215,6 +217,8 @@ def _run_child(item, knobs: Knobs, timeout: int) -> dict:
         "--objective",
         knobs.objective,
     ]
+    if knobs.budget is not None:
+        argv += ["--budget", str(knobs.budget)]
     t0 = time.time()
     base = {
         "key": key,
@@ -361,6 +365,12 @@ def main():
         default=0,
         help="simulation budget per run; 0 derives it from the modelled latency",
     )
+    ap.add_argument(
+        "--budget",
+        type=float,
+        help="what one exact solve may spend, in the solver's deterministic "
+        "time units; unset keeps the compiler default",
+    )
     ap.add_argument("--timeout", type=int, default=1800, help="wall seconds per run")
     ap.add_argument("-o", "--out", default="verify.json")
     args = ap.parse_args()
@@ -369,6 +379,7 @@ def main():
         seed=args.seed,
         cycles=args.cycles,
         objective=args.objective,
+        budget=args.budget,
     )
 
     if args.one:

@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GetGlobalOp/GlobalOp (ROM)
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Matchers.h" // m_ConstantInt (counter hull literals)
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Format.h"
@@ -734,34 +735,211 @@ Source DatapathBuilder::resolveValue(Value v) {
   return Source{Source::Kind::Survivor, rid, arg - 1};
 }
 
-// The bits region \p rb's iteration counter needs. The register holds
-// `lb, lb+step, ...` and the terminator compares `iv + step` against `ub` under
-// a SIGNED predicate, so three values ride this width: `lb`, `step` (its own
-// cell) and `lb + trip*step` (the one-past value, also `ub`). `step` must be
-// counted even for an empty loop, whose `0 to 0` bounds alone would fit in a
-// bit. A loop whose trip only an ASSUMPTION bounds uses the bound in place of
-// the count.
-static unsigned counterWidth(const RegionBlock &rb) {
-  auto pipe = cast<dcp::DCPathPipelineOp>(rb.op);
-  std::optional<int64_t> trip = rb.tripCount ? rb.tripCount : rb.tripBound;
-  if (rb.conditional || !trip || pipe.getLbBound() || pipe.getStepBound())
-    return kIndexWidth;
-  int64_t lb = pipe.getLb().value_or(0), step = pipe.getStep().value_or(1);
-  int64_t span, last;
-  if (llvm::MulOverflow(*trip, step, span) || llvm::AddOverflow(lb, span, last))
-    return kIndexWidth;
-  auto bits = [](int64_t v) {
+// Interval bounds of the values a counted counter touches, walked over the
+// dcp IR: literal bounds, an enclosing counter, and the reified bound cone.
+// Exact in __int128; anything the walk cannot bound keeps `kIndexWidth`.
+namespace {
+struct ValueHull {
+  __int128 lo = 0, hi = 0;
+};
+struct CounterBounds {
+  ValueHull lb, step;
+  std::optional<ValueHull> last; // the one-past value `lb + trip*step`
+  std::optional<ValueHull> ub;   // a runtime bound's own values
+};
+} // namespace
+
+static ValueHull hullUnion(ValueHull a, ValueHull b) {
+  return {std::min(a.lo, b.lo), std::max(a.hi, b.hi)};
+}
+
+static bool fitsSigned(const ValueHull &h, unsigned width) {
+  __int128 lim = (__int128)1 << (std::min(width, 64u) - 1);
+  return h.lo >= -lim && h.hi < lim;
+}
+
+static unsigned hullBits(const ValueHull &h) {
+  auto bits = [](__int128 v) {
     return static_cast<unsigned>(
-        APInt(64, static_cast<uint64_t>(v), /*isSigned=*/true)
+        APInt(64, static_cast<uint64_t>((int64_t)v), /*isSigned=*/true)
             .getSignificantBits());
   };
-  return std::min(kIndexWidth, std::max({bits(lb), bits(step), bits(last)}));
+  return std::max(bits(h.lo), bits(h.hi));
+}
+
+static std::optional<CounterBounds> counterBoundsOf(dcp::DCPathPipelineOp pipe,
+                                                    unsigned fuel);
+
+static std::optional<ValueHull> hullOfValue(Value v, unsigned fuel) {
+  if (!fuel)
+    return std::nullopt;
+  APInt cst;
+  if (matchPattern(v, m_ConstantInt(&cst)))
+    return ValueHull{cst.getSExtValue(), cst.getSExtValue()};
+  if (auto barg = dyn_cast<BlockArgument>(v)) {
+    auto pipe =
+        dyn_cast_or_null<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp());
+    if (!pipe || barg.getArgNumber() != 0)
+      return std::nullopt;
+    auto cb = counterBoundsOf(pipe, fuel - 1);
+    if (!cb)
+      return std::nullopt;
+    // What the body reads: lb through the last issued value, and lb itself
+    // even when the loop is empty.
+    __int128 hi = cb->last ? cb->last->hi - cb->step.lo : cb->ub->hi - 1;
+    return ValueHull{cb->lb.lo, std::max(cb->lb.hi, hi)};
+  }
+  auto res = dyn_cast<OpResult>(v);
+  if (!res)
+    return std::nullopt;
+  if (auto seq = dyn_cast<dcp::DCPathSequentialOp>(res.getOwner()))
+    return hullOfValue(seq.getBody().front().getTerminator()->getOperand(
+                           res.getResultNumber()),
+                       fuel - 1);
+  auto comp = dyn_cast<dcp::DCPathComputeOp>(res.getOwner());
+  if (!comp)
+    return std::nullopt;
+  std::optional<CombOpKindEnum> kind = comp.getCombKind();
+  if (!kind)
+    return std::nullopt;
+  auto of = [&](unsigned i) {
+    return hullOfValue(comp.getInputs()[i], fuel - 1);
+  };
+  std::optional<ValueHull> h;
+  switch (*kind) {
+  case CombOpKindEnum::IndexCast:
+  case CombOpKindEnum::Extsi:
+  case CombOpKindEnum::Trunci:
+    h = of(0);
+    break;
+  case CombOpKindEnum::IndexCastUi:
+  case CombOpKindEnum::Extui:
+    // Zero-extension preserves the value only where it is non-negative.
+    if ((h = of(0)) && h->lo < 0)
+      return std::nullopt;
+    break;
+  case CombOpKindEnum::Addi:
+  case CombOpKindEnum::Subi: {
+    auto a = of(0), b = of(1);
+    if (!a || !b)
+      return std::nullopt;
+    h = *kind == CombOpKindEnum::Addi
+            ? ValueHull{a->lo + b->lo, a->hi + b->hi}
+            : ValueHull{a->lo - b->hi, a->hi - b->lo};
+    break;
+  }
+  case CombOpKindEnum::Muli: {
+    auto a = of(0), b = of(1);
+    if (!a || !b)
+      return std::nullopt;
+    __int128 c[] = {a->lo * b->lo, a->lo * b->hi, a->hi * b->lo, a->hi * b->hi};
+    h = ValueHull{*std::min_element(c, c + 4), *std::max_element(c, c + 4)};
+    break;
+  }
+  case CombOpKindEnum::Minsi:
+  case CombOpKindEnum::Maxsi:
+  case CombOpKindEnum::Minui:
+  case CombOpKindEnum::Maxui: {
+    auto a = of(0), b = of(1);
+    if (!a || !b)
+      return std::nullopt;
+    // The unsigned orders agree with the signed one only over non-negatives.
+    if ((*kind == CombOpKindEnum::Minui || *kind == CombOpKindEnum::Maxui) &&
+        (a->lo < 0 || b->lo < 0))
+      return std::nullopt;
+    bool isMin =
+        *kind == CombOpKindEnum::Minsi || *kind == CombOpKindEnum::Minui;
+    h = isMin ? ValueHull{std::min(a->lo, b->lo), std::min(a->hi, b->hi)}
+              : ValueHull{std::max(a->lo, b->lo), std::max(a->hi, b->hi)};
+    break;
+  }
+  default:
+    return std::nullopt;
+  }
+  // A result its own type cannot represent wraps in hardware; an index result
+  // is materialized at the datapath index width.
+  if (!h)
+    return std::nullopt;
+  unsigned width = isa<IndexType>(res.getType())
+                       ? kIndexWidth
+                       : cast<IntegerType>(res.getType()).getWidth();
+  if (!fitsSigned(*h, width))
+    return std::nullopt;
+  return h;
+}
+
+static std::optional<CounterBounds> counterBoundsOf(dcp::DCPathPipelineOp pipe,
+                                                    unsigned fuel) {
+  if (!fuel || pipe.isWhileLoop())
+    return std::nullopt;
+  auto bound = [&](std::optional<int64_t> attr, Value v,
+                   int64_t dflt) -> std::optional<ValueHull> {
+    if (attr)
+      return ValueHull{*attr, *attr};
+    if (v)
+      return hullOfValue(v, fuel);
+    return ValueHull{dflt, dflt};
+  };
+  auto lb = bound(pipe.getLb(), pipe.getLbBound(), 0);
+  auto step = bound(pipe.getStep(), pipe.getStepBound(), 1);
+  if (!lb || !step || step->lo < 1)
+    return std::nullopt;
+  CounterBounds cb{*lb, *step, {}, {}};
+  std::optional<int64_t> trip =
+      pipe.getTrip() ? pipe.getTrip() : pipe.getTripBound();
+  if (trip && *trip >= 0)
+    cb.last = ValueHull{cb.lb.lo + (__int128)*trip * cb.step.lo,
+                        cb.lb.hi + (__int128)*trip * cb.step.hi};
+  // A materialized runtime bound needs its own hull only when no trip covers
+  // it: `trip` iterations put `ub` at most `lb + trip*step`.
+  if (Value ub = pipe.getDynamicBound()) {
+    cb.ub = hullOfValue(ub, fuel);
+    if (!cb.ub && !cb.last)
+      return std::nullopt;
+  }
+  if (!cb.last && !cb.ub)
+    return std::nullopt;
+  return cb;
+}
+
+// Every value the counter register and its terminator touch: `lb` and `step`
+// (each its own cell), the iv up to the one-past value, the `iv + step`
+// compare operand, and a materialized `ub`.
+static ValueHull storageHullOf(const CounterBounds &cb) {
+  ValueHull h = hullUnion(cb.lb, cb.step);
+  h = hullUnion(h, {cb.lb.lo + cb.step.lo, cb.lb.hi + cb.step.hi});
+  if (cb.last)
+    h = hullUnion(h, *cb.last);
+  if (cb.ub)
+    h = hullUnion(h, {cb.ub->lo, cb.ub->hi + cb.step.hi - 1});
+  return h;
 }
 
 void DatapathBuilder::deriveCounterTypes() {
-  for (RegionBlock &rb : dp.regions)
-    if (rb.kind == RegionBlock::Kind::Cyclic)
-      rb.counterType = IntegerType::get(func.getContext(), counterWidth(rb));
+  constexpr unsigned kHullFuel = 16;
+  for (RegionBlock &rb : dp.regions) {
+    if (rb.kind != RegionBlock::Kind::Cyclic)
+      continue;
+    unsigned width = kIndexWidth;
+    auto pipe = cast<dcp::DCPathPipelineOp>(rb.op);
+    if (!rb.conditional) {
+      if (auto cb = counterBoundsOf(pipe, kHullFuel)) {
+        ValueHull h = storageHullOf(*cb);
+        if (fitsSigned(h, 64) && hullBits(h) < kIndexWidth) {
+          width = hullBits(h);
+          // A runtime bound narrowed below `kIndexWidth` publishes its hull,
+          // so the recurrence gates can size `lb + n*step` against it. A
+          // literal-bound counter keeps in-range gates by construction.
+          if (pipe.getLbBound() || pipe.getStepBound() ||
+              pipe.getDynamicBound()) {
+            rb.counterHull = {{(int64_t)h.lo, (int64_t)h.hi}};
+            rb.counterStepHi = (int64_t)cb->step.hi;
+          }
+        }
+      }
+    }
+    rb.counterType = IntegerType::get(func.getContext(), width);
+  }
 }
 
 void DatapathBuilder::recordRegionBounds() {

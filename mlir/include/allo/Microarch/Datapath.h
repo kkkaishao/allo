@@ -829,6 +829,11 @@ struct RegionBlock {
   Source stepSource; // step (counter increment)
   // The width the iteration counter is built at.
   Type counterType;
+  /// Signed hull of every value the counter holds or compares, set only when
+  /// a runtime bound narrowed below `kIndexWidth`; the recurrence gates widen
+  /// `lb + n*step` past `counterType` where it leaves this range.
+  std::optional<std::pair<int64_t, int64_t>> counterHull;
+  int64_t counterStepHi = 1; // the step's hull top
   // Termination class as the emitter discriminates it, axis 2 of the pair
   // above. A while loop (a `dcp.condition` terminator) is a flushing pipeline
   // whose exit is data-dependent. The declared `determinacy` below agrees in

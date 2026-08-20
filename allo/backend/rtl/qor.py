@@ -234,12 +234,12 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
     Every module the emission built is priced separately: a design with
     sub-kernels spends its area in all of them. Measured against a routed
     18-design bed sweep: float-datapath designs land within 1.0x to 1.2x of
-    measured LUT, FF and state sites, while control-heavy designs over-charge
-    LUT up to 2.5x, so this compares two schedules rather than quoting a
-    utilization figure. Structures with no cost row are reported in
-    :attr:`QoR.unmodelled` rather than dropped; the emitter's control glue
-    (run/issue/done logic, memory port muxing) is aggregated away rather than
-    priced structure by structure.
+    measured LUT, FF and state sites, so this compares two schedules rather
+    than quoting a utilization figure. Structures with no cost row are
+    reported in :attr:`QoR.unmodelled` rather than dropped. The control plane
+    is priced from the structures the report carries: counter, phase and
+    stride update cells, and the next-state cone of every un-enabled control
+    latch.
     """
     price = device.price
     ip_costs = _operator_costs(device)
@@ -269,13 +269,29 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
             run = Utilization.of(price(uses, (c.depth, c.width)))
             charge("regs", f.func, run * c.count)
 
-        # Every counter/stride advances by an adder and turns over on a compare;
-        # its update selects are self-holds and reach no LUT, so the control
-        # plane is priced from the counters it belongs to rather than counted.
+        # Control plane, priced from structure: each counter, phase and stride
+        # register advances by an adder and two update selects, and a control
+        # latch without a clock enable spends its next-state cone.
         for c in f.regs:
             if c.role is RegRole.COUNTER:
-                step = comb(CombKind.ADD, c.width) + comb(CombKind.CMP, c.width)
+                step = comb(CombKind.ADD, c.width) + comb(CombKind.SELECT, c.width) * 2
                 charge("control", f.func, step * c.count)
+            elif c.role is RegRole.CONTROL and not c.enable:
+                charge("control", f.func, comb(CombKind.SELECT, c.width) * c.count)
+        # What the register classes cannot see: the counter's turnover compare,
+        # the phase's two equality compares, and a stride's wrap/carry cells.
+        for r in f.regions:
+            cost = r.cost
+            if cost.counter_width and r.interval is not None:
+                charge("control", f.func, comb(CombKind.CMP, cost.counter_width))
+            if cost.phase_width:
+                charge("control", f.func, comb(CombKind.CMP, cost.phase_width) * 2)
+            for s in cost.strides:
+                cells = comb(CombKind.ADD, s.width) + comb(CombKind.SELECT, s.width)
+                if s.carry:
+                    charge("control", f.func, cells)
+                if s.wrap:
+                    charge("control", f.func, cells + comb(CombKind.CMP, s.width))
 
         for r in f.regions:
             for unit in r.units:

@@ -127,6 +127,14 @@ struct SolveReport {
   std::optional<int64_t> interval;
   /// Wall time of the whole solve in milliseconds.
   double millis = 0.0;
+  /// `simplex` or `cpsat`; the config below applies to a cpsat solve only.
+  std::string solver;
+  int64_t workers = 0, seed = 0;
+  double budgetSeconds = 0.0;
+  /// The solver's own verdict; see `SolveTelemetry`. A budget-exhausted solve
+  /// may ship a different schedule on the next run of the same compile.
+  bool proven = false, budgetExhausted = false, fallback = false;
+  std::optional<int64_t> exhaustedAtII;
 };
 
 /// One kernel's schedule: an `allo.dcp.module` and the regions it holds.

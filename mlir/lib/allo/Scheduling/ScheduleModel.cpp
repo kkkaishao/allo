@@ -213,9 +213,20 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
                  {"kind", s.kind},
                  {"ops", s.ops},
                  {"limited_ops", s.limitedOps},
-                 {"ms", s.millis}};
+                 {"ms", s.millis},
+                 {"solver", s.solver}};
     if (s.interval)
       entry["interval"] = *s.interval;
+    if (s.solver == "cpsat") {
+      entry["workers"] = s.workers;
+      entry["seed"] = s.seed;
+      entry["budget_s"] = s.budgetSeconds;
+      entry["proven"] = s.proven;
+      entry["budget_exhausted"] = s.budgetExhausted;
+      entry["fallback"] = s.fallback;
+      if (s.exhaustedAtII)
+        entry["exhausted_at_ii"] = *s.exhaustedAtII;
+    }
     solveEntries.push_back(std::move(entry));
   }
 

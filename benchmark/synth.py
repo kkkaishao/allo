@@ -45,6 +45,7 @@ class Knobs:
     objective: str
     freq: float | None
     area_slack: float
+    budget: float | None
 
 
 def _tag(key: str, variant: str, scheduler: str) -> str:
@@ -79,9 +80,14 @@ def emit_one(item, knobs: Knobs, work: Path) -> dict:
         parts = bench.build()
         sched = bench.schedules[variant](parts)
         opts = {"freq_mhz": knobs.freq} if knobs.freq is not None else {}
-        rtl = sched.export("rtl", **opts).set_scheduler_opt(
-            scheduler=scheduler, O=knobs.objective, area_slack=knobs.area_slack
-        )
+        solver = {
+            "scheduler": scheduler,
+            "O": knobs.objective,
+            "area_slack": knobs.area_slack,
+        }
+        if knobs.budget is not None:
+            solver["budget"] = knobs.budget
+        rtl = sched.export("rtl", **opts).set_scheduler_opt(**solver)
         assert knobs.binding in ("trivial", "auto"), knobs.binding
         if knobs.binding == "trivial":
             rtl.use_trivial_binding()
@@ -127,6 +133,8 @@ def _run_child(item, knobs: Knobs, work: Path, timeout: int) -> dict:
         argv += ["--freq", str(knobs.freq)]
     if knobs.area_slack:
         argv += ["--area-slack", str(knobs.area_slack)]
+    if knobs.budget is not None:
+        argv += ["--budget", str(knobs.budget)]
     base = {
         "tag": _tag(key, variant, scheduler),
         "key": key,
@@ -385,6 +393,12 @@ def main() -> None:
         help="fraction the area solve's span leash is widened by",
     )
     ap.add_argument(
+        "--budget",
+        type=float,
+        help="what one exact solve may spend, in the solver's deterministic "
+        "time units; unset keeps the compiler default",
+    )
+    ap.add_argument(
         "--impl",
         action="store_true",
         help="place and route after synthesis, and report timing",
@@ -419,6 +433,7 @@ def main() -> None:
         objective=args.objective,
         freq=args.freq,
         area_slack=args.area_slack,
+        budget=args.budget,
     )
 
     if args.one:

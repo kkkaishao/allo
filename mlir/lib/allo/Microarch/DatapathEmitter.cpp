@@ -130,7 +130,7 @@ Value DatapathEmitter::ivAt(const uarch::RegionBlock &rb, unsigned n,
                             Value lb) {
   if (!n)
     return {};
-  auto ivTy = cast<IntegerType>(rb.counterType);
+  auto ivTy = cast<IntegerType>(lb.getType());
   std::optional<int64_t> kstep = dp.constantOf(rb.stepSource);
   Value nStep = kstep ? c.konst(ivTy, static_cast<int64_t>(n) * *kstep)
                       : c.R(comb::MulOp::create(
@@ -141,20 +141,34 @@ Value DatapathEmitter::ivAt(const uarch::RegionBlock &rb, unsigned n,
   return c.R(comb::AddOp::create(c.b, c.loc, lb, nStep, false));
 }
 
-// Both at the raw counter register's width, the width its terminator compares
-// at, so a bound from elsewhere resizes into it.
+// The width a `lb + n*step` gate compares at: the counter's own, or wider
+// where a narrowed runtime-bound counter's hull cannot absorb the offset.
+unsigned DatapathEmitter::gateWidth(const uarch::RegionBlock &rb, unsigned n) {
+  unsigned w = cast<IntegerType>(rb.counterType).getWidth();
+  if (!rb.counterHull || !n)
+    return w;
+  __int128 top =
+      (__int128)rb.counterHull->second + (__int128)n * rb.counterStepHi;
+  unsigned need = APInt(64, static_cast<uint64_t>((int64_t)top),
+                        /*isSigned=*/true)
+                      .getSignificantBits();
+  return std::min<unsigned>(kIndexWidth, std::max(w, need));
+}
+
+// Both at \p w bits: the counter register's own width, or a gate's widened
+// one, with the counter and the bound resized into it.
 std::pair<Value, Value>
-DatapathEmitter::counterAndLb(const uarch::RegionBlock &rb) {
+DatapathEmitter::counterAndLb(const uarch::RegionBlock &rb, unsigned w) {
   Value iv = controlOf.lookup(rb.id).counter;
   assert(iv && "a recurrence input in a region with no iteration counter");
-  unsigned w = cast<IntegerType>(rb.counterType).getWidth();
-  return {iv, resize(c.b, c.loc, resolveSource(rb.lbSource), w,
-                     /*isSigned=*/true)};
+  return {resize(c.b, c.loc, iv, w, /*isSigned=*/true),
+          resize(c.b, c.loc, resolveSource(rb.lbSource), w,
+                 /*isSigned=*/true)};
 }
 
 Value DatapathEmitter::firstIterations(const uarch::RegionBlock &rb,
                                        unsigned dist) {
-  auto [iv, lb] = counterAndLb(rb);
+  auto [iv, lb] = counterAndLb(rb, gateWidth(rb, dist <= 1 ? 0 : dist));
   if (dist <= 1)
     return c.icmpEqV(iv, lb);
   // iv < lb + dist*step == !(iv >= lb + dist*step). Signed, as
@@ -165,7 +179,7 @@ Value DatapathEmitter::firstIterations(const uarch::RegionBlock &rb,
 
 Value DatapathEmitter::atIteration(const uarch::RegionBlock &rb,
                                    unsigned iter) {
-  auto [iv, lb] = counterAndLb(rb);
+  auto [iv, lb] = counterAndLb(rb, gateWidth(rb, iter));
   Value at = ivAt(rb, iter, lb);
   return c.icmpEqV(iv, at ? at : lb);
 }

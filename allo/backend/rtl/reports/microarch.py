@@ -320,6 +320,22 @@ class Call:
 
 
 @dataclass(frozen=True)
+class StrideCost:
+    """One address stride register beside the counter: its width and which
+    update cells it builds (a step adder, a carry adder with its select, a
+    wrap compare with its fix adder and select)."""
+
+    width: int
+    step: bool
+    carry: bool
+    wrap: bool
+
+    @classmethod
+    def from_json(cls, d: dict) -> StrideCost:
+        return cls(d["width"], d["step"], d["carry"], d["wrap"])
+
+
+@dataclass(frozen=True)
 class RegionCost:
     """What the cost model needs of one region and no reader does.
 
@@ -329,7 +345,9 @@ class RegionCost:
     mux_inputs: int
     mux_bits: int
     counter_width: int  # the iteration counter this region builds
+    phase_width: int  # the [0, II) phase counter of a pipelined leaf at II>1
     addr_strides: int  # address registers riding beside it
+    strides: tuple[StrideCost, ...] = ()
 
     @classmethod
     def from_json(cls, d: dict) -> RegionCost:
@@ -337,7 +355,9 @@ class RegionCost:
             mux_inputs=d["mux_inputs"],
             mux_bits=d["mux_bits"],
             counter_width=d["counter_width"],
+            phase_width=d.get("phase_width", 0),
             addr_strides=d["addr_strides"],
+            strides=tuple(StrideCost.from_json(s) for s in d.get("strides", ())),
         )
 
 

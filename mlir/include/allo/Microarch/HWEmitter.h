@@ -430,9 +430,14 @@ struct DatapathEmitter {
   /// The single iteration that reads identity \p iter: \p rb's counter at
   /// `lb + iter*step`. The same kind of level as `firstIterations`.
   Value atIteration(const uarch::RegionBlock &rb, unsigned iter);
-  /// \p rb's counter and its lower bound, at the counter register's width.
-  std::pair<Value, Value> counterAndLb(const uarch::RegionBlock &rb);
-  /// The counter value \p rb's n-th iteration holds, `lb + n*step` at that
+  /// \p rb's counter and its lower bound, resized to \p w bits.
+  std::pair<Value, Value> counterAndLb(const uarch::RegionBlock &rb,
+                                       unsigned w);
+  /// The width a `lb + n*step` gate compares at: the counter register's own,
+  /// or wider where a narrowed runtime-bound counter's hull cannot absorb the
+  /// offset (`RegionBlock::counterHull`).
+  unsigned gateWidth(const uarch::RegionBlock &rb, unsigned n);
+  /// The counter value \p rb's n-th iteration holds, `lb + n*step` at \p lb's
   /// width; null for n == 0, which is \p lb itself.
   Value ivAt(const uarch::RegionBlock &rb, unsigned n, Value lb);
   /// One cone \p r of this access's address as hardware at \p width: a

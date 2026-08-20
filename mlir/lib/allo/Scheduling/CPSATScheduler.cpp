@@ -1460,8 +1460,11 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                   (allocates || !choices.empty() || !span.regs.empty() ||
                    span.device.pulsePrice());
   if (!areaMode && !allocates && choices.empty() &&
-      floorDrain >= span.drainOf(prob))
+      floorDrain >= span.drainOf(prob)) {
+    // The floor proves the heuristic's drain minimal with nothing to solve.
+    prob.telemetry.proven = true;
     return success();
+  }
 
   // Horizon: the whole region laid out end to end (each op after the previous
   // one's end at its longest realization, its occupancy window, plus a spare
@@ -1576,6 +1579,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // The heuristic's schedule stands: this solve came back with none.
   auto giveUp = [&](const CpSolverResponse &response) {
     reportUnsolved(prob, response, opts.budget);
+    prob.telemetry.fallback = true;
+    prob.telemetry.budgetExhausted = true;
     applyFallbackAllocation(prob, span.device, opts.allocate, /*ii=*/0,
                             cycleTime);
     return success();
@@ -1632,6 +1637,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
            "of "
         << heuristicDrain << ": area " << SolutionIntegerValue(*pick, area)
         << ", drain " << SolutionIntegerValue(*pick, drain);
+    prob.telemetry.proven =
+        areaProven && second.status() == CpSolverStatus::OPTIMAL;
+    prob.telemetry.budgetExhausted = !prob.telemetry.proven;
     return ship(*pick);
   }
 
@@ -1691,6 +1699,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
            "commits at cycle "
         << finalDrain << " instead of " << heuristicDrain;
 
+  prob.telemetry.proven =
+      spanProven && second.status() == CpSolverStatus::OPTIMAL;
+  prob.telemetry.budgetExhausted = !prob.telemetry.proven;
   return ship(pick);
 }
 
@@ -2323,6 +2334,13 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                        : "Exact scheduling found nothing shorter than the "
                          "heuristic's schedule at II=")
           << greedyII << "; keeping it";
+    prob.telemetry.fallback = true;
+    // Every interval decided and none beat the incumbent: the heuristic's
+    // schedule is thereby proven optimal.
+    prob.telemetry.proven = !exhaustedAt;
+    prob.telemetry.budgetExhausted = exhaustedAt.has_value();
+    if (exhaustedAt)
+      prob.telemetry.exhaustedAtII = (int64_t)*exhaustedAt;
     applyFallbackAllocation(prob, span.device, opts.allocate, greedyII,
                             cycleTime);
     return success();
@@ -2392,6 +2410,11 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
         << "Exact scheduling ran out of budget at II=" << *exhaustedAt
         << " without deciding it, so the search stopped there; what it kept is "
            "the best of the intervals it did decide";
+  prob.telemetry.proven =
+      bestAttempt.spanProven && bestAttempt.areaProven && !exhaustedAt;
+  prob.telemetry.budgetExhausted = !prob.telemetry.proven;
+  if (exhaustedAt)
+    prob.telemetry.exhaustedAtII = (int64_t)*exhaustedAt;
   return finishSchedule(prob, cycleTime, opts.regFloor);
 }
 

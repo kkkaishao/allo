@@ -136,15 +136,25 @@ struct CallReport {
   unsigned handshake = 0, broadcast = 0, timed = 0;
 };
 
+/// One address stride register beside the counter: its width and which update
+/// cells it builds (a step adder, a carry adder with its select, a wrap
+/// compare with its fix adder and select).
+struct StrideCost {
+  unsigned width = 0;
+  bool step = false, carry = false, wrap = false;
+};
+
 /// What the cost model needs of one region and no reader does. Grouped apart
 /// for the same reason as `MemCost`.
 struct RegionCost {
   // Mux totals as the allocation charges them: inputs across every mux, and
   // 2:1-equivalent bits, since a k:1 mux costs about (k-1) 2:1 muxes per bit.
   unsigned muxInputs = 0, muxBits = 0;
-  // The region's control plane: the iteration counter's width, and the address
-  // strides riding beside it.
-  unsigned counterWidth = 0, addrStrides = 0;
+  // The region's control plane: the iteration counter's width, the phase
+  // counter's (a pipelined leaf at II>1), and the address strides riding
+  // beside them.
+  unsigned counterWidth = 0, phaseWidth = 0, addrStrides = 0;
+  std::vector<StrideCost> strides;
 };
 
 /// One step of a combinational path: what the signal passes through and what it
