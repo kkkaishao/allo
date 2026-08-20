@@ -219,13 +219,11 @@ public:
   double combMarginalDelay(OpKind kind, int64_t width) const;
 
   /// \ref combDelay where the row measured \p width, nullopt above its last
-  /// measured point or with no row at all: the safe form for a caller probing
-  /// candidate widths rather than pricing a scheduled structure.
+  /// measured point or with no row at all.
   std::optional<double> measuredCombDelay(OpKind kind, int64_t width) const;
 
-  /// The widest integer multiplier the device offers as a pipelined IP row:
-  /// the width up to which a reciprocal's product can ride registered stages
-  /// instead of a combinational multiply. 0 with no such row.
+  /// The widest integer multiplier the device offers as a pipelined IP row,
+  /// 0 with no such row.
   unsigned maxPipelinedMulWidth() const;
 
   /// The narrowest integer width of at least \p width an advanced row
@@ -234,7 +232,7 @@ public:
                                     unsigned width) const;
 
   /// Whether an advanced row declares mnemonic \p mnem at exactly \p args ->
-  /// \p results: what a pattern asks before minting an op with that name.
+  /// \p results.
   bool hasAdvancedRow(llvm::StringRef mnem, TypeRange args,
                       TypeRange results) const;
 
@@ -556,14 +554,14 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
 /// no select between them and the emitter builds one only where the drivers
 /// differ.
 ///
-/// Which operations join a class. `Static` is the exact path: an operation
-/// with selection candidates joins no class, since a class groups one STATIC
-/// identity and the solve may move the operation off it; the exact model
-/// re-composes such operations into the class of whichever row they decide
-/// (its shared classes), merging with the static members this declares.
-/// `Selecting` is the exact FALLBACK: only those skipped operations, grouped
-/// at the library's own pick, which is what a solve that decided nothing
-/// realizes them as.
+/// Which operations join a class. `All` declares every operation at the
+/// library's own pick. `Static` skips an operation with selection candidates,
+/// since a class groups one static identity and the solve may move the
+/// operation off it; the exact model re-composes such operations into the
+/// class of whichever row they decide, merging with the static members this
+/// declares. `Selecting` takes only those skipped operations, grouped at the
+/// library's own pick, which is what a solve that decided nothing realizes
+/// them as.
 enum class AllocationScope { All, Static, Selecting };
 
 template <class ProblemT>

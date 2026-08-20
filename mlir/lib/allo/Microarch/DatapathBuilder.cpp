@@ -466,9 +466,7 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
 void DatapathBuilder::recordForwards() {
   for (auto &[mid, load, ids] : fwdLoads) {
     MemUnit &m = dp.mems[mid];
-    // The scheduler's own eligibility gate: an addressed, unskewed array whose
-    // write commits in one cycle into a registered read, both accesses in one
-    // region (one timeline, one stall shell).
+    // The scheduler's eligibility gate, restated as build invariants.
     assert(!m.scattered && !m.isRom && !m.skewed &&
            "forwarding was decided for an array whose realization has no RAM "
            "port to shadow");

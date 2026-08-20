@@ -949,10 +949,9 @@ def test_selection_reranks_at_the_derated_period():
     assert add_deep.symbol not in _impls(sched)
 
 
-# A row's warranted period gates it exactly like its boundary cones: the
-# depth-2 float adder is a candidate only below its own floor, and a clock past
-# every row's warranty derates to the fastest period a row is warranted at,
-# where selection re-ranks.
+# A row's warranted period gates it like its boundary cones: the depth-2 float
+# adder is a candidate only below its own floor, and a clock past every row's
+# warranty derates to the fastest warranted period, where selection re-ranks.
 def test_selection_honors_a_rows_warranted_period():
     @kernel
     def axpy(x: f32[8], y: f32[8]):
@@ -1871,12 +1870,10 @@ def test_narrow_demanded_bits_wraps_exactly():
     assert int(r.result) == wrapped
 
 
-# A loop-carried integer scalar spans its recurrence envelope, not its
-# declared carrier: a guarded counter stepping by 2 over 50 trips stays within
-# [0, 100], an argmax-style position within the IV's range. The survivor
-# register and the whole carried cone are built at that width, while a
-# data-stepped accumulator (its increment loaded from memory) has no envelope
-# and keeps the carrier.
+# A loop-carried integer scalar is built at its recurrence envelope, not at its
+# declared carrier: a counter stepping by 2 over 50 trips stays within [0, 100]
+# and an argmax-style position within the IV's range. A data-stepped
+# accumulator has no envelope and keeps the carrier.
 def test_a_carried_scalar_narrows_to_its_recurrence_envelope():
     N = 50
 
@@ -2661,11 +2658,10 @@ def test_an_apply_residue_builds_the_reciprocal():
     assert np.array_equal(out, (np.arange(16) * 3 + 2) % 5)
 
 
-# A multiply whose only consumer is one add is the device's fused core where a
-# `muladd` row exists: the pair becomes `allo.muladd` and binds the row, so the
-# multiply-to-add hop never crosses the fabric. A width no row declares stays
-# unfused; so does a multiply with a second consumer, or a constant factor
-# (NAF's territory).
+# A multiply whose only consumer is one add becomes `allo.muladd` and binds the
+# device's fused row where one exists, so the multiply-to-add hop never crosses
+# the fabric. A width no row declares stays unfused, as does a multiply with a
+# second consumer or a constant factor, which recodes to shift-adds instead.
 def test_a_multiply_feeding_one_add_fuses_onto_the_device_row():
     @kernel
     def mac(A: i32[16], B: i32[16], C: i32[16], out: i32[16]):

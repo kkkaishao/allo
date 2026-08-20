@@ -56,8 +56,8 @@ class LatencyModelWarning(UserWarning):
 
 class RealizationWarning(UserWarning):
     """A scaffolded project instantiates an extern module its device cannot
-    build; it synthesizes as a black box until an implementation is supplied.
-    Its own class so a test run can filter it to an error."""
+    build, so it synthesizes as a black box until an implementation is
+    supplied. Its own class so a test run can filter it to an error."""
 
 
 # pylint: disable-next=too-many-instance-attributes
@@ -194,8 +194,8 @@ class RTL(Backend[P, R]):
             # the trivial binding keeps one unit per operation.
             allocate = self.binding != "trivial"
             if self._sched_opts.O in ("freq", "wall"):
-                # The clock is an output: the sweep probes candidate periods
-                # on fresh copies, and the handle follows the winner.
+                # The clock is an output: the sweep probes candidates on
+                # fresh copies and the handle follows the winner.
                 if self._sched_opts.O == "freq":
                     self._dcp_ir, self._schedule_result = sweep_freq(
                         self.top,
@@ -206,8 +206,8 @@ class RTL(Backend[P, R]):
                         self._device.reg_delay_ns,
                     )
                 else:
-                    # The slowest clock any operator row is built for caps the
-                    # wall ladder: past the deepest row nothing new unlocks.
+                    # The slowest period any operator row is built for caps
+                    # the wall ladder.
                     reg = self._device.reg_delay_ns
                     cap = max(
                         (
@@ -245,10 +245,10 @@ class RTL(Backend[P, R]):
         return self._schedule_result
 
     def _set_clock(self, period_ns: float) -> None:
-        """Move the operating clock the design ships at; ``freq_mhz``, the
-        published options and so the QoR's ``clock_mhz`` all follow, and cosim
-        drives the new clock. Nothing is recompiled: the schedule's model
-        period, which the chains were cut to, stays what it was."""
+        """Move the operating clock the design ships at. ``freq_mhz``, the
+        published options and the QoR's ``clock_mhz`` follow, and cosim drives
+        the new clock. Nothing is recompiled: the schedule's model period,
+        which the chains were cut to, stays what it was."""
         self.freq_mhz = 1000.0 / period_ns
         self._cycle_time = period_ns
         result = self._schedule_result
@@ -313,8 +313,8 @@ class RTL(Backend[P, R]):
             # The boundary document verbatim, for `scaffold_project` to write.
             self._manifest = envelope["interfaces"]
             self._hw_ir = work
-            # The period policies' last step: collect the packing slack the
-            # sweep's winner left by clocking at the realized critical path.
+            # Last step of the period policies: clock at the realized
+            # critical path.
             if self._sched_opts.O in ("freq", "wall"):
                 self.tighten_clock()
         return self._hw_ir
@@ -364,15 +364,14 @@ class RTL(Backend[P, R]):
         return estimate(self.report, self._device)
 
     def tighten_clock(self) -> float:
-        """Clock the compiled design at its realized critical path, recompiling
-        nothing: the emitted structures hold their longest model path (the
-        QoR's ``fmax``) by construction, so the operating clock moves there,
-        with ``clock_margin`` withheld on top of it. Honest in both directions:
-        a design whose paths came in under the target speeds up, one that
-        missed it slows down. A bound row's warranted period caps the move:
-        internal pipeline stages are not paths the estimator can see. Returns
-        the new ``freq_mhz``, which ``cosim`` then drives. Runs by itself at
-        compile under ``O="freq"`` and ``O="wall"``."""
+        """Clock the compiled design at its realized critical path (the QoR's
+        ``fmax``), recompiling nothing, with ``clock_margin`` withheld on top.
+        The clock moves in both directions: a design whose paths came in under
+        the target speeds up, one that missed it slows down. A bound operator
+        row's warranted period caps the move, since its internal pipeline
+        stages are not paths the estimator sees. Returns the new ``freq_mhz``,
+        which ``cosim`` then drives. Runs by itself at compile under
+        ``O="freq"`` and ``O="wall"``."""
         period = 1000.0 / self.estimation.fmax
         floors = {o.symbol: o.timing.min_period_ns for o in self._device.operators}
         bound = {op.impl for m in self.interfaces.values() for op in m.operators}

@@ -215,13 +215,13 @@ SCATTER_STORAGE = "register"
 #: row is that core's achieved Fmax in MHz, a record of the characterization run
 #: and not an input to the cost model. Several rows under one archetype declare
 #: several cores for the library to choose between. A row is warranted at the
-#: part's default clock unless ``min_period_ns`` declares its own floor: below
-#: the default it is the fastest clock a routed design has closed with the row
-#: inside, above the default it marks a core only a slower clock holds, derated
-#: from the wrapper measurement. The latency-1 rows are combinational up to
-#: their output register and carry the measured cone in ``in_delay_ns``, which
-#: gates them the same way. ``lut`` is logic sites only: the shift registers a
-#: core holds internally are split out as ``slicem_lut``.
+#: part's default clock unless ``min_period_ns`` declares its own floor, the
+#: fastest clock a routed design has closed with the row inside; a floor above
+#: the default period is derated from the wrapper measurement rather than
+#: measured in context. The latency-1 rows are combinational up to their output
+#: register and carry the measured cone in ``in_delay_ns``, which gates them
+#: the same way. ``lut`` counts logic sites only: the shift registers a core
+#: holds internally are split out as ``slicem_lut``.
 IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ip.fadd: (
         IPRow(
@@ -247,9 +247,9 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
         IPRow(2, {"lut": 382, "ff": 75, "carry8": 17}, min_period_ns=4.09),  # 326
         IPRow(1, {"lut": 392, "ff": 33, "carry8": 17}, in_delay_ns=4.51),  # 203
     ),
-    # The 2-cycle multiply measures 376 MHz here and routes below 300 in a
-    # module (taking it cost dft, symm, atax and bicg the clock), so its floor
-    # derates the wrapper number and admits it only below the default clock.
+    # The 2-cycle multiply measures 376 MHz standalone but routes below 300 MHz
+    # inside a module, so its floor derates the wrapper number and admits the
+    # row only below the default clock.
     ip.fmul: (
         IPRow(
             4,
@@ -260,9 +260,8 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
         IPRow(2, {"lut": 81, "ff": 51, "dsp": 2, "carry8": 8}, min_period_ns=3.55),  # 376
         IPRow(1, {"lut": 79, "ff": 33, "dsp": 2, "carry8": 8}, in_delay_ns=3.37),  # 264
     ),
-    # The 10-cycle divide measures the same frequency as the 12 beside it, two
-    # cycles shorter and no dearer, so the pick takes it at this grade; the
-    # deeper row stays declared for a clock the shorter one cannot hold.
+    # The 10-cycle divide matches the 12-cycle row's frequency at no more area.
+    # The deeper row stays declared for clocks the shorter one cannot hold.
     ip.fdiv: (
         IPRow(
             12,
@@ -333,10 +332,9 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ),
     ip.imul32: (
         IPRow(2, {"ff": 32, "dsp": 3}, min_period_ns=2.94),  # 341
-        # The 1-cycle row is a combinational 3-DSP cascade up to its output
-        # register. Routed in context the cone runs 3.0 ns (2.9 of DSP logic
-        # plus route), so the row is honestly unfit at 300 MHz and the 2-cycle
-        # row above takes over; it stays available at lower targets.
+        # A combinational 3-DSP cascade up to its output register: routed in
+        # context the cone runs 3.0 ns (2.9 ns of DSP logic plus route), which
+        # rules the row out at 300 MHz and leaves it to lower targets.
         IPRow(1, {"ff": 32, "dsp": 3}, in_delay_ns=3.0),  # 320
     ),
     ip.imul64: IPRow(6, {"slicem_lut": 64, "ff": 81, "dsp": 10}),  # 333
@@ -407,10 +405,9 @@ IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
     # needs a deeper multiply, so most of its integer arithmetic is a row of
     # its own.
     GRADE_2LV: {
-        # The low-voltage grade's float ladder is slower throughout: each
-        # archetype keeps its depth at the default clock, the shallow rows
-        # carry correspondingly higher floors, and only the double multiply
-        # moves.
+        # The low-voltage float ladder is slower throughout: each archetype
+        # keeps its depth at the default clock and the shallow rows carry
+        # correspondingly higher floors.
         ip.fadd: (
             IPRow(
                 7, {"lut": 257, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry8": 10}
@@ -526,10 +523,9 @@ IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
 
 
 #: SLICEM sites one bit of a 64-deep distributed RAM occupies for one instance,
-#: a write port and one addressed read. A further read is a further instance
-#: (`inst_reads` below), so the row prices a single copy: measured 640 LUT as
-#: memory at 1024x32 with one read, and the two-read DUT series (80 / 320 / 640
-#: at 64 / 256 / 512 x 32) lands on exactly twice this.
+#: meaning a write port and one addressed read. Measured 640 LUT as memory at
+#: 1024x32 with one read; the two-read series (80 / 320 / 640 sites at 64 /
+#: 256 / 512 x 32) lands on exactly twice this.
 LUTRAM_SITES_PER_BIT = 1.25
 
 _STORAGE = {
@@ -706,8 +702,7 @@ def build(part: Part) -> Device:
             operator = core.retimed(
                 row.latency,
                 row.in_delay_ns,
-                # A row is warranted at the clock it was characterized to
-                # close unless it declares its own floor.
+                # A row defaults to the clock it was characterized at.
                 row.min_period_ns
                 if row.min_period_ns is not None
                 else 1000.0 / part.grade.default_freq_mhz,
@@ -724,7 +719,7 @@ def build(part: Part) -> Device:
         d.set_mux_delay(timing.mux, timing.mux_w)
     d.set_chain_uses(_chain_uses(res))
     d.set_chain_uses_norst(_chain_uses_norst(res))
-    # Routed bed designs pack 1.22-1.25 LUT instances per occupied site.
+    # Routed designs pack 1.22 to 1.25 LUT instances per occupied site.
     d.set_lut_packing(0.80)
     d.set_register_floor(timing.reg_ns)
     d.set_default_frequency(part.grade.default_freq_mhz)

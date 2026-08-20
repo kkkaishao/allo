@@ -181,11 +181,10 @@ class UnhonoredDirective:
 
 @dataclass(frozen=True)
 class SweepPoint:
-    """One probed operating period on the ``(period, span)`` curve a period
-    sweep walks. ``achieved_ns`` is the period after a derate raised the model
-    period; a candidate the device holds comes back unchanged."""
+    """One probed point on the ``(period, span)`` curve a period sweep walks.
+    ``achieved_ns`` is the period after a derate raised the model period."""
 
-    cycle_ns: float  # the candidate operating period the probe was asked for
+    cycle_ns: float  # the operating period the probe was asked for
     achieved_ns: float  # the operating period the probe came back holding
     latency: int | None  # the top kernel's composed span at this period
     latency_is_bound: bool
@@ -205,8 +204,8 @@ class ScheduleResult:
     #: period every device operator fits when the target was unreachable and
     #: the scheduler lowered the clock. Emission and QoR price against this.
     cycle_ns: float | None = None
-    #: the ``(period, span)`` curve a period sweep probed before settling on
-    #: this schedule, tightest candidates last. Empty outside ``O="freq"``.
+    #: the ``(period, span)`` curve the period sweep probed before settling on
+    #: this schedule, tightest last. Empty outside ``O="freq"`` and ``O="wall"``.
     sweep: tuple[SweepPoint, ...] = ()
 
     @classmethod

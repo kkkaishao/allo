@@ -16,9 +16,8 @@ using namespace circt;
 namespace mlir::allo::uarch {
 
 // Whether a schedule-paced region launches through the start-cycle bypass
-// (`kPipelinedBoundary`'s zero arm): rigid and counted. One predicate for the
-// controller and the scaled counters, which must bypass exactly when the
-// counter itself does.
+// (`kPipelinedBoundary`'s zero arm). The scaled counters must bypass exactly
+// when the counter does.
 static bool bypassesStart(const Terminator &term, const StallShell &sh) {
   return term.kind == Terminator::Kind::Counted && !sh;
 }
@@ -106,14 +105,13 @@ llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
 //     phase counter (in-flight drain via the valid chain);
 //   * while (II==1, conditional): a non-speculative flushing pipeline,
 //     terminated by the condition going false.
-// A rigid counted region issues its first iteration on `start` itself: the
+// A rigid counted region issues its first iteration in the `start` cycle: the
 // counter and phase read their reload values through a start-cycle bypass, so
-// the region arms at zero cost (`kPipelinedBoundary`). A while must first
-// latch the iter-args its condition reads, and an elastic region may not
-// issue on a pulse it cannot hold, so both keep the registered launch through
-// `running`; neither composes a static span, so the model never describes
-// them. The counter advances on issue, feeding the counted bound test and the
-// datapath's iteration-0 recurrence-init injection. A conditional terminator
+// the arm cost is zero (`kPipelinedBoundary`). A while must first latch the
+// iter-args its condition reads, and an elastic region may not issue on a
+// pulse it cannot hold, so both launch a cycle later through `running`. The
+// counter advances on issue, feeding the counted bound test and the datapath's
+// iteration-0 recurrence-init injection. A conditional terminator
 // is non-speculative (II >= t_cond, so no doomed iteration issues and nothing
 // squashes) and stall-free (fixed-latency memory, no FIFO).
 RegionControl ControlEmitter::emitPipelined(unsigned region,
@@ -156,10 +154,9 @@ RegionControl ControlEmitter::emitPipelined(unsigned region,
     // The phase is the region's time base rather than an issue gate: it
     // free-runs with the chains folded onto it, so a frozen cycle holds them
     // together and the cadence resumes where it paused. A pass deferred by a
-    // starved input leaves the phase running, which keeps that pass a whole
-    // `ii` late and the modulo reservation intact. Advancing from the
-    // effective phase re-times the cadence at the bypassed start; the
-    // registered families reload on `start` instead.
+    // starved input stays a whole `ii` late, keeping the modulo reservation
+    // intact. Advancing from the effective phase re-times the cadence at the
+    // bypassed start; the registered families reload on `start`.
     phaseNext.setValue(
         chained ? c.mux(sh ? sh.chainEnable : c.t1, phaseAdv, phase)
                 : c.mux(term.gateStart(c, start), pz,
@@ -178,8 +175,8 @@ RegionControl ControlEmitter::emitPipelined(unsigned region,
   // register.
   auto iterNext = c.bb.get(term.lb.getType());
   Value ivReg = c.reg(iterNext, term.lb, RegRole::Counter);
-  // Label the counter REGISTER after the source loop variable; the bypass mux
-  // below stays anonymous, as the counted done-driven controller's does.
+  // Label the counter register after the source loop variable; the bypass mux
+  // below stays anonymous.
   nameValue(ivReg, counterName.empty() ? regionSignal(region, "iv")
                                        : std::string(counterName));
   Value iv = chained ? c.mux(first, term.lb, ivReg) : ivReg;
@@ -326,7 +323,7 @@ RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
       topLevel ? kAcyclicTopBoundary : kAcyclicNestedBoundary;
   Value armed = c.delayValid(start, boundary.arm, StallShell{});
   if (!sh) {
-    // At zero arm cost `armed` IS the caller's start wire, which may already
+    // At zero arm cost `armed` is the caller's start wire, which may already
     // be named for its first role (a container's `fire`); keep that name.
     if (!isNamedValue(armed))
       nameValue(armed, regionSignal(region, "issue"));

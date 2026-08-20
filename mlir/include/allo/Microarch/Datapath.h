@@ -465,12 +465,10 @@ struct MemUnit {
   };
   llvm::SmallVector<Access, 2> accesses;
 
-  /// One store->load forwarding the schedule leans on: the two accesses can
-  /// issue in the same cycle, where the RAM would still hand the load the old
-  /// word. The emitter compares their addresses at issue, registers the select
-  /// and the store's datum to the read latency, and muxes them into the load's
-  /// data out. Carried by the dcp ops (`fwd` / `fwd_id`) and resolved to
-  /// access indices by the builder.
+  /// One store->load forwarding pair: the two accesses may issue in the same
+  /// cycle, where the RAM would still return the old word. The emitter
+  /// compares their addresses at issue and muxes the store's datum into the
+  /// load's data out, delayed to the read latency.
   struct Forward {
     unsigned load = 0, store = 0; // indices into `accesses`
   };

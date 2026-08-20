@@ -160,8 +160,8 @@ bool allIntegerOperands(Operation *op) {
 
 // The significant bits \p op's operands actually carry: an extension counts
 // its source (a zero-extension plus the sign bit it pins), a constant its own
-// significant bits, anything else its full width. What gates a `fed_width`
-// row: the measured pruning only happens where synthesis sees the extensions.
+// significant bits, anything else its full width. Gates a `fed_width` row,
+// which holds only where synthesis sees the extensions.
 unsigned fedWidthOf(Operation *op) {
   unsigned fed = 1;
   for (Value v : op->getOperands()) {
@@ -244,8 +244,8 @@ bool needsIP(Operation *op) {
   case OpKind::FCastF:
     return true;
   case OpKind::Unknown:
-    // `allo.muladd` exists only because a device row matched it, so like a
-    // math op it has no combinational fallback.
+    // `allo.muladd` exists only where a device row matched it, so it has no
+    // combinational fallback.
     return isa<math::MathDialect>(op->getDialect()) || isa<MulAddOp>(op);
   default:
     return false;
@@ -538,8 +538,8 @@ int64_t OperatorLibrary::muxPrice(int64_t sources, int64_t width) const {
 
 int64_t OperatorLibrary::instancePrice(const OperatorIdentity &identity,
                                        int64_t width) const {
-  // Wiring: pricing it as its mnemonic's row would make folding two renames
-  // look like saving a real structure, when it only builds one.
+  // A rename is wiring: pricing it as its mnemonic's row would make folding
+  // two renames look like saving a real structure.
   if (identity.rename)
     return 0;
   const OperatorEntry *e = nullptr;
@@ -760,7 +760,7 @@ OperatorChar OperatorLibrary::characterize(Operation *op,
   // A shift by a literal is wiring, not a shifter, and so is a resize that
   // changes no width. It takes a type name of its own because the problem
   // registers timing per name: sharing the row would make two spellings of that
-  // row disagree. Wiring builds no logic, so it also prices at nothing.
+  // row disagree. It builds no logic, so it prices at nothing.
   if (isZeroDelay(op)) {
     c.timing.typeName = "rename." + c.timing.typeName;
     c.timing.inDelay = c.timing.outDelay = 0.0;

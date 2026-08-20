@@ -471,9 +471,8 @@ bool coalescingCostsADivider(MutableArrayRef<affine::AffineForOp> band) {
         }
         AffineMap coalesced = a->map.replaceDimsAndSymbols(
             dims, syms, next, a->map.getNumSymbols());
-        // A structural question: what decides is whether a division survives
-        // the fold, whatever it is realized as, not how long it takes, so the
-        // delay table is empty.
+        // Only whether a division survives the fold decides this, not how
+        // long it takes, so the delay table is empty.
         auto shape = cast<MemRefType>(a->root.getType()).getShape();
         AddressCost c = addressCost(coalesced, shape, AddressDelays{},
                                     AddressDelays::refWidth);

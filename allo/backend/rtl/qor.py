@@ -138,8 +138,8 @@ class QoR:  # pylint: disable=too-many-instance-attributes
     fmax: float
     fmax_target: float  # MHz, the period the schedule was cut to
     #: MHz the design is clocked at, absent where the compile options are not
-    #: attached. Sits apart from ``fmax_target`` where a clock margin cut the
-    #: chains short of the operating period, or a derate stretched them past it.
+    #: attached. Differs from ``fmax_target`` where a clock margin or a derate
+    #: moved the model period the chains were cut to.
     clock_mhz: float | None
     #: the paths behind ``fmax``, longest first across every module, each
     #: decomposed into the cells the signal passes through.
@@ -232,11 +232,10 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
     """Price ``report``'s structures against ``device``.
 
     Every module the emission built is priced separately: a design with
-    sub-kernels spends its area in all of them. Validated against a routed
+    sub-kernels spends its area in all of them. Measured against a routed
     18-design bed sweep: float-datapath designs land within 1.0x to 1.2x of
-    measured on LUT, FF and state sites, while control-heavy designs still
-    over-charge LUT up to ~2.5x (cones, counters and constant operands priced
-    op by op), so this is fit to COMPARE two schedules and not to quote as a
+    measured LUT, FF and state sites, while control-heavy designs over-charge
+    LUT up to 2.5x, so this compares two schedules rather than quoting a
     utilization figure. Structures with no cost row are reported in
     :attr:`QoR.unmodelled` rather than dropped; the emitter's control glue
     (run/issue/done logic, memory port muxing) is aggregated away rather than
@@ -352,9 +351,9 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                     Utilization.of(price(scatter, (s.depth, s.width))),
                 )
 
-    # The rows count LUT instances; a routed report counts sites after LUT
-    # combining, which is what the device's packing fraction bridges. State
-    # sites do not combine and stay as counted.
+    # Cost rows count LUT instances; a routed report counts sites after LUT
+    # combining, which the device's packing fraction bridges. State sites do
+    # not combine.
     if device.lut_packing != 1.0:
 
         def packed(u: Utilization) -> Utilization:

@@ -465,13 +465,12 @@ def ScalarizeMemoryPass
 
     Second, for the untouched survivors, if the array is small enough (at most
     `maxElements` elements) and a register file buys bandwidth a ported memory
-    cannot give, automatically partition it with `allo.part` so it lowers to
+    cannot, automatically partition it with `allo.part` so it lowers to
     registers rather than a memory whose ports and access latency bound the II.
-    That is the case when every subscript is a constant (the accesses are
-    wires), or when one block issues more than two accesses (an unrolled or
-    pipelined body a dual-ported row cannot serve in a cycle). A rolling loop
-    touching the array once or twice per iteration keeps the priced storage
-    the memory tables select.
+    That holds when every subscript is a constant (the accesses are wires), or
+    when one block issues more than two accesses, which a dual-ported row
+    cannot serve in a cycle. An array touched once or twice per iteration keeps
+    the storage the memory tables select.
   }];
   let dependentDialects = [
     "mlir::affine::AffineDialect", "mlir::memref::MemRefDialect"
@@ -489,9 +488,8 @@ def HoistInvariantReadsPass
     Move a read whose address does not change across a loop's iterations out in
     front of the loop, so the body meets a held register instead of spending a
     memory port on the same word every iteration. An unrolled or pipelined body
-    re-reading a small coefficient array is the motivating shape: the repeated
-    reads bound the initiation interval by port count, while the preloaded
-    values cost one read each ahead of the loop.
+    re-reading a small coefficient array is the shape this targets: the
+    repeated reads bound the initiation interval by port count.
 
     A read moves only when every operand is defined outside the loop, the loop
     provably runs at least once, and the array sees no write and no opaque use
@@ -501,10 +499,9 @@ def HoistInvariantReadsPass
 
     Out of a leaf body, the one the modulo scheduler paces, reads move only
     when their removal lowers the body's port-pressure floor, the widest
-    array's accesses per bank per iteration; a preload that leaves that
-    maximum in place buys no II and would only spend the held registers. A
-    body with loops inside is paced by its children, so an invariant read
-    there always moves and stops being re-issued every sweep.
+    array's accesses per bank per iteration; a preload that leaves that maximum
+    in place buys no II and only spends the held registers. A body with loops
+    inside is paced by its children, so an invariant read there always moves.
   }];
   let dependentDialects = [
     "mlir::affine::AffineDialect", "mlir::memref::MemRefDialect"
@@ -596,16 +593,16 @@ def NarrowDemandedBitsPass
     the algebra). Writing a bit field splices with such a mask on every field
     after the first. A load-bearing mask stays: one overwriting a mid-word
     field stays an AND, and a low mask, being a zero-extended truncation,
-    becomes the resize casts, which are wiring.
+    becomes resize casts, which are wiring.
 
     Values are narrowed forward as well. An interval walk over constants,
     constant loop bounds and the monotone arith transfers bounds each value,
     and a ring or bitwise operator whose bound needs fewer bits than its
-    carrier is rebuilt at that width behind resize casts, which are wiring. In
-    particular an `index` operator, otherwise built at the one width the
-    datapath gives `index`, enters the integer domain at its value's width: a
-    product of two loop counters under a `% 2^k` mask ends as a k-bit fabric
-    multiply instead of an `index`-wide multiplier IP.
+    carrier is rebuilt at that width behind resize casts. In particular an
+    `index` operator, otherwise built at the one width the datapath gives
+    `index`, enters the integer domain at its value's width: a product of two
+    loop counters under a `% 2^k` mask ends as a k-bit fabric multiply instead
+    of an `index`-wide multiplier IP.
   }];
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
@@ -628,26 +625,24 @@ def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
     injection and before scheduling.
 
     A read of a constant table (an initialized, never-written `memref.global`)
-    at literal indices folds to the element it names: after unrolling, a
-    filter's coefficient reads all take this shape, and the fold is what lets
-    a multiply see its literal factor. A table some variable read still
-    addresses keeps its storage for those reads.
+    at literal indices folds to the element it names, which is what lets a
+    multiply see its literal factor. A table that variable reads still address
+    keeps its storage for those reads.
 
-    Under `expand-const-arith`, a `divsi`/`divui`/`remsi`/`remui` by a
-    constant that is not a power of two is reduced to a reciprocal multiply
-    and shift, a signed one with the sign carried around the magnitude's
-    multiply. An index op expands regardless: it carries no width for an IP
-    signature to match, so it would otherwise be priced as a full
-    combinational divider, one operator no register can split. A typed op has
-    a divider IP to fall back on, so it expands only where the product
-    multiply fits the clock period stated in `period-ns`, and keeps the IP
-    everywhere else. Under the same flag, a `muli` by a literal whose
-    non-adjacent form takes at most three add/subs recodes into that
-    shift-add network, exact modulo the result width for either sign; the
-    shifts are by literals and so are wiring. A wider factor keeps its
-    multiplier, which a DSP slice serves better than a deep adder tree. The
-    pipeline sets the flag only on its second run: before subscripts are
-    raised to affine maps, arithmetic under an access still has the chance to
+    Under `expand-const-arith`, a `divsi`/`divui`/`remsi`/`remui` by a constant
+    that is not a power of two is reduced to a reciprocal multiply and shift, a
+    signed one carrying the sign around the magnitude's multiply. An index op
+    expands regardless: it carries no width for an IP signature to match, so it
+    would otherwise be priced as a full combinational divider, one operator no
+    register can split. A typed op has a divider IP to fall back on, so it
+    expands only where the product multiply fits the clock period stated in
+    `period-ns`, and keeps the IP everywhere else. Under the same flag, a
+    `muli` by a literal whose non-adjacent form takes at most three add/subs
+    recodes into that shift-add network, exact modulo the result width for
+    either sign; the shifts are by literals and so are wiring. A wider factor
+    keeps its multiplier, which a DSP slice serves better than a deep adder
+    tree. The pipeline sets the flag only on its second run, since before
+    subscripts are raised to affine maps arithmetic under an access can still
     become a carried register digit or part of an affine map.
   }];
   let options = [Option<"expandConstArith", "expand-const-arith", "bool", "false",

@@ -117,9 +117,9 @@ def verify_one(
 ) -> dict:
     """Compile one variant under one binding, cosim it and compare.
 
-    ``binding`` is the operator-sharing policy and the axis this probe exists
-    for; ``cycles`` overrides the derived simulation budget. ``objective`` is
-    the exact solver's optimization direction (the ``O`` knob)."""
+    ``binding`` is the operator-sharing policy; ``cycles`` overrides the
+    derived simulation budget; ``objective`` is the exact solver's
+    optimization direction (the ``O`` knob)."""
     from allo.backend.rtl import LatencyModelWarning
     from benchmark.spec import find
 

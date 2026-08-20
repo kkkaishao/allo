@@ -52,8 +52,8 @@ class Timing:
     pipelined: bool
     # pipelining style: free running, elastic, or clock enable
     style: Literal["free", "elastic", "ce"] | None = None
-    # least clock period (ns) the core's internal stages are warranted at;
-    # 0 claims nothing and leaves the boundary cones as the only gate
+    # least clock period (ns) the core's internal stages hold; 0 claims
+    # nothing and leaves the boundary cones as the only gate
     min_period_ns: float = 0.0
 
 
@@ -191,7 +191,7 @@ class OperatorIP(IP[P, R]):
         )
         self.optype = optype
         # Restricts the row to ops whose operands carry no more significant
-        # bits: the same core measured with pruned, extension-fed inputs.
+        # bits, the core having been measured with extension-fed inputs.
         self.fed_width = fed_width
         # The readable base of the symbol, not what makes it unique. Defaults
         # to the kind's own string.

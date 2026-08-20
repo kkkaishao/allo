@@ -176,8 +176,8 @@ protected:
 
   virtual Problem &getProblem() = 0;
   /// The problem as the resource layer sees it, where the forwarded-edge set
-  /// lives; set by the concrete schedulers, null only for the resource-free
-  /// cyclic rung, which nothing instantiates on its own.
+  /// lives; set by the concrete schedulers, null only on the resource-free
+  /// cyclic rung.
   OccupancyProblem *occupancy = nullptr;
   /// The latency a dependence separates its endpoints by: its source's, or
   /// zero for a forwarded store->load edge.

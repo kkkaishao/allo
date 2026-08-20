@@ -226,7 +226,7 @@ def measure_one(
     unit per op) or ``"auto"``, the binding the scheduler implies; the recorded
     row carries the resolved name. ``objective`` is the exact solver's
     optimization direction (the ``O`` knob); the heuristic ignores it.
-    ``area_slack`` widens the area solve's span leash by that fraction."""
+    ``area_slack`` widens the area solve's span limit by that fraction."""
     bench = _load(key)
     out: dict = {
         "key": key,

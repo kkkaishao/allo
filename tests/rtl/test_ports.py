@@ -340,8 +340,8 @@ def test_internal_signal_names():
         for i in range(16):
             # `buf` is combinational and the multiply beside it is a DSP core,
             # so `buf` waits for it. That wait is the delay tap named below.
-            # A subtract, so the pair stays a core plus an adder: an add here
-            # would fuse onto the muladd row and leave no wait to name.
+            # A subtract keeps the pair a core plus an adder; an add would
+            # fuse onto the muladd row and leave no wait to name.
             buf: i32 = X[i] + a
             Z[i] = buf - Y[i] * a
 

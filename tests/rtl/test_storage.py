@@ -1091,7 +1091,7 @@ def test_constant_rom_cosim():
 
 def test_a_padded_constant_table():
     # The non-power-of-two ROM edge case: the `hw.aggregate_constant` needs
-    # spare fields, and the padding must land PAST the real elements (a
+    # spare fields, and the padding must land past the real elements (a
     # hw.array indexes element 0 as its last field, so the initializer is
     # reversed). The indices stay variable on purpose: a literal index folds
     # to the element it names and drops the table outright.
@@ -3085,8 +3085,8 @@ def test_the_auto_partition_threshold_is_a_boundary(depth):
     # A register file with a runtime subscript costs a mux per read and a demux
     # per write, so the element-count threshold is what bounds the area the
     # automatic partition can spend. It has to be a real boundary. Three reads
-    # in one body is what qualifies the array at all: past any ported row's
-    # bandwidth, only the register file serves the block.
+    # in one body is what qualifies the array: past any ported row's bandwidth,
+    # only the register file serves the block.
     if depth == 16:
 
         @kernel
@@ -3121,9 +3121,9 @@ def test_the_auto_partition_threshold_is_a_boundary(depth):
 
 
 def test_a_rolling_small_array_keeps_ported_storage():
-    # One or two touches per iteration is what a dual-ported row serves with
-    # no mux in sight, so a register file would spend its read mux and write
-    # decode on nothing: the array stays on the priced storage tables.
+    # A dual-ported row serves one or two touches per iteration, so a register
+    # file would spend its read mux and write decode on nothing: the array
+    # stays on the priced storage tables.
     @kernel
     def roll(A: i32[16], out: i32[16]):
         buf: i32[16]

@@ -493,9 +493,8 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
     }
     // A mixed pair, one access of this function against a port a child
     // masters: a call's window lies inside its region's span, so different
-    // regions under a serial top hand off exactly as two direct accesses do.
-    // In one region the call runs beside the access, and the pair stays
-    // concurrent.
+    // regions under a serial top hand off as two direct accesses do. Within
+    // one region the call runs beside the access and the pair is concurrent.
     if (a.region == b.region)
       return true;
     return underConcurrent(a.region) || underConcurrent(b.region);

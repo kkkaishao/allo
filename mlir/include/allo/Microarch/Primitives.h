@@ -284,9 +284,8 @@ struct EmitContext {
   /// A while iter-arg's frozen result register: out[t+1] = load ? init :
   /// (advance ? next : out[t]). Frozen once the loop exits, so it holds the
   /// loop's final carried value, or `init` for a zero-iteration loop.
-  /// \p dWire, when given, receives the register's D input: the value the
-  /// register holds at the END of the current cycle, equal to the output on
-  /// any cycle without a latch event. A consumer sampling in the latch cycle
+  /// \p dWire, when given, receives the register's D input: the value held at
+  /// the end of the current cycle. A consumer sampling in the latch cycle
   /// itself reads it in place of the not-yet-settled output.
   Value latchReg(Value init, Value next, Value load, Value advance,
                  RegRole role = RegRole::Survivor, Value *dWire = nullptr);

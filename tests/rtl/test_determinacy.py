@@ -222,10 +222,9 @@ def test_the_latency_oracle_fails_only_the_unsound_direction():
 
 
 # A guard publishes the deeper arm's span as a bound, so the kernel keeps a
-# waitable figure. The bound arithmetic keeps every done-latch cycle, while
-# the hardware advances the enclosing loop on the guard's completion pulse
-# (one cycle each turnover), so a deeper-arm run lands one cycle per
-# iteration under the bound and a skipped run further still.
+# waitable figure. The bound counts every done-latch cycle while the hardware
+# advances the enclosing loop on the guard's completion pulse, so a deeper-arm
+# run lands one cycle per iteration under the bound.
 @needs_verilator
 def test_a_guard_publishes_the_deeper_arms_span_as_a_bound():
     N, M = 8, 4
@@ -260,10 +259,9 @@ def test_a_guard_publishes_the_deeper_arms_span_as_a_bound():
     assert skipped.cycles < taken.cycles  # empty arms complete early
 
 
-# The two guard hand-offs compose within one iteration: a result-less guard
-# hands its successor its completion pulse, and the enclosing container
-# advances on its last child's pulse, latching the carried scalar from the
-# live result wire. Each iteration recovers two of the bound's latch cycles.
+# A result-less guard hands its successor its completion pulse and the
+# enclosing container advances on its last child's pulse, so each iteration
+# runs two latch cycles under the published bound.
 @needs_verilator
 def test_a_result_less_guards_pulse_chains_through_the_iteration():
     N, M = 5, 6
@@ -290,10 +288,9 @@ def test_a_result_less_guards_pulse_chains_through_the_iteration():
     assert np.array_equal(out, A.sum(0))
 
 
-# A result-yielding guard no longer holds its container to the latched done:
-# the advance rides the guard's completion pulse, and the carried scalar
-# latches through the capture D wire, whose datum the arm hand-off rule has
-# already settled. One latch cycle recovered per iteration, under the bound.
+# A result-yielding guard advances its container on the completion pulse and
+# latches the carried scalar through the capture D wire, so each iteration
+# runs one latch cycle under the published bound.
 @needs_verilator
 def test_a_carried_result_rides_the_guards_pulse():
     N, M = 5, 6
@@ -320,9 +317,9 @@ def test_a_carried_result_rides_the_guards_pulse():
     assert out[0] == A.sum()
 
 
-# The self-referential shape: the guard's predicate reads the very scalar the
-# guard yields. The predicate leaf launches a cycle after the pulse-advance,
-# when the iter-arg register has already latched the D-wire value.
+# The guard's predicate reads the scalar the guard itself yields. The
+# predicate leaf launches a cycle after the pulse advance, when the iter-arg
+# register has already latched the D-wire value.
 @needs_verilator
 def test_a_guard_predicate_reads_the_scalar_its_own_pulse_latched():
     N, M = 5, 6

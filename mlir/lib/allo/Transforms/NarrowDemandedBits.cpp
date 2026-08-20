@@ -61,7 +61,7 @@ unsigned bitsOfHull(Hull h) {
   return std::max(bits(h.first), bits(h.second));
 }
 
-/// The walk is a recursion over a DAG, so a modest cap bounds the blowup.
+/// Depth cap on the recursive walk over the value DAG.
 constexpr unsigned kHullDepth = 8;
 
 std::optional<Hull> hullOf(Value v, unsigned depth);
@@ -120,7 +120,7 @@ Hull hullUnion(Hull a, Hull b) {
 
 /// One iteration of a carried value's transfer, decomposed against its own
 /// iter-arg: the value either translates by `delta` or resets into `join`.
-/// Select, min and max return one of their operands, which is what makes the
+/// Select, min and max return one of their operands, which makes the
 /// alternation exact. `trunc` is the narrowest truncation the walk looked
 /// through; the envelope must fit it or the transfer wraps mid-cone.
 struct Step {
@@ -129,15 +129,15 @@ struct Step {
   unsigned trunc = std::numeric_limits<unsigned>::max();
 };
 
-/// Recurrences whose hull is in flight, keyed (loop, result index): a transfer
-/// whose supposedly independent side reads its own (or a coupled) iter-arg
-/// re-enters here and must see unknown rather than recurse forever.
+/// Recurrences whose hull is in flight, keyed (loop, result index). A transfer
+/// side that reads its own or a coupled iter-arg re-enters here and sees
+/// unknown rather than recursing forever.
 thread_local llvm::DenseSet<std::pair<Operation *, unsigned>> inFlightHulls;
 
-/// Decompose \p v as a transfer of iter-arg \p arg. The seam casts the
-/// narrowing rewrites leave behind are value-preserving here: extension
-/// exactly, truncation once `recurrenceHull` has held the envelope against
-/// the narrowest width the walk passed through.
+/// Decompose \p v as a transfer of iter-arg \p arg. The seam casts left behind
+/// by the narrowing rewrites are value-preserving here: extension exactly,
+/// truncation once `recurrenceHull` has held the envelope against the narrowest
+/// width the walk passed through.
 std::optional<Step> stepOf(Value v, Value arg, unsigned depth) {
   if (v == arg)
     return Step{};
@@ -434,7 +434,8 @@ std::optional<Hull> hullOf(Value v, unsigned depth) {
               [&](auto) { return in(0); })
           .Case<arith::ExtUIOp, arith::IndexCastUIOp>(
               [&](auto) -> std::optional<Hull> {
-                // Reinterprets the bits unsigned: exact only proven >= 0.
+                // Reinterprets the bits unsigned: exact only where the input
+                // is proven non-negative.
                 auto x = in(0);
                 if (!x || x->first < 0)
                   return std::nullopt;
@@ -529,7 +530,7 @@ struct DropRedundantMask : OpRewritePattern<arith::AndIOp> {
 // carrier at the hull's width, with resize casts at the seams. The casts are
 // wiring; the operator is built and priced at the width the value spans. An
 // `index` operand enters the integer domain here, which is what lets a
-// truncation reach it at all.
+// truncation reach it.
 struct NarrowFromHull : RewritePattern {
   NarrowFromHull(MLIRContext *ctx)
       : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx) {}
@@ -572,11 +573,10 @@ struct NarrowFromHull : RewritePattern {
 };
 
 // Narrow an affine.for's integer iter-args to their recurrence hulls. The
-// loop's signature is what demands the carrier width: once the carried value
-// crosses the boundary narrow, its survivor register shrinks with it, and the
-// body cone follows through the seam casts and the surrounding patterns. The
-// result hull is the full-trip envelope, a superset of every value the body
-// reads, so it is the register's width.
+// loop's signature demands the carrier width: once the carried value crosses
+// the boundary narrow, its survivor register shrinks with it and the body cone
+// follows through the seam casts. The result hull is the full-trip envelope, a
+// superset of every value the body reads, so it is the register's width.
 struct NarrowIterArgs : OpRewritePattern<affine::AffineForOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -588,9 +588,9 @@ struct NarrowIterArgs : OpRewritePattern<affine::AffineForOp> {
     bool any = false;
     for (OpResult r : fo.getResults()) {
       auto ity = dyn_cast<IntegerType>(r.getType());
-      // A returned or re-yielded result would strand its widening cast in a
-      // span of its own, spending a region boundary on pure wiring; those
-      // keep the carrier.
+      // A returned or re-yielded result keeps the carrier: its widening cast
+      // would be stranded in a span of its own, spending a region boundary on
+      // pure wiring.
       bool escapes = llvm::any_of(r.getUsers(), [](Operation *u) {
         return u->hasTrait<OpTrait::IsTerminator>();
       });
@@ -637,8 +637,8 @@ struct NarrowIterArgs : OpRewritePattern<affine::AffineForOp> {
         continue;
       }
       // The cast goes beside its producer, not at the yield: stranded after
-      // the child loops it would reify as a span of its own and spend a
-      // region boundary on pure wiring.
+      // the child loops it would reify as a span of its own and spend a region
+      // boundary on pure wiring.
       if (Operation *def = v.getDefiningOp(); def && def->getBlock() == body)
         rewriter.setInsertionPointAfter(def);
       else

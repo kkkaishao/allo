@@ -145,8 +145,8 @@ AddressCost mlir::allo::addressCost(AffineExpr e, const AddressDelays &delays,
     }
     // Any other constant is the reciprocal multiply `divConst` builds: the
     // multiplier's shift-adds at the product width, the shift wiring. A
-    // residue adds the divisor's own multiply and the subtract; a ceildiv,
-    // never materialized today, is priced as the pre-biased floordiv.
+    // residue adds the divisor's own multiply and the subtract; a ceildiv is
+    // priced as the pre-biased floordiv.
     if (konst && konst.getValue() > 1 &&
         konst.getValue() < (int64_t(1) << AddressDelays::refWidth)) {
       uint64_t d = static_cast<uint64_t>(konst.getValue());

@@ -91,10 +91,10 @@ bool heldOutside(const RegionBlock &rb, Value v) {
 /// the whole cone reaching it, which is what a fold has to fit inside.
 ///
 /// `checkCombPathsMeetPeriod` stays the authority, and this is the same
-/// recursion read off the ops rather than the Sources it has yet to build. In
-/// particular a shared producer contributes the max over ALL its members'
-/// inputs: the structural path through every mux arm exists whichever slot the
-/// select sits in, and static timing knows no slots.
+/// recursion read off the ops rather than the Sources it has yet to build. A
+/// shared producer contributes the max over every member's inputs: the
+/// structural path through each mux arm exists whichever slot the select sits
+/// in.
 struct ShareCone {
   ShareCone(const Datapath &dp, const RegionBlock &rb,
             const BindingContext &ctx)
@@ -110,8 +110,7 @@ struct ShareCone {
       slack[i] = unitSlack(u, ctx.lib, ctx.cycleTime).value_or(0.0);
       Operation *y = u.repOp();
       // A recurrence identity is re-injected through a select the emitter
-      // builds fold or no fold, so it is the unshared baseline, not an
-      // addition: the emit gate walks it too.
+      // builds fold or no fold, so it counts as the unshared baseline.
       base[i] = fanin[i] = readsRecurrence(rb, y) ? 2 : 1;
       width[i] = std::max<int64_t>(1, combParamWidth(y));
       // One op feeding two operands takes two entries; `added` maxes over them.
@@ -349,8 +348,8 @@ ExactShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
     if (auto solved = solveSharing(problem, assign, rb.op)) {
       // The solve's cone constraint charges each member its own producers,
       // but the built mux is one structure whose every arm is a timed path.
-      // Re-check its plan under the emit gate's recursion and keep the greedy
-      // plan, admitted fold by fold, when a cross-member arm would bust.
+      // Fall back to the greedy plan, admitted fold by fold, when a
+      // cross-member arm would bust it.
       llvm::SmallVector<unsigned> arms(rb.units.size(), 0);
       for (auto [i, r] : llvm::enumerate(*solved))
         arms[r] += readsRecurrence(rb, dp.units[rb.units[i]].repOp()) ? 2 : 1;

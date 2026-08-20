@@ -256,10 +256,9 @@ unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
 }
 
 // Run `regions` in program order, each region starting when its predecessor
-// drains (the first on `start`); returns the last region's done. A conditional
-// predecessor hands its successor its completion pulse directly, a cycle ahead
-// of the latched done: a while's exit trails every commit and iter-arg latch
-// by at least a cycle (`handoffSafe`), so the successor samples settled state.
+// drains (the first on `start`); returns the last region's done. A
+// `handoffSafe` predecessor hands its successor its completion pulse directly,
+// a cycle ahead of the latched done, since its state has already settled.
 Value HWEmitter::sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
                           bool retrig) {
   Value done;
@@ -377,10 +376,9 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
 }
 
 bool HWEmitter::advancesOnPulse(const uarch::RegionBlock &rb) const {
-  // A container composing an exact span keeps its wiring: consumers are
-  // placed against that span, so the hardware may not run ahead of it. A
-  // conditional container, a dynamic trip or any non-static child leaves
-  // every enclosing figure dynamic or a ceiling, and faster stays inside.
+  // A container composing an exact span keeps its wiring: consumers are placed
+  // against that span, so the hardware may not run ahead of it. A conditional
+  // container, a dynamic trip or a non-static child yields only a ceiling.
   bool exactSpan =
       !rb.conditional && rb.tripCount &&
       llvm::all_of(rb.children, [&](uarch::RegionId c) {
@@ -388,12 +386,10 @@ bool HWEmitter::advancesOnPulse(const uarch::RegionBlock &rb) const {
       });
   if (exactSpan)
     return false;
-  // The last child must hand its results over safely at the pulse: a
-  // call-free leaf exposes each result's live wire (`liveResult`), a
-  // conditional container's iter-args settle at least a cycle before its
-  // exit, and a guard's survivor, which latches on the pulse itself, is
-  // sampled through its capture D wire (`nextValueFor`), whose sources the
-  // arms' own hand-off rule has already settled.
+  // The last child must hand its results over safely at the pulse: a call-free
+  // leaf exposes each result's live wire, a conditional container's iter-args
+  // settle at least a cycle before its exit, and a guard's survivor is sampled
+  // through its capture D wire.
   const uarch::RegionBlock &last = dp.regions[rb.children.back()];
   bool lastOk = false;
   switch (last.shape) {
@@ -424,9 +420,9 @@ bool HWEmitter::chainsTurnover(const uarch::RegionBlock &rb) const {
     return false;
   // A conditional container's children launch behind its own CHECK window. A
   // counted one's first child samples the counter and iter-args at its own
-  // start, so collapsing launch onto the commit cycle needs a first child
-  // that samples a cycle later: a conditional child's CHECK or a guard
-  // child's predicate test.
+  // start, so collapsing launch onto the commit cycle needs a first child that
+  // samples a cycle later: a conditional child's CHECK or a guard child's
+  // predicate test.
   if (rb.conditional)
     return true;
   const uarch::RegionBlock &first = dp.regions[rb.children.front()];
@@ -440,9 +436,8 @@ Value HWEmitter::nextValueFor(const uarch::RegionBlock &rb, unsigned k,
       r.value.id == rb.children.back()) {
     const uarch::RegionBlock &last = dp.regions[r.value.id];
     // A counted leaf result captured in the commit cycle itself: its survivor
-    // register settles only at the turnover's end, so latch from the same
-    // wire its own capture takes. A conditional leaf's last capture precedes
-    // its exit by an II, and an earlier-stage capture already settled.
+    // register settles only at the turnover's end, so latch from the same wire
+    // its own capture takes. Any other capture has settled a cycle earlier.
     if (last.shape == uarch::RegionBlock::Shape::Leaf && !last.conditional &&
         dp.readyCycle(last.results[r.value.outPort].value) == last.drainStage) {
       Value live = liveResult.lookup(
@@ -452,8 +447,7 @@ Value HWEmitter::nextValueFor(const uarch::RegionBlock &rb, unsigned k,
       return live;
     }
     // A guard survivor latches on the pulse itself, so rebuild its latch's D
-    // wire: the captured datum in this very cycle (settled registers behind
-    // one select), the register on any event-free one.
+    // wire: the captured datum in a capture cycle, the register otherwise.
     if (last.shape == uarch::RegionBlock::Shape::Guard) {
       auto [en, datum] = guardCapture.lookup(
           DatapathEmitter::accKey(r.value.id, r.value.outPort));
@@ -508,8 +502,8 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
   datapath.setControl(rb.id, ic.rc);
 
   // Loop-carried iter-args, advancing on each outer-iteration drain; the final
-  // value is this region's survivor. Chained, the first child launches in the
-  // latch cycle, so the D wires are published for its init latches.
+  // value is this region's survivor. When chained, the first child launches in
+  // the latch cycle, so the D wires are published for its init latches.
   SmallVector<Backedge> nextBE =
       setupCarriedIterArgs(rb, start, lastDrain, /*publishThrough=*/chained);
 
@@ -551,9 +545,8 @@ Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
       control.emitCheckedIteration(rb.id, cond, tCond, start, lastDrain);
   donePulse[rb.id] = ic.donePulse;
 
-  // The last child's drain advances the iter-args and drives the next CHECK;
-  // riding the pulse is safe because the CHECK samples a cycle later, when
-  // the advanced iter-args have settled.
+  // The last child's drain advances the iter-args and drives the next CHECK,
+  // which samples a cycle later, once the advanced iter-args have settled.
   resolveIterationBody(rb, ic.rc.issue, lastDrain, nextBE, onPulse);
   return ic.done;
 }
@@ -580,9 +573,8 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   auto [thenStart, elseStart] = ctx.branchPulse(checkTime, cond);
   // Each arm runs its children once, retrig so a re-entered guard presents
   // fresh edges each enclosing pass. The arm's completion follows the sibling
-  // hand-off rule: a `handoffSafe` tail hands its pulse (its commits and
-  // result latches trail it), everything else the done edge, so the survivor
-  // capture below always reads settled arm results.
+  // hand-off rule: a `handoffSafe` tail hands its pulse, everything else the
+  // done edge, so the capture below reads settled arm results.
   auto armDrained = [&](llvm::ArrayRef<uarch::RegionId> arm,
                         Value armStart) -> Value {
     if (arm.empty())
@@ -611,11 +603,11 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   }
   // Exactly one arm runs, so the region completes on whichever drains. Latch
   // done (a level); clear on start so a retriggered guard re-edges. The set
-  // pulse is recorded for the hand-off and advance chains; `handoffSafe`
-  // gates a SIBLING hand-off to a result-less guard (a successor's datapath
-  // samples survivor registers, which only settle a cycle after the pulse),
-  // while a pulse-advanced container takes a yielded result through the
-  // capture D wire.
+  // pulse is recorded for the hand-off and advance chains. `handoffSafe`
+  // restricts a sibling hand-off to a result-less guard, since a successor's
+  // datapath samples survivor registers that settle a cycle after the pulse;
+  // a pulse-advanced container instead takes the result through the capture
+  // D wire.
   Value pulse = ctx.orBits(thenDrained, elseDrained);
   donePulse[rb.id] = pulse;
   Value done = ctx.holdDone(pulse, start);

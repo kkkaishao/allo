@@ -1,8 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The Vivado recipe table against the fabrics' operator tables, and the
-manifest-driven shim and core generator over it."""
+"""Vivado recipes against the operator tables, and the generator over them."""
 
 import json
 import re
@@ -246,7 +245,7 @@ def test_generate_selects_add_against_sub_on_the_shared_core():
     assert ".s_axis_operation_tdata(8'b00000001)" in sub
 
 
-# --- the neutral seam: scaffold_project ---------------------------------------
+# --- project scaffolding -----------------------------------------------------
 
 
 def test_scaffold_writes_split_rtl_and_realization(tmp_path):
@@ -271,10 +270,8 @@ def test_scaffold_writes_split_rtl_and_realization(tmp_path):
     # The manifest keys the boundary by module name.
     manifest = json.loads((root / "manifest.json").read_text())
     assert "sf_top" in manifest
-    # The realizer's contribution rides along.
-    # The shortest multiply the CLOCK CAN HOLD is the one the library binds, so
-    # the depth comes off the table rather than being restated here; a row
-    # declared for a slower clock is not a candidate at this one.
+    # The library binds the shortest multiply that fits the clock, so the depth
+    # comes off the table rather than being restated here.
     assert f"module mul_f32_f32_f32_l{FMUL}(" in (root / "shims.v").read_text()
     assert "create_ip" in (root / "gen_ip.tcl").read_text()
     # Split emission ran on a copy: the compiled module still exports whole.

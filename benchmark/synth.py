@@ -7,25 +7,13 @@
     python -m benchmark.synth --impl                  # place+route, timing too
     python -m benchmark.synth --skip-synth            # scaffolds only
 
-The bed's third leg: `report.py` predicts what a variant costs, `verify.py`
-checks what it computes, this synthesizes what it emits, with the real
-operator cores, and reports what Vivado actually built. Each case scaffolds
-through `RTL.scaffold_project`, so the RTL, the operator-core wrappers and the
-core-generation script are exactly the shipped flow's, never a bed-local
-re-derivation.
-
-Three disciplines, each paid for:
-
-  - One Vivado process per design. Vivado segfaults on some emitted RTL and a
-    segfault is not something `catch` survives, so a bad design must not cost
-    the queue behind it; separate processes also keep two variants of one
-    kernel, which share a top module name, out of one in-memory project.
-  - A design whose extern operators have no realization is synthesized but
-    marked: a black box synthesizes to nothing, so its actual area
-    under-counts and the row says so rather than passing as a measurement.
-  - A stale utilization report is deleted before its design runs: a fresh
-    prediction silently paired with an actual measured off older hardware is
-    worse than a hole in the table.
+Each case scaffolds through `RTL.scaffold_project`, so the RTL, the
+operator-core wrappers and the core-generation script are the shipped flow's.
+One Vivado process per design, since Vivado can segfault on emitted RTL and
+since two variants of one kernel share a top module name. A design whose extern
+operators have no realization synthesizes its black boxes to nothing, so its
+actual area under-counts and its row is marked. Stale utilization and timing
+reports are deleted before a design runs.
 """
 
 from __future__ import annotations
@@ -93,9 +81,8 @@ def emit_one(
             warnings.simplefilter("always")
             rtl.scaffold_project(str(work / f"{tag}.prj"))
         q = rtl.estimation
-        # Under a period policy the compile wrote the clock it chose back to
-        # the handle, and that clock is what the design is held to; otherwise
-        # the model period (post-derate) is the honest constraint.
+        # Under a period-choosing objective the compile wrote its clock back
+        # to the handle; otherwise the constraint is the derated model period.
         cycle_ns = (
             1000.0 / rtl.freq_mhz
             if objective in ("freq", "wall")
@@ -199,9 +186,8 @@ def vivado_command(explicit: str | None) -> str:
 
 def design_tcl(d: dict, work: Path, impl: bool) -> Path:
     """One design's whole run: its own project (via the scaffold's
-    `gen_ip.tcl` when it has cores, so the part and the generated IP come from
-    the shipped script), the split RTL off `filelist.f`, OOC synthesis, and
-    under ``--impl`` a clock constraint plus place and route."""
+    `gen_ip.tcl` when it has cores), the RTL off `filelist.f`, OOC synthesis,
+    and under ``--impl`` a clock constraint plus place and route."""
     prj = work / f"{d['tag']}.prj"
     gen_ip = prj / "gen_ip.tcl"
     if gen_ip.exists():
@@ -245,8 +231,8 @@ def design_tcl(d: dict, work: Path, impl: bool) -> Path:
 
 
 def run_vivado(vivado: str, tcl: Path, log: Path, timeout: int) -> None:
-    """One Vivado process; a hung one is killed so it cannot pin its slot, and
-    the missing report marks the design's row."""
+    """One Vivado process, killed at ``timeout``; the report it then fails to
+    write is what marks the design's row."""
     with log.open("w") as sink:
         try:
             subprocess.run(
@@ -263,9 +249,8 @@ def run_vivado(vivado: str, tcl: Path, log: Path, timeout: int) -> None:
             sink.write(f"\n### TIMEOUT after {timeout}s\n")
 
 
-#: `report_utilization` row -> the key it lands under. "LUT as Memory" is left
-#: out on purpose: it is the sum of the two rows below it, and counting it too
-#: would double-charge.
+#: `report_utilization` row -> the key it lands under. "LUT as Memory" is
+#: excluded: it is the sum of the two rows below it.
 _UTIL_ROWS = {
     "LUT as Logic": "lut_logic",
     "LUT as Distributed RAM": "lut_mem",
@@ -280,9 +265,9 @@ _UTIL_ROWS = {
 
 def read_utilization(work: Path, tag: str) -> dict | None:
     """One design's cell counts off its `report_utilization`. A Block RAM Tile
-    is reported in halves (an 18Kb RAMB is 0.5), so it is kept a float. The
-    first occurrence of a row wins: a post-route report repeats the names in
-    later per-region tables whose leading column is not a count."""
+    is reported in halves (an 18Kb RAMB is 0.5), so counts stay floats. The
+    first occurrence of a row wins, since a post-route report repeats the names
+    in later per-region tables whose leading column is not a count."""
     p = work / f"{tag}_util.rpt"
     if not p.exists():
         return None
@@ -294,7 +279,7 @@ def read_utilization(work: Path, tag: str) -> dict | None:
             if key not in seen:
                 seen.add(key)
                 out[key] = float(cells[2])
-    # A LUT the design spends is a LUT whichever role it is in.
+    # Total LUT sites, whichever role each is in.
     out["lut"] = out["lut_logic"] + out["lut_mem"] + out["srl"]
     return {k: int(v) if v == int(v) else v for k, v in out.items()}
 
@@ -369,8 +354,8 @@ def print_table(rows: list[dict], impl: bool) -> None:
         if a is None:
             print(f"{r['tag']:<38} {p['lut']:>7}/{'--':<7}{note}")
             continue
-        # `srl` in the estimate is every state-holding LUT site, so its actual
-        # is the shift registers plus the distributed RAM.
+        # `srl` in the estimate covers every state-holding LUT site, so its
+        # actual is the shift registers plus the distributed RAM.
         astate = a["srl"] + a["lut_mem"]
         line = (
             f"{r['tag']:<38} {p['lut']:>7}/{a['lut']:<7}"

@@ -314,8 +314,7 @@ def MulAddOp : Allo_Op<"muladd", [
     Computes `(a * b + c) mod 2^N`, the same value as `arith.addi(arith.muli(a,
     b), c)` at width N, so it is signedness-transparent like `arith.muli`.
     Minted by `legalize-arith` only where the device declares a matching
-    `muladd` operator row; the multiply-to-add hop then never leaves the core,
-    which is what a fabric's post-adder offers.
+    `muladd` operator row, so the multiply-to-add hop stays inside one core.
   }];
   let arguments = (ins SignlessIntegerLike:$a, SignlessIntegerLike:$b,
                        SignlessIntegerLike:$c);
@@ -532,15 +531,14 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator",
     notation a per-op exception would save.
 
     `min_period` is the least clock period the row's internal pipeline stages
-    are warranted at, from the device characterization. A selection period
-    below it cannot hold the core, whatever its boundary cones say; `0` claims
-    nothing (the row holds any period its `in_delay`/`out_delay` fit).
+    are characterized at. A selection period below it cannot hold the core,
+    whatever its boundary cones allow. `0` claims nothing, so the row holds any
+    period its `in_delay`/`out_delay` fit.
 
     `fed_width`, when present, restricts the row to operations whose operands
     carry no more significant bits than it: the same core measured with its
-    inputs known to be extensions, where synthesis prunes the array. Such a
-    row is only a candidate where the operands prove that narrow, and the
-    plain row keeps every other operation.
+    inputs known to be extensions, where synthesis prunes the array. The plain
+    row keeps every other operation.
 
     Its resource references are NESTED (`@u55c::@lut`). The resources belong to
     the device, this op does not, and a symbol reference has to resolve from
@@ -1096,9 +1094,8 @@ def DCPathLoadOp : DCPath_Op<"dcp.load",
     OptionalAttr<I64Attr>:$bank,
     OptionalAttr<I64Attr>:$port,
     // The `fwd_id`s of the same-array stores whose data a shadow forwards into
-    // this read on a same-cycle, same-element collision. Stamped by the reify
-    // from the schedule's decision; the emitter builds one compare and mux arm
-    // per entry.
+    // this read on a same-cycle, same-element collision. The emitter builds one
+    // compare and mux arm per entry.
     OptionalAttr<DenseI64ArrayAttr>:$fwd);
   let results = (outs AnyType:$result);
   let assemblyFormat = [{

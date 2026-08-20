@@ -142,8 +142,8 @@ _MODELS: dict[str, _Model] = {
     "add": _Model("a + b", "a + b"),
     "sub": _Model("a - b", "a - b"),
     "mul": _Model("a * b", "a * b"),
-    # The fused multiply-add (`allo.muladd`): exact at the shared width, where
-    # the SV expression self-truncates to the result like the plain multiply.
+    # Fused multiply-add, exact at the shared width: the expression
+    # self-truncates to the result like the plain multiply.
     "muladd": _Model("a * b + c", "a * b + c"),
     "div": _Model("a / b", "a / b"),
     "rem": _Model("a % b", "std::fmod(a, b)"),

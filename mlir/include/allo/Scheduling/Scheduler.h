@@ -78,10 +78,10 @@ public:
   int64_t latencyOf(Operation *op);
 
   /// Store->load dependences a forwarding network relaxes: the load may issue
-  /// in the very cycle the store does, a shadow register supplying the datum
-  /// on an address match instead of the RAM, which has not committed it yet.
-  /// Set before solving; every solver and verifier weighs such an edge at
-  /// latency zero instead of the store's write latency.
+  /// in the cycle the store does, a shadow register supplying the datum on an
+  /// address match instead of the RAM, which has not committed it yet. Set
+  /// before solving; every solver and verifier weighs such an edge at latency
+  /// zero instead of the store's write latency.
   void setForwarded(Dependence dep) { forwardedEdges.insert(dep); }
   bool isForwarded(Dependence dep) const {
     return forwardedEdges.contains(dep);
@@ -512,10 +512,9 @@ struct SchedulerOptions {
   int seed = kDefaultSolveSeed;
   /// The span the area objective may pay beyond its leash, as a fraction of
   /// the reference span (the heuristic's, or the first solved interval where
-  /// the greedy did not place). Zero ships no slower than the heuristic. The
-  /// slack is spent the way a composition grant is, as interval room for unit
-  /// folds: an interval the ungranted leash already admits keeps its tight
-  /// drain bound.
+  /// the greedy did not place). Zero ships no slower than the heuristic. It
+  /// buys interval room for unit folds alone: an interval the ungranted leash
+  /// already admits keeps its tight drain bound.
   double areaSlack = 0.0;
   /// The fabric's register-to-register floor (ns): the earliest sub-cycle time
   /// any operation may start at. Combinational rows carry their measured delay
@@ -595,13 +594,11 @@ LogicalResult scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 /// over intervals is a branch and bound on \p span. \p maxII, nonzero, caps
 /// the search under the area objective (an explicit pipeline directive's
 /// ceiling, held no lower than the natural floor); the cycles objective
-/// ignores it, since capping there could forbid a span win at a wider
-/// interval. \p slackGrant, nonzero, is composition slack the enclosing
-/// kernel proved free of this region (off the sibling DAG's longest path); it
-/// buys INTERVAL room alone under the area objective: intervals the ungranted
-/// leash admits keep their own tight drain bound (extra drain room at a held
-/// interval buys folds the fabric prices as registers), wider ones are
-/// admitted with what the grant leaves. The cycles objective ignores it.
+/// ignores it. \p slackGrant, nonzero, is composition slack the enclosing
+/// kernel proved free of this region (off the sibling DAG's longest path). It
+/// buys interval room alone under the area objective: intervals the ungranted
+/// leash admits keep their own tight drain bound, wider ones are admitted with
+/// what the grant leaves. The cycles objective ignores it.
 LogicalResult scheduleCPSAT(ChainingModuloProblem &prob, Operation *lastOp,
                             float cycleTime, unsigned minII, unsigned maxII,
                             const SpanObjective &span,

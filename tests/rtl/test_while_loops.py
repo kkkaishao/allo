@@ -740,8 +740,8 @@ def test_a_chained_container_turns_over_in_the_commit_cycle():
     # `for i: [while, epilogue]` is the flat-FSM shape: the while hands the
     # epilogue its finish pulse, the container relaunches on the epilogue's
     # commit pulse, and the carried q crosses through the live result wire. A
-    # zero-trip iteration therefore costs exactly CHECK(1) + t_cond + drain,
-    # with the container's own done latch as the only cycle outside the loop.
+    # zero-trip iteration costs CHECK(1) + t_cond + drain, with the container's
+    # done latch as the only cycle outside the loop.
     N = 16
 
     @kernel
@@ -770,9 +770,9 @@ def test_a_chained_container_turns_over_in_the_commit_cycle():
 def test_a_backtracking_while_carries_its_state_across_the_turnover():
     # Data-dependent while trips: q crosses while -> epilogue on the finish
     # pulse, epilogue -> next iteration through the container's live latch, and
-    # into the while's own iter-arg through the register's D wire, all in the
-    # same cycle family. A stale sample at any of the three hand-offs changes
-    # the values, not just the timing.
+    # into the while's own iter-arg through the register's D wire. A stale
+    # sample at any of the three hand-offs changes the values, not just the
+    # timing.
     N = 16
 
     @kernel

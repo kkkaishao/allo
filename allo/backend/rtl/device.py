@@ -17,10 +17,9 @@ from .sim.ip_models import OpDesc, Ty
 
 
 class Realization(NamedTuple):
-    """What a device contributes to a scaffolded project beyond the emitted
-    RTL: source files and build scripts keyed by file name, plus the extern
-    modules it cannot build. File names and contents are the realizer's own
-    vocabulary; nothing here interprets them."""
+    """Device-supplied project content beyond the emitted RTL: source and
+    build files keyed by file name, plus the extern modules it cannot build.
+    File names and contents are opaque here."""
 
     files: dict[str, str]
     missing: tuple[str, ...] = ()
@@ -381,8 +380,8 @@ class Device:
         # register; the ledger's `reset` flag picks between the two rows.
         self.chain_uses_norst: Spend = ()
         self.storage: dict[str, Storage] = {}
-        # Routed logic sites per modeled LUT: the area rows count LUT instances,
-        # and post-route LUT combining packs several into fewer sites, so an
+        # Routed logic sites per modeled LUT. Area rows count LUT instances and
+        # post-route LUT combining packs several of them into one site, so an
         # estimate quoted against a utilization report scales by this.
         self.lut_packing: float = 1.0
         # The default is a NAME, not a handle: redeclaring a row (a copied
@@ -393,9 +392,9 @@ class Device:
         # on their `symbol`.
         self.operators: list[OperatorIP] = []
         self.default_freq_mhz: float = 100.0
-        # Builds the extern operator modules the emitter instantiates, called
-        # as ``realizer(interfaces, device)``; ``None`` when the fabric ships
-        # no realization and the externs stay black boxes.
+        # Builds the extern operator modules the emitter instantiates, called as
+        # ``realizer(interfaces, device)``. ``None`` leaves the externs as black
+        # boxes.
         self.realizer: Callable[..., Realization] | None = None
 
     def _spend(
@@ -753,9 +752,9 @@ class Device:
         return self
 
     def set_lut_packing(self, sites_per_lut: float) -> Device:
-        """Routed logic sites per modeled LUT, measured by routing real designs
-        and dividing sites by instances. Scales only the quoted estimate; every
-        comparison between realizations is made in unpacked instances."""
+        """Routed logic sites per modeled LUT, measured as routed sites divided
+        by LUT instances over real designs. Scales the quoted estimate only;
+        realizations are compared in unpacked instance counts."""
         if not 0.0 < sites_per_lut <= 1.0:
             raise ValueError("lut packing is a fraction of instances kept")
         self.lut_packing = float(sites_per_lut)

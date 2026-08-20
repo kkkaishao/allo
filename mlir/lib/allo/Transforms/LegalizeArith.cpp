@@ -236,26 +236,22 @@ struct ReduceRemSI : OpRewritePattern<arith::RemSIOp> {
 //===----------------------------------------------------------------------===//
 // Constant divisors, general case -> reciprocal multiply.
 //
-// A constant divisor never needs a divider: `n divui d` is
-// `(n * M) >> (w + ceil(log2 d))` with `M` the rounded-up reciprocal, exact
-// for every `n` below `2^w`. The dividend's range decides `w`: an
-// induction-variable expression usually proves a narrow bound, and the
-// multiply then fits the clock. A signed division carries the sign around the
-// magnitude's multiply, which preserves its truncation toward zero.
+// `n divui d` is `(n * M) >> (w + ceil(log2 d))` with `M` the rounded-up
+// reciprocal, exact for every `n` below `2^w`; the dividend's proven range
+// decides `w`. A signed division carries the sign around the magnitude's
+// multiply, which preserves truncation toward zero.
 //
-// Who expands is a fit question. An index op matches no device IP row (a row
-// is declared at concrete widths) and is priced as a full-width combinational
-// divider, one operator no register can split, so it expands regardless; one
-// the reciprocal cannot take moves to the typed width instead
+// An index op matches no device IP row, since a row is declared at concrete
+// widths, and prices as a full-width combinational divider, so it expands
+// regardless; one the reciprocal cannot take moves to the typed width instead
 // (`IndexDivToTyped`). A typed op has a pipelined divider IP to fall back on,
-// so it expands only where the reciprocal's product multiply fits the stated
-// clock period, and keeps the IP everywhere else.
+// so it expands only where the reciprocal's product fits, either whole in the
+// stated clock period or registered inside a pipelined multiplier row.
 //===----------------------------------------------------------------------===//
 
-/// Largest value the expression \p v can take, read as unsigned bits: walked
-/// over constants, affine induction variables and the arithmetic an index
-/// expression is built from. nullopt where the walk meets anything it cannot
-/// bound.
+/// Largest value \p v can take, read as unsigned bits, walking constants,
+/// affine induction variables and the arithmetic an index expression is built
+/// from. nullopt where the walk meets anything it cannot bound.
 static std::optional<uint64_t> unsignedBound(Value v, unsigned depth = 0) {
   if (depth > 8)
     return std::nullopt;
@@ -288,7 +284,7 @@ static std::optional<uint64_t> unsignedBound(Value v, unsigned depth = 0) {
     return std::nullopt;
   };
   // Everything the result type can hold: a truncation wraps rather than
-  // clamps, but whatever it wraps to still fits the type.
+  // clamps, but the wrapped value still fits the type.
   auto typeMax = [&]() -> uint64_t {
     Type t = op->getResult(0).getType();
     unsigned w = t.isIndex() ? 64 : t.getIntOrFloatBitWidth();
@@ -362,17 +358,16 @@ static unsigned boundWidth(Value n, unsigned cap) {
 
 /// One planned expansion: the divisor, the width `w` the reciprocal form is
 /// exact below, and whether the dividend is proven non-negative, which lets a
-/// signed op take the unsigned form directly. `viaIp` picks the classic mulh
-/// form whose `2w`-bit product a pipelined multiplier row carries registered,
-/// where the narrow form's combinational multiply would not fit the clock.
+/// signed op take the unsigned form directly. `viaIp` picks the mulh form,
+/// whose `2w`-bit product a pipelined multiplier row carries registered, where
+/// the narrow form's combinational multiply would not fit the clock.
 struct MagicPlan {
   uint64_t divisor;
   unsigned width;
   bool nonneg;
   bool viaIp = false;
-  /// Whether the whole dividend range sits below the divisor, where the
-  /// quotient folds to zero and the remainder to the dividend, no multiply
-  /// built.
+  /// Whether the dividend range sits below the divisor: the quotient is zero
+  /// and the remainder the dividend, with no multiply built.
   bool folds() const {
     return width < 64 && ((uint64_t(1) << width) - 1) < divisor;
   }
@@ -382,8 +377,8 @@ struct MagicPlan {
 /// the patterns and the conversion target, so what is marked illegal is
 /// exactly what rewrites.
 ///
-/// TODO: a negative constant divisor keeps its op today; it could expand as
-/// the magnitude's reciprocal with one more negation of the quotient.
+/// TODO: a negative constant divisor keeps its op; it could expand as the
+/// magnitude's reciprocal with one more negation of the quotient.
 static std::optional<MagicPlan> magicPlan(Operation *op, bool isSigned,
                                           unsigned maxMulWidth,
                                           unsigned maxIpMulWidth) {
@@ -399,9 +394,8 @@ static std::optional<MagicPlan> magicPlan(Operation *op, bool isSigned,
     if (isSigned)
       return std::nullopt; // `IndexDivToTyped` routes it through the i32 form
     MagicPlan p{d, boundWidth(op->getOperand(0), kIndexWidth), true};
-    // The narrow form regardless when nothing better fits: even its wide
-    // combinational multiply beats the full combinational divider an `index`
-    // op would otherwise become.
+    // The narrow form is kept even when its multiply misses the period: it
+    // still beats the full combinational divider an `index` op would become.
     if (!p.folds() && 2 * p.width + 1 > maxMulWidth &&
         2 * kIndexWidth <= maxIpMulWidth) {
       p.viaIp = true;
@@ -473,9 +467,8 @@ struct NafDigit {
 
 /// The digits of \p cst's non-adjacent form, where the shift-add network is
 /// small enough to beat a multiplier. Digits at or above the factor's width
-/// contribute nothing modulo two to that width and are dropped, which keeps
-/// the recoding exact for either sign; a wider factor keeps its multiplier,
-/// which a DSP slice serves better than a deep adder tree.
+/// contribute nothing modulo 2^width and are dropped, which keeps the recoding
+/// exact for either sign.
 static std::optional<SmallVector<NafDigit, 5>> nafDigits(const APInt &cst) {
   constexpr unsigned kMaxNafAdders = 3;
   unsigned width = cst.getBitWidth();
@@ -493,7 +486,7 @@ static std::optional<SmallVector<NafDigit, 5>> nafDigits(const APInt &cst) {
       v -= 1;
   }
   if (digits.empty())
-    return std::nullopt; // a zero factor is the folder's, not a network
+    return std::nullopt; // a zero factor is left to constant folding
   bool positive = llvm::any_of(digits, [](NafDigit d) { return !d.negative; });
   if (digits.size() - 1 + (positive ? 0 : 1) > kMaxNafAdders)
     return std::nullopt;
@@ -576,10 +569,10 @@ static Value signedMagicQuotient(PatternRewriter &rewriter, Location loc,
 }
 
 //===----------------------------------------------------------------------===//
-// The classic mulh forms: the product built at `2w`, which a pipelined
-// multiplier row carries registered, so the clock never sees it whole. The
-// magic data comes from LLVM's division-by-constant machinery; the shapes are
-// Hacker's Delight 10-3 / 10-8.
+// The mulh forms: the product is built at `2w`, which a pipelined multiplier
+// row carries registered, so the clock never sees it whole. The magic data
+// comes from LLVM's division-by-constant machinery; the shapes are Hacker's
+// Delight 10-3 and 10-8.
 //===----------------------------------------------------------------------===//
 
 /// The unsigned quotient at width `p.width`, returned in that width.
@@ -620,7 +613,7 @@ static Value ipMagicQuotientU(PatternRewriter &rewriter, Location loc, Value n0,
 
 /// The signed quotient at the op's own integer type, `p.width` wide: mulhs,
 /// the add-back where the magic is negative, and the final round toward zero
-/// off the quotient's own sign. `INT_MIN` needs no carve-out here.
+/// off the quotient's own sign. `INT_MIN` needs no carve-out.
 static Value ipMagicQuotientS(PatternRewriter &rewriter, Location loc, Value n,
                               const MagicPlan &p) {
   unsigned w = p.width;
@@ -764,8 +757,8 @@ struct MagicRemSI : MagicBase<arith::RemSIOp> {
 
 // An `index` division no other pattern takes is rebuilt at `kIndexWidth`, the
 // width the datapath gives `index` anyway. At a concrete type it binds a
-// pipelined divider core; left at `index` it has no row to match and becomes
-// a full-width combinational divider that derates the whole module's clock.
+// pipelined divider core; left at `index` it matches no row and becomes a
+// full-width combinational divider that derates the module's clock.
 struct IndexDivToTyped : RewritePattern {
   IndexDivToTyped(MLIRContext *ctx, bool expand, unsigned maxMulWidth,
                   unsigned maxIpMulWidth)
@@ -809,8 +802,7 @@ struct IndexDivToTyped : RewritePattern {
 };
 
 /// Whether \p op sits at an integer width no divider row declares while a
-/// wider row exists: the widths a mixed-signedness promotion mints (i33) and
-/// any other off-row width a kernel spells.
+/// wider row exists, such as the i33 a mixed-signedness promotion mints.
 static bool widensToDivRow(Operation *op, const OperatorLibrary &lib) {
   auto ity = dyn_cast<IntegerType>(op->getResult(0).getType());
   if (!ity)
@@ -820,11 +812,10 @@ static bool widensToDivRow(Operation *op, const OperatorLibrary &lib) {
   return row != 0 && row != ity.getWidth();
 }
 
-// A division at an off-row width no other pattern takes prices as a
-// full-width combinational divider and derates the module, like the `index`
-// case above. Widened to the narrowest declared row it binds that pipelined
-// core; the extension keeps quotient and remainder exact and the truncation
-// back is free.
+// A division at an off-row width no other pattern takes prices as a full-width
+// combinational divider and derates the module, like the `index` case above.
+// Widened to the narrowest declared row it binds that pipelined core; the
+// extension keeps quotient and remainder exact and the truncation back is free.
 struct WidenDivToRow : RewritePattern {
   WidenDivToRow(MLIRContext *ctx, bool expand, unsigned maxMulWidth,
                 unsigned maxIpMulWidth, const OperatorLibrary &lib)
@@ -935,12 +926,12 @@ struct NafConstMul : OpRewritePattern<arith::MulIOp> {
   }
 };
 
-// Whether \p v is, transitively through adds, a sum already holding a
-// product: the sibling leaf of a reduction tree, or the running sum of an
-// unrolled accumulation. Such an addend arrives a core's depth after the
-// multiply could issue, so fusing over it serializes at the row's latency per
-// link where the plain adders chained inside one period (the bed priced that
-// at +19..65% latency). Past the walk's depth it stays conservative.
+// Whether \p v is, transitively through adds, a sum already holding a product:
+// the sibling leaf of a reduction tree, or the running sum of an unrolled
+// accumulation. Such an addend arrives a core's depth after the multiply could
+// issue, so fusing over it serializes at the row's latency per link where the
+// plain adders chained inside one period, measured at +19..65% latency on the
+// benchmark suite. Past the walk's depth it stays conservative.
 static bool sumsProducts(Value v, unsigned depth = 8) {
   Operation *d = v.getDefiningOp();
   if (!d)
@@ -957,10 +948,10 @@ static bool sumsProducts(Value v, unsigned depth = 8) {
 
 // Fusing must not put the core's latency on a recurrence: an accumulation
 // (`acc += a * b`) would come round at the row's depth per turn instead of an
-// adder's. Three local shapes cover the reductions as `reassociate-reductions`
-// leaves them: an operand the enclosing loop carries, a result yielded to it,
-// and a depth-1 memory accumulation, a store of the result over a load an
-// operand made.
+// adder's. Three local shapes cover the reductions `reassociate-reductions`
+// leaves: an operand the enclosing loop carries, a result yielded to it, and a
+// depth-1 memory accumulation, a store of the result over a load an operand
+// made.
 static bool onRecurrence(arith::AddIOp op, arith::MulIOp mul, Value addend) {
   auto carried = [](Value v) {
     auto arg = dyn_cast<BlockArgument>(v);
@@ -982,10 +973,10 @@ static bool onRecurrence(arith::AddIOp op, arith::MulIOp mul, Value addend) {
 }
 
 // A multiply feeding one add becomes the device's fused core: the pair is
-// `(a * b + c) mod 2^N`, which `allo.muladd` names, and the multiply-to-add
-// hop then stays inside the core instead of crossing the fabric. Minted only
-// where an advanced `muladd` row declares this exact signature; a constant
-// factor is left to `NafConstMul`, whose shift-add expansion is cheaper.
+// `(a * b + c) mod 2^N`, which `allo.muladd` names, and the multiply-to-add hop
+// stays inside the core instead of crossing the fabric. Minted only where an
+// advanced `muladd` row declares this exact signature; a constant factor is
+// left to `NafConstMul`, whose shift-add expansion is cheaper.
 struct FuseMulAdd : OpRewritePattern<arith::AddIOp> {
   FuseMulAdd(MLIRContext *ctx, OperatorLibrary &lib)
       : OpRewritePattern(ctx), lib(lib) {}
@@ -1005,9 +996,8 @@ struct FuseMulAdd : OpRewritePattern<arith::AddIOp> {
       if (matchPattern(mul.getLhs(), m_ConstantInt(&cst)) ||
           matchPattern(mul.getRhs(), m_ConstantInt(&cst)))
         continue;
-      // A serial chain's late value feeds the MULTIPLY side and costs
-      // nothing; an addend that already sums products would stall the core
-      // (see `sumsProducts`).
+      // A late value on the multiply side costs nothing; an addend that
+      // already sums products would stall the core (see `sumsProducts`).
       if (sumsProducts(addend))
         continue;
       Type args[] = {ity, ity, ity};
@@ -1039,9 +1029,9 @@ struct LegalizeArithPass
 
     // The widest multiply the clock takes whole, register floor included, and
     // the widest one a pipelined multiplier row carries registered: a typed
-    // division expands where either form of the reciprocal's product fits,
-    // and keeps its divider IP only past both. With no period stated every
-    // typed division stays on its IP.
+    // division expands where either form of the reciprocal's product fits and
+    // keeps its divider IP past both. With no period stated every typed
+    // division stays on its IP.
     unsigned maxMulWidth = 0;
     if (expandConstArith && periodNs > 0.0)
       for (unsigned w = 2; w <= 129; ++w)
@@ -1052,8 +1042,7 @@ struct LegalizeArithPass
 
     // Table reads at literal indices fold to a fixpoint first, so a multiply
     // sees its literal factor before it is judged: the conversion below visits
-    // each op once, which is too early for an operand another rewrite
-    // constant-folds.
+    // each op once, too early for an operand another rewrite constant-folds.
     RewritePatternSet folds(&getContext());
     folds.add<FoldConstantTableRead>(&getContext());
     if (expandConstArith)
@@ -1063,7 +1052,7 @@ struct LegalizeArithPass
 
     // Fusion runs after the folds settle, never beside them: a multiply whose
     // factor is still a foldable table read would fuse onto a DSP core where
-    // the fold plus NAF build cheaper constant shift-adds.
+    // the fold plus NAF recoding build cheaper constant shift-adds.
     if (expandConstArith) {
       RewritePatternSet fuse(&getContext());
       fuse.add<FuseMulAdd>(&getContext(), lib);
@@ -1100,10 +1089,10 @@ struct LegalizeArithPass
                                  arith::MinimumFOp, arith::MaxNumFOp,
                                  arith::MinNumFOp>(keepIfRealizable);
     // A power-of-two divisor makes the op a shift, so it does not survive
-    // either; a constant one the reciprocal patterns plan for goes to them
-    // when the flag asks; anything still at `index` moves to the typed width,
-    // and an off-row width to the narrowest divider row above it. Every other
-    // divisor stays and is bound to a device core.
+    // either; a constant one the reciprocal patterns plan for goes to them when
+    // the flag asks; anything still at `index` moves to the typed width, and an
+    // off-row width to the narrowest divider row above it. Every other divisor
+    // stays and is bound to a device core.
     bool expand = expandConstArith;
     target.addDynamicallyLegalOp<arith::DivUIOp, arith::RemUIOp>(
         [expand, maxMulWidth, maxIpMulWidth, &lib](Operation *op) {

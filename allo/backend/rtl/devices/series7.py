@@ -214,9 +214,9 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
 
 
 #: SLICEM sites one bit of a 64-deep distributed RAM occupies for one instance,
-#: a write port and one addressed read. A further read is a further instance
-#: (`inst_reads` below), so the row prices a single copy: half the two-read DUT
-#: series (88 / 352 / 704 sites at 64 / 256 / 512 x 32, 32-bit reference).
+#: meaning a write port and one addressed read. Measured at the 32-bit
+#: reference width as half of a two-read series (88 / 352 / 704 sites at
+#: 64 / 256 / 512 x 32).
 LUTRAM_SITES_PER_BIT = 1.375
 
 _STORAGE = {
@@ -391,8 +391,7 @@ def build(part: Part) -> Device:
             operator = core.retimed(
                 row.latency,
                 row.in_delay_ns,
-                # A row is warranted at the clock it was characterized to
-                # close unless it declares its own floor.
+                # A row defaults to the clock it was characterized at.
                 row.min_period_ns
                 if row.min_period_ns is not None
                 else 1000.0 / part.grade.default_freq_mhz,

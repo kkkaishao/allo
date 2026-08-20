@@ -127,8 +127,8 @@ def select_cpp_common_int_type(lhs: DType, rhs: DType) -> APInt:
 
 def select_hls_common_int_type(lhs: DType, rhs: DType) -> APInt:
     # A mixed-sign pair promotes to a signed type wide enough for both ranges,
-    # so comparison, division, and bitwise results follow the operand values
-    # instead of C's unsigned-domain reinterpretation.
+    # so results follow the operand values rather than C's unsigned-domain
+    # reinterpretation.
     assert lhs.is_int_signless() and rhs.is_int_signless()
     if lhs.is_int() == rhs.is_int():
         return APInt(max(lhs.primitive_width, rhs.primitive_width), signed=lhs.is_int())

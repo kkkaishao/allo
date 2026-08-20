@@ -37,9 +37,8 @@ Value accessedMemref(Operation *op) {
 }
 
 // Whether every write to \p memref is visible as a user of this SSA value:
-// a kernel argument or a local allocation under Allo's aliasing contract, or
-// a constant global. A view, or a rewritable global reachable through other
-// `get_global` ops, can hide a writer.
+// a kernel argument or a local allocation under Allo's aliasing contract, or a
+// constant global. A view or a rewritable global can hide a writer.
 bool writersAreVisible(Value memref) {
   if (auto arg = dyn_cast<BlockArgument>(memref))
     return isa<func::FuncOp>(arg.getOwner()->getParentOp());
@@ -76,8 +75,8 @@ bool scattersToRegisters(Value memref) {
          });
 }
 
-// Banks the array's partition splits it into. Per-bank ports are what serve
-// accesses, so pressure scales inversely with this count.
+// Banks the array's partition splits it into. Ports are per bank, so access
+// pressure scales inversely with this count.
 unsigned bankCount(Value memref) {
   PartitionAttr part = partitionOf(memref);
   if (!part)
@@ -94,10 +93,10 @@ unsigned bankCount(Value memref) {
   return banks;
 }
 
-// Whether removing \p hoistable lowers the body's port-pressure floor: the
-// modulo scheduler cannot beat the widest array's accesses per bank per
-// iteration, so a preload that leaves that maximum where it was buys no II
-// and only spends registers holding the values across the region boundary.
+// Whether removing \p hoistable lowers the body's port-pressure floor, the
+// widest array's accesses per bank per iteration. The modulo scheduler cannot
+// beat that floor, so a preload leaving it in place buys no II and only spends
+// registers holding the values across the region boundary.
 bool lowersPortFloor(affine::AffineForOp loop, ArrayRef<Operation *> hoistable) {
   DenseSet<Operation *> moved(hoistable.begin(), hoistable.end());
   DenseMap<Value, std::pair<unsigned, unsigned>> traffic; // total, hoistable
@@ -120,10 +119,9 @@ bool lowersPortFloor(affine::AffineForOp loop, ArrayRef<Operation *> hoistable) 
 }
 
 void hoistFrom(affine::AffineForOp loop) {
-  // A hoisted read runs unconditionally, so the body must have issued it: the
-  // loop needs a known non-zero trip count. Reads under an `affine.if` stay
-  // for the same reason, and a read in a nested loop is hoisted level by
-  // level, which keeps its order against writes between the loops.
+  // A hoisted read runs unconditionally, so the loop needs a known non-zero
+  // trip count. Only reads directly in the body move, one loop level at a
+  // time, which keeps their order against writes between nested loops.
   std::optional<uint64_t> trip = affine::getConstantTripCount(loop);
   if (!trip || *trip == 0)
     return;
@@ -151,7 +149,7 @@ void hoistFrom(affine::AffineForOp loop) {
     return;
   // A leaf body is what the modulo scheduler paces, so a preload there must
   // pay for its held registers with II. A body with loops inside is paced by
-  // its children instead, and hoisting simply stops re-reading each sweep.
+  // its children, where hoisting only stops the re-read on each sweep.
   bool leaf = loop.getBody()->getOps<LoopLikeOpInterface>().empty();
   if (leaf && !lowersPortFloor(loop, reads))
     return;

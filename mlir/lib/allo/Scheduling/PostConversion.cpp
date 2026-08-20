@@ -216,8 +216,8 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     setZ(nw);
     // The setup delay the solve priced this op against, so the emitter's model
     // holds the schedule's own number instead of re-deriving one. The rename
-    // decision travels the same way: the original operands it is judged on do
-    // not survive into `dcp`.
+    // decision travels the same way, since the operands it is judged on do not
+    // survive into `dcp`.
     nw->setAttr("in_delay", b.getF32FloatAttr(oc.timing.inDelay));
     if (isZeroDelay(&op))
       nw->setAttr("rename", b.getUnitAttr());
@@ -230,10 +230,10 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
 
 // Stamp the store->load forwarding pairs the schedule recorded onto the dcp
 // accesses just reified: each store gets a func-unique `fwd_id`, each load the
-// list of ids its shadow serves it from. Both ends of a pair sit in one block
-// (the scheduler's own gate), so \p accessMap holds them together and a pair is
-// stamped exactly once. Loads are ordered by their reified position, so the ids
-// are a function of the program rather than of pointer hashing.
+// list of ids its shadow serves it from. Both ends of a pair sit in one block,
+// so \p accessMap holds them together and a pair is stamped exactly once. Loads
+// are ordered by their reified position, so the ids are a function of the
+// program rather than of pointer hashing.
 static void stampForwards(ScheduleModel &model,
                           DenseMap<Operation *, Operation *> &accessMap,
                           int64_t &nextFwdId) {

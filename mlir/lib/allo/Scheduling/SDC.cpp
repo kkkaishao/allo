@@ -237,12 +237,6 @@ static Stopwatch now() { return std::chrono::steady_clock::now(); }
 
 namespace {
 
-/// Solves ONE function's schedule. Holds the analysis, device, model and
-/// options every method needs, instead of threading them through each
-/// signature.
-///
-/// One instance per function, no longer lived than the `DependenceAnalysis` it
-/// is handed: the span composition reads that analysis after the solve.
 /// What the area objective's slack pass collects from the heuristic
 /// pre-schedule: leash widenings for regions the kernel's composition proved
 /// off its longest path (`grants`, keyed by the region's solve key), and
@@ -257,12 +251,12 @@ struct SlackLedger {
 };
 
 /// Where a composition-slack grant on \p region lands, and what one granted
-/// cycle costs there: the solve key of the region's own schedule, and the
-/// trip product of the counted wrappers between the region's span and that
-/// schedule (a container re-runs its body per iteration, so widening the body
-/// by one widens the region by the product). nullopt where the region holds
-/// no interval a grant could widen: a straight-line span, a container
-/// decomposed into sub-regions, a call node, a while.
+/// cycle costs there: the solve key of the region's own schedule, and the trip
+/// product of the counted wrappers between the region's span and that schedule
+/// (a container re-runs its body per iteration, so widening the body by one
+/// widens the region by the product). nullopt where the region holds no
+/// interval a grant could widen: a straight-line span, a container decomposed
+/// into sub-regions, a call node, a while.
 std::optional<std::pair<Operation *, int64_t>>
 grantTarget(const SchedRegion &region, DependenceAnalysis &deps) {
   if (region.kind != allo::RegionKind::Loop)
@@ -284,6 +278,12 @@ grantTarget(const SchedRegion &region, DependenceAnalysis &deps) {
   return std::pair{innermost.getOperation(), divisor};
 }
 
+/// Solves ONE function's schedule. Holds the analysis, device, model and
+/// options every method needs, instead of threading them through each
+/// signature.
+///
+/// One instance per function, no longer lived than the `DependenceAnalysis` it
+/// is handed: the span composition reads that analysis after the solve.
 class FuncScheduler {
 public:
   FuncScheduler(DependenceAnalysis &deps, const DeviceModel &dev,
@@ -430,9 +430,9 @@ static int64_t pipelineDirective(Operation *loop, Operation *anchor) {
 // full storage round trip. A shadow register pair (the store's address compared
 // against the load's at issue, the select and the store's datum registered to
 // the read latency, a 2:1 mux at the load's data out) serves the one case the
-// RAM cannot: the two issuing in the same cycle. With it, the RAW edge needs
-// only issue order, i.e. latency zero; the WAR/WAW edges stay, and they are
-// exactly what excludes every collision the shadow must not serve.
+// RAM cannot: the two issuing in the same cycle. The RAW edge then needs only
+// issue order, latency zero; the WAR/WAW edges stay, and they exclude every
+// collision the shadow must not serve.
 //===----------------------------------------------------------------------===//
 
 // The compare of the forward select: the two element addresses, at the
@@ -579,13 +579,13 @@ struct ForwardRelaxation {
 
 // The most pairs one problem relaxes outright. Every pair costs a compare, a
 // select chain and a datum chain, and relaxing hundreds floods the modulo
-// placement with same-cycle freedom the greedy search chokes on.
+// placement with same-cycle freedom the greedy search cannot place.
 constexpr size_t kMaxForwardPairs = 16;
 
-// A body whose may-alias pairs outnumber that spends a larger budget on the
-// circuits that bind the II (`selectCriticalPairs`): the walk stops by itself
-// once the recurrence no longer binds, so this is a backstop sized for an
-// unrolled read-modify-write, not a target.
+// The budget a body with more may-alias pairs than that spends on the circuits
+// binding the II (`selectCriticalPairs`). The walk stops by itself once the
+// recurrence no longer binds, so this is a backstop sized for an unrolled
+// read-modify-write rather than a target.
 constexpr size_t kMaxTargetedPairs = 64;
 
 // The candidate pairs worth the budget: walk the circuit that binds the II,
@@ -695,13 +695,12 @@ selectCriticalPairs(ChainingModuloProblem &problem,
 }
 
 // Relax the forwardable RAW edges of \p problem when, and only when, a storage
-// recurrence is what binds the II and relaxing moves that bound: anything less
-// keeps today's schedule byte-for-byte and builds no shadow. Each forwarded
-// load is re-linked onto a `.fwd` twin of its operator type whose outgoing
-// delay carries the data mux (the RAM datum plus one arm per paired store);
-// the compare ends in the select register and touches no port path, so
-// nothing else is re-priced. Returns the relaxed edges, empty when nothing
-// was.
+// recurrence binds the II and relaxing moves that bound; otherwise the
+// schedule is unchanged and no shadow is built. Each forwarded load is
+// re-linked onto a `.fwd` twin of its operator type whose outgoing delay
+// carries the data mux (the RAM datum plus one arm per paired store); the
+// compare ends in the select register and touches no port path, so nothing
+// else is re-priced. Returns the relaxed edges, empty when there are none.
 static ForwardRelaxation
 relaxForwardableEdges(ChainingModuloProblem &problem, const DeviceModel &dev,
                       float cycleTime, float regFloor, unsigned minII) {
@@ -772,7 +771,7 @@ relaxForwardableEdges(ChainingModuloProblem &problem, const DeviceModel &dev,
 
 // Put a relaxation back: the forwarded set cleared and every re-linked load
 // returned to its original operator type, so a re-solve runs the unrelaxed
-// problem the previous release shipped.
+// problem.
 static void undoForwardRelaxation(ChainingModuloProblem &problem,
                                   ForwardRelaxation &relax) {
   problem.clearForwarded();
@@ -782,14 +781,13 @@ static void undoForwardRelaxation(ChainingModuloProblem &problem,
   relax.originalTypes.clear();
 }
 
-// Record the relaxed pairs the SOLVED schedule actually leans on, i.e. the
-// ones that collide: the store issues a whole number of intervals after the
-// load, so some iteration pair shares a cycle and the RAM alone would hand the
-// load stale data. A pair the schedule keeps at the old spacing needs no
-// shadow and none is built. `delta == 0` is a collision only for a distance-0
-// (program-ordered, same-iteration) edge; at carried-only distances the same
-// cycle holds a load that precedes the store, a pair the analysis proved
-// address-disjoint.
+// Record the relaxed pairs the solved schedule collides on: the store issues a
+// whole number of intervals after the load, so some iteration pair shares a
+// cycle and the RAM alone would hand the load stale data. A pair the schedule
+// leaves separated needs no shadow and none is built. `delta == 0` is a
+// collision only for a distance-0 (same-iteration) edge; at carried-only
+// distances the same cycle holds a load that precedes the store, a pair the
+// analysis proved address-disjoint.
 static void
 recordForwards(ChainingModuloProblem &problem,
                ArrayRef<circt::scheduling::Problem::Dependence> edges,
@@ -881,7 +879,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
       return failure();
     // The relaxed problem starts its II search lower, which can strand the
     // greedy placement where the unrelaxed search would not have gone. The
-    // relaxation is an optimization, so put it back and solve as shipped.
+    // relaxation is an optimization, so put it back and solve without it.
     info(Stage::Sched, problem.getContainingOp())
         << "The relaxed problem did not place; retrying without the "
            "store->load forwarding relaxation";

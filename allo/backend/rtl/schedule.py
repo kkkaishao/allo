@@ -113,8 +113,7 @@ _SWEEP_RUNGS = 8
 
 def _region_vector(result) -> dict:
     """Every solved per-region quantity a span composes from, keyed stably
-    across probes of one kernel. Trip counts are what a span-less kernel is
-    missing, and none of these depend on one."""
+    across probes of one kernel. None of them depend on trip counts."""
     out = {}
     for f in result.funcs:
         for r in f.regions:
@@ -140,14 +139,13 @@ def sweep_freq(
     ``options.cycle_ns`` with the heuristic scheduler, keep those whose span
     stays within ``span_tolerance`` of the span at the requested clock, and
     solve once at the tightest survivor under the caller's own scheduler
-    settings. A kernel with no composed span (unknown trip counts) is leashed
-    per region instead: every solved quantity the span composition is monotone
-    in must hold the same tolerance, which bounds the span for any trips.
-    Every probe recompiles from pristine IR (``make_module``), since
-    the legalized op set depends on the period; all probes are heuristic so the
-    chosen clock is deterministic. ``floor_ns`` is the device's register floor,
-    which bounds how deep the probes reach. Returns the scheduled module and
-    its result, with the probed curve published as ``ScheduleResult.sweep``."""
+    settings. A kernel with no composed span is leashed per region instead:
+    every solved quantity the span composition is monotone in holds the same
+    tolerance, which bounds the span at any trip counts. Every probe recompiles
+    from pristine IR (``make_module``), since the legalized op set depends on
+    the period. ``floor_ns`` is the device's register floor, which bounds how
+    deep the probes reach. Returns the scheduled module and its result, with
+    the probed curve published as ``ScheduleResult.sweep``."""
     if options.span_tolerance < 0.0:
         raise ValueError(
             f"span_tolerance must be non-negative; got {options.span_tolerance}"
@@ -168,10 +166,9 @@ def sweep_freq(
         )
 
     asked = probe(options.cycle_ns)
-    # The aggressive probe: the least period whose cycle still holds logic,
-    # twice the device's register floor (an 8x faster clock where the device
-    # declares none). The derate lifts an unholdable ask, so what this one
-    # achieves is the tightest clock on offer.
+    # The aggressive probe: twice the device's register floor, or an 8x faster
+    # clock where the device declares none. A derate lifts an unholdable ask,
+    # so what this probe achieves is the tightest clock on offer.
     anchor = 2.0 * floor_ns / margin if floor_ns > 0 else options.cycle_ns / 8.0
     points = [asked]
     lo = options.cycle_ns
@@ -194,9 +191,8 @@ def sweep_freq(
             seen.add(key)
             curve.append(p)
     # A bounded span compares as its worst case; `asked` always qualifies, so
-    # there is a winner. With no span to compare, hold the per-region vector:
-    # the composed span is monotone in every entry, so a probe inside the
-    # per-region leash spends no more than the tolerance at any trip counts.
+    # there is a winner. With no span to compare, the per-region vector is
+    # leashed instead.
     tol = 1.0 + options.span_tolerance
     if asked.latency is not None:
         leash = asked.latency * tol
@@ -235,12 +231,12 @@ def sweep_wall(
     sides of the requested clock with the heuristic scheduler, take the one
     whose span times achieved period is least, and solve once there under the
     caller's own scheduler settings. The requested clock is a reference, not a
-    bound: a slower clock that unlocks a shallower operator row can win.
-    ``cap_ns`` tops the ladder at the slowest period any device row is built
-    for, past which nothing new unlocks; ``floor_ns`` is the register floor
-    the aggressive anchor stands on. A kernel with no composed span has no
-    wall time to compare and is refused. Returns the scheduled module and its
-    result, with the probed curve published as ``ScheduleResult.sweep``."""
+    bound, so a winning clock slower than asked is possible. ``cap_ns`` tops
+    the ladder at the slowest period any device row is built for; ``floor_ns``
+    is the register floor the aggressive anchor stands on. A kernel with no
+    composed span has no wall time to compare and is refused. Returns the
+    scheduled module and its result, with the probed curve published as
+    ``ScheduleResult.sweep``."""
     margin = 1.0 - options.clock_margin
 
     def probe(period: float) -> SweepPoint:
@@ -291,8 +287,8 @@ def sweep_wall(
         if (key := round(p.achieved_ns, 3)) not in seen:
             seen.add(key)
             curve.append(p)
-    # Fewer cycles breaks a wall tie: the shorter schedule at the slower
-    # clock spends less on pipeline registers.
+    # Fewer cycles breaks a wall tie: the shorter schedule spends less on
+    # pipeline registers.
     winner = min(curve, key=lambda p: (p.latency * p.achieved_ns, p.latency))
     module = make_module()
     result = run_schedule(

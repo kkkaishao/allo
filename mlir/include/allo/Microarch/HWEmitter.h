@@ -124,8 +124,7 @@ struct IterationControl {
   RegionControl rc;
   Value done;
   /// The pulse that sets `done`: high in the completion cycle itself, one
-  /// cycle before the latched level. A chained container advances on its last
-  /// child's pulse instead of the level's edge.
+  /// cycle before the latched level.
   Value donePulse;
 };
 
@@ -169,10 +168,9 @@ struct ControlEmitter {
   /// `CountedStatic`. Runs one body pass per iteration of \p term, launching
   /// the next when \p complete pulses (the body's drain edge, a Backedge the
   /// caller resolves once the body has emitted). \p rb's `shape` decides
-  /// whether the FIRST pass may launch on \p start itself. With \p chained the
-  /// boundary is free on both paths: \p complete is the last child's commit
-  /// pulse and the next pass launches on it directly
-  /// (`HWEmitter::emitContainer` establishes when that is safe).
+  /// whether the first pass may launch on \p start itself. With \p chained,
+  /// \p complete is the last child's commit pulse and the next pass launches
+  /// on it directly.
   IterationControl emitCountedIteration(const uarch::RegionBlock &rb,
                                         const Terminator &term, Value start,
                                         Value complete, bool chained) const;
@@ -310,15 +308,12 @@ struct DatapathEmitter {
 
   /// A forwarded store's issue-time terms, recorded by `emitWrites` before the
   /// write-latency delays: its commit pulse, its (bank, offset) and its datum.
-  /// `finalizeForwards` compares them against the paired load's.
   struct ForwardStore {
     Value we, bank, offset, data;
   };
   DenseMap<uint64_t, ForwardStore> fwdStores; // accKey(mem, store idx)
   /// One forwarded load awaiting its stores: the RAM datum it would have read,
-  /// its own issue-time (bank, offset), and the backedge its consumers hold,
-  /// resolved to the shadow mux by `finalizeForwards` once every region has
-  /// emitted.
+  /// its own issue-time (bank, offset), and the backedge its consumers hold.
   struct PendingForward {
     unsigned mem, load;
     Value raw, bank, offset;
@@ -326,9 +321,9 @@ struct DatapathEmitter {
   };
   SmallVector<PendingForward, 1> pendingForwards;
   /// Resolve every pending forward: per paired store, a same-element compare at
-  /// issue gated by the store's commit pulse, the select and the datum
-  /// registered to the read latency on the load's shell, muxed over the RAM
-  /// datum.
+  /// issue gated by the store's commit pulse, with the select and the datum
+  /// registered to the read latency on the load's shell and muxed over the RAM
+  /// datum. Runs once every region has emitted.
   void finalizeForwards();
 
   /// One store to an internal array, held back so the stores coloured onto the
@@ -708,19 +703,18 @@ struct HWEmitter {
   /// call's done, which is a level with no usable pulse.
   llvm::DenseMap<unsigned, Value> donePulse;
   /// A leaf result's wire in its own capture cycle, keyed
-  /// accKey(region, port). A chained container latches its iter-arg from this
-  /// wire when the survivor register itself only settles at the turnover.
+  /// accKey(region, port), for a consumer sampling before the survivor
+  /// register settles.
   llvm::DenseMap<uint64_t, Value> liveResult;
   /// A chained container's iter-arg latch D wires, keyed accKey(region, port):
   /// what the register holds at the end of the current cycle. Its first child
-  /// launches in the latch cycle itself, so an init sourced from one of these
-  /// survivors reads the D wire instead of the stale output.
+  /// launches in the latch cycle itself and reads the D wire in place of the
+  /// stale output.
   llvm::DenseMap<uint64_t, Value> throughValue;
   /// A guard survivor's capture terms {enable, datum}, keyed
   /// accKey(region, port). The survivor latches on the guard's completion
-  /// pulse itself, so a pulse-advanced container sampling it in that cycle
-  /// rebuilds the latch's D wire from these (`nextValueFor`) instead of
-  /// reading the stale register.
+  /// pulse itself, so a container sampling in that cycle rebuilds the latch's
+  /// D wire from these instead of reading the stale register.
   llvm::DenseMap<uint64_t, std::pair<Value, Value>> guardCapture;
 
   HWEmitter(OpBuilder &b, Location loc, const uarch::Datapath &dp,
@@ -762,17 +756,15 @@ struct HWEmitter {
   /// Run \p regions in program order, each starting when its predecessor drains
   /// (the first on \p start); returns the last region's done. The shared
   /// sequencer for func-scope siblings and a container's children. A successor
-  /// of a CONDITIONAL region starts on that region's completion pulse itself
-  /// (`handoffSafe`), saving the done-latch cycle.
+  /// starts on its predecessor's completion pulse where `handoffSafe` allows,
+  /// saving the done-latch cycle.
   Value sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
                  bool retrig);
   /// Whether a successor may start on \p rb's completion pulse rather than on
-  /// its latched done. True for a conditional region (a while, flushing or
-  /// CHECK/RUN): its exit trails every commit and every iter-arg latch by at
-  /// least a cycle. Also true for a result-less guard: its arms' commits
-  /// trail the completion pulse by their own done cycle, and with no survivor
-  /// there is nothing latching on the pulse itself. A counted region's pulse
-  /// IS its commit cycle, so it keeps the latch.
+  /// its latched done. True for a conditional region, whose exit trails every
+  /// commit and every iter-arg latch by at least a cycle, and for a
+  /// result-less guard, which has no survivor latching on the pulse. A counted
+  /// region's pulse is its commit cycle, so it keeps the latch.
   bool handoffSafe(const uarch::RegionBlock &rb) const {
     return rb.conditional ||
            (rb.shape == uarch::RegionBlock::Shape::Guard && rb.results.empty());
@@ -784,22 +776,20 @@ struct HWEmitter {
   }
   /// Whether container \p rb's advance may ride its last child's completion
   /// pulse, one cycle ahead of the latched done edge. Requires that no exact
-  /// span composes through this container (an exact contract would have to
-  /// follow the hardware, which is the deferred slack analysis) and that the
-  /// last child's results are settled or handed live at the pulse
-  /// (`nextValueFor`).
+  /// span composes through this container and that the last child's results
+  /// are settled or handed live at the pulse.
   bool advancesOnPulse(const uarch::RegionBlock &rb) const;
   /// Whether \p rb also relaunches in that same cycle (advance = launch,
-  /// boundary {0,0}): its first child must sample the counter and iter-args
-  /// no earlier than one cycle after launch, which a conditional child (its
-  /// CHECK) and a guard child (its predicate test) both guarantee.
+  /// boundary {0,0}). Requires the first child to sample the counter and
+  /// iter-args no earlier than one cycle after launch, which a conditional
+  /// child and a guard child both guarantee.
   bool chainsTurnover(const uarch::RegionBlock &rb) const;
   /// The next-value wire container \p rb's iter-arg \p k latches on advance.
   /// Normally the producing child's survivor register. With \p onPulse the
-  /// advance is the last child's own commit cycle, where a survivor that
-  /// child captures in that very cycle still reads stale, so the result's
-  /// live wire (`liveResult`) stands in; every other source is settled at
-  /// least a cycle earlier and stays the survivor.
+  /// advance falls in the last child's own commit cycle, where a survivor
+  /// captured in that cycle still reads stale and the result's live wire
+  /// stands in; every other source is settled a cycle earlier and stays the
+  /// survivor.
   Value nextValueFor(const uarch::RegionBlock &rb, unsigned k, bool onPulse);
   /// Sequence container \p rb's children from \p issue and resolve the body's
   /// promises: \p lastDrain takes the last child's completion pulse when the
@@ -819,10 +809,9 @@ struct HWEmitter {
   /// (latch each `rb.results[k].init` at \p start, advance on \p advance),
   /// record each as Source::Survivor{rb, k}, and return the per-arg next-value
   /// backedges, set after the children emit since the next value comes from
-  /// them. A CHAINED container (\p publishThrough) also records each latch's D
-  /// wire in `throughValue`: its first child launches in the very cycle these
-  /// registers latch, so that child's own init latch must read what the
-  /// register is becoming, not its stale output.
+  /// them. With \p publishThrough each latch's D wire is recorded in
+  /// `throughValue`, for a first child that launches in the same cycle these
+  /// registers latch and must read what the register is becoming.
   llvm::SmallVector<circt::Backedge>
   setupCarriedIterArgs(const uarch::RegionBlock &rb, Value start, Value advance,
                        bool publishThrough);

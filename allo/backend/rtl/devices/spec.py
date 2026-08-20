@@ -187,11 +187,10 @@ class IPRow(NamedTuple):
     latency: int
     area: Mapping[str, int]  # resource name -> count, in the fabric's vocabulary
     mnemonic: str | None = None
-    #: Measured input cone of this row, overriding the archetype's default.
-    #: A single-cycle core is combinational up to its output register, so its
-    #: cone is nearly the whole measured period, not the registered-input 0.5.
+    #: Measured input cone of this row in ns, overriding the archetype's
+    #: default. A single-cycle core is combinational up to its output register,
+    #: so its cone is nearly the whole measured period.
     in_delay_ns: float | None = None
-    #: Least clock period the row's internal stages are warranted at. ``None``
-    #: takes the grade's characterization period: a row is only ever warranted
-    #: at the clock it was measured to close.
+    #: Least clock period in ns the row's internal stages are warranted at.
+    #: ``None`` takes the grade's characterization period.
     min_period_ns: float | None = None

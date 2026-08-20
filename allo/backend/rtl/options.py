@@ -47,41 +47,35 @@ class SchedulerOptions:
         scheduler: the solver that settles the resource half of each problem.
             ``"heuristic"`` is the SDC simplex plus greedy placement; ``"exact"``
             is CP-SAT over the same problem.
-        O: the optimization direction, compiler style. ``"cycles"`` (the
-            default) minimizes each region's span and breaks ties on area;
-            ``"area"`` minimizes area under a span leash, shipping no slower
-            than the heuristic schedule, and an explicit ``pipeline(ii=n)``
-            then also caps the II at ``n``. The heuristic scheduler solves
-            spans only, so those two take effect under ``scheduler="exact"``.
+        O: the optimization direction. ``"cycles"`` minimizes each region's
+            span and breaks ties on area. ``"area"`` minimizes area under a
+            span leash no slower than the heuristic schedule, and an explicit
+            ``pipeline(ii=n)`` also caps the II at ``n``. Both take effect
+            under ``scheduler="exact"``, since the heuristic solves spans only.
             ``"freq"`` makes the clock an output: candidate periods below the
             requested one are probed with the heuristic, the tightest whose
-            cycle count stays within ``span_tolerance`` is solved once under
-            this handle's own scheduler settings, and after emission the
-            clock is tightened once more to the realized critical path. The
-            handle's ``freq_mhz`` follows, and cosim runs at it.
-            ``"wall"`` makes the whole wall time the objective: candidate
-            periods on BOTH sides of the requested clock are probed and the
-            span-times-period winner is solved, so the clock may come back
-            slower than asked where a shallower operator row pays for itself.
-            The requested clock is a reference, not a bound.
-        cycle_ns: the operating clock period, derived from the handle's
+            cycle count stays within ``span_tolerance`` is solved under this
+            handle's own scheduler settings, and after emission the clock is
+            tightened to the realized critical path. ``"wall"`` minimizes span
+            times period, probing candidates on both sides of the requested
+            clock, which is then a reference rather than a bound, so the clock
+            may come back slower than asked. Under both the handle's
+            ``freq_mhz`` follows the result and cosim runs at it.
+        cycle_ns: the operating clock period in ns, derived from the handle's
             ``freq_mhz``, which the cosim clock also reads. Chains are cut to
             it less the ``clock_margin`` withheld.
         clock_margin: the fraction of the period withheld from the schedule as
-            timing headroom, Vitis clock-uncertainty style: every chain is cut
-            to ``(1 - clock_margin) * cycle_ns`` while the design is clocked
-            at ``cycle_ns``, so placement and routing surprises the model
-            cannot see fit inside the difference.
-        area_slack: the span the area objective may pay beyond its leash, as
-            a fraction of the reference span (the heuristic schedule's). Zero,
-            the default, ships no slower than the heuristic; the slack buys
-            interval room for unit folds, the way a composition grant does.
-            It is a permission, not a bargain: any legal area reduction
-            inside the widened leash is taken, whatever span it costs.
-        span_tolerance: the cycle-count regression ``O="freq"`` may trade for
-            a faster clock: the period sweep keeps a candidate only while the
+            timing headroom. Chains are cut to
+            ``(1 - clock_margin) * cycle_ns`` while the design is clocked at
+            ``cycle_ns``.
+        area_slack: the span the area objective may pay beyond its leash, as a
+            fraction of the heuristic schedule's span. Zero ships no slower
+            than the heuristic; any legal area reduction inside the widened
+            leash is taken, whatever span it costs.
+        span_tolerance: the cycle-count regression ``O="freq"`` may trade for a
+            faster clock. The period sweep keeps a candidate only while the
             span stays within ``(1 + span_tolerance)`` of the span at the
-            requested clock, or, when unknown trip counts leave no composed
+            requested clock, or, where unknown trip counts leave no composed
             span, while every region holds its own II, iteration depth and
             drain to the same tolerance. Zero refuses to pay any cycles for
             frequency.

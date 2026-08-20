@@ -63,9 +63,8 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
                                  const uarch::MemUnit::Access::Reduced &r,
                                  unsigned width) {
   // The counters a delayed cone reads are fresh at cycle 0 of their iteration,
-  // so under a published phase the delay folds onto it like a model chain
-  // (`emitRegisters`): `ceil(addrDelay / ii)` registers instead of one per
-  // cycle of the access's stage.
+  // so under a published phase the delay folds onto it: `ceil(addrDelay / ii)`
+  // registers instead of one per cycle of the access's stage.
   auto delayed = [&](Value v) {
     StallShell sh = shellFor(acc.region);
     Value phase = controlOf.lookup(acc.region).phase;
@@ -842,8 +841,8 @@ void DatapathEmitter::finalizeScatteredPorts() {
 // the shared issue cycle gated by the store's commit pulse, the select and the
 // store's datum registered to the read latency on the load's shell, muxed over
 // the RAM datum. At most one select fires per cycle (a WAW pair holding one
-// address is kept a cycle apart, and same-cycle stores are provably
-// element-disjoint), so the arms stack in any order.
+// address is kept a cycle apart, and same-cycle stores are element-disjoint),
+// so the arms stack in any order.
 void DatapathEmitter::finalizeForwards() {
   for (PendingForward &p : pendingForwards) {
     const uarch::MemUnit &m = dp.mems[p.mem];

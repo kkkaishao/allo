@@ -56,8 +56,8 @@ SatParameters solverParameters(const SchedulerOptions &opts) {
   // stops on depend on thread timing.
   if (opts.workers > 1)
     params.set_interleave_search(true);
-  // Developer probe: the solver's own progress log, for diagnosing where a
-  // budget goes on a model that returns nothing.
+  // Solver progress log, for diagnosing where a budget goes on a model that
+  // returns nothing.
   if (getenv("ALLO_CPSAT_LOG")) {
     params.set_log_search_progress(true);
     params.set_log_to_stdout(true);
@@ -65,11 +65,10 @@ SatParameters solverParameters(const SchedulerOptions &opts) {
   return params;
 }
 
-/// Solve \p model under \p params. A tiny model solves inside the portfolio's
-/// first batch, where or-tools 9.15's interleaved startup races itself
-/// (`ConfigureSearchHeuristics` check-fails on a worker whose model already
-/// finished), so below this size one worker runs alone; it is the more
-/// deterministic setting and the portfolio buys nothing there anyway.
+/// Solve \p model under \p params. Below this variable count a single worker
+/// runs: or-tools 9.15's interleaved startup check-fails
+/// (`ConfigureSearchHeuristics`) on a worker whose model already finished, and
+/// the portfolio buys nothing at that size.
 constexpr int kPortfolioFloorVars = 256;
 CpSolverResponse solveBuilt(CpModelBuilder &model, SatParameters params) {
   CpModelProto proto = model.Build();
@@ -552,8 +551,7 @@ addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
 /// top of the system (`addAllocationHeadroom`).
 ///
 /// \p hintSchedule hints every variable created here off the schedule already
-/// on \p prob (an area-first solve completes its hint this way; a partial
-/// hint on a model this size never completes).
+/// on \p prob. A partial hint on a model this size never completes.
 template <class ProblemT>
 DenseMap<Operation *, IntVar>
 addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
@@ -830,14 +828,11 @@ void addAllocationHeadroom(CpModelBuilder &model, ProblemT &prob,
 }
 
 /// Add \p price at \p size to a weighted sum, for a price tabulated at every
-/// value the size can take. A piecewise-linear price is its FIRST slope on the
+/// value the size can take. A piecewise-linear price is its first slope on the
 /// size, plus at every change of slope that change charged on how far the size
 /// runs past the point it changes at: `max(size - b, 0)`. Every variable this
 /// adds is determined by the size through a propagator, avoiding a per-segment
 /// disjunction for the search to branch on.
-///
-/// The sum is an identity, so what it contributes is bounded by the price's own
-/// maximum however the slopes cancel.
 void addPiecewiseCost(CpModelBuilder &model, IntVar size,
                       ArrayRef<int64_t> price, SmallVectorImpl<IntVar> &vars,
                       SmallVectorImpl<int64_t> &weights) {
@@ -859,7 +854,7 @@ void addPiecewiseCost(CpModelBuilder &model, IntVar size,
   }
 }
 
-/// The region's area, every term of it in what the device spends, as ONE
+/// The region's area, every term of it in what the device spends, as one
 /// expression the caller weights into an objective: the delay chain each value
 /// carried across slack costs (`RegisterTerm`), the activation pulse chain,
 /// and the table above per allocatable operator. A chain is not `width *
@@ -879,14 +874,14 @@ void addPiecewiseCost(CpModelBuilder &model, IntVar size,
 /// (members, units) table instead.
 ///
 /// \p hintFrom, non-null, hints every variable created here off that problem's
-/// SOLVED schedule, completing the start/allocation/selection hints an
-/// area-first solve carries: a partial hint the solver fails to complete
+/// solved schedule, completing the start/allocation/selection hints an
+/// area-first solve carries. A partial hint the solver fails to complete
 /// leaves a heavy model with no incumbent at all.
 ///
-/// \p structuralOut, non-null, receives the STRUCTURAL part alone (instances,
-/// their selects, the decided rows; no chains, no pulse): the bootstrap
-/// objective of an area solve, whose piecewise chain terms leave the full
-/// expression's relaxation too weak to search on.
+/// \p structuralOut, non-null, receives the structural part alone (instances,
+/// their selects, the decided rows; no chains, no pulse), which an area solve
+/// bootstraps on: the piecewise chain terms leave the full expression's
+/// relaxation too weak to search on.
 LinearExpr areaTerms(CpModelBuilder &model, ArrayRef<IntVar> starts,
                      const SpanObjective &span,
                      DenseMap<Operation *, IntVar> &startVars,
@@ -1073,7 +1068,7 @@ void rehintFrom(CpModelBuilder &model, ArrayRef<Operation *> ops,
     model.AddHint(cls.units, SolutionIntegerValue(from, cls.units));
 }
 
-/// Point the model's hints at EVERY variable of \p from, verbatim: the
+/// Point the model's hints at every variable of \p from, verbatim: the
 /// complete warm start the next solve on the same builder resumes from.
 /// Valid only while the builder has grown no variables since \p from was
 /// solved (added constraints are fine).
@@ -1118,12 +1113,11 @@ void applyAllocation(OccupancyProblem &prob, const Allocated &decided,
 
 /// Fall back to a first-fit shared allocation over the schedule already on the
 /// problem, for a solve that decided none. Operations whose realization was
-/// the solver's to decide join no class up front; here they are grouped at the
-/// library's own pick, which is what an undecided solve realizes them as. Bins
-/// then grow member by member in start order; joining one holds the class's
-/// select cone at the grown size against every member's own sub-cycle slack,
-/// so one packed operation keeps its own instance instead of opening the whole
-/// class to its ceiling the way a class-wide minimum slack would.
+/// the solver's to decide are grouped at the library's own pick, which is what
+/// an undecided solve realizes them as. Bins grow member by member in start
+/// order; joining one holds the class's select cone at the grown size against
+/// every member's own sub-cycle slack, so one packed operation keeps its own
+/// instance instead of opening the whole class to its ceiling.
 template <class ProblemT>
 void applyFallbackAllocation(ProblemT &prob, const OperatorLibrary &lib,
                              bool allocate, unsigned ii, float cycleTime) {
@@ -1518,8 +1512,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   // What the region is charged, bounded by what the heuristic already reached
   // and below by the floor, which speeds the span proof. Under the area
-  // objective the heuristic's drain is the span LEASH instead: a constraint,
-  // not what the first solve minimizes, widened by any composition slack the
+  // objective the heuristic's drain is a span leash instead: a constraint, not
+  // what the first solve minimizes, widened by any composition slack the
   // kernel's sibling DAG granted this region.
   int64_t heuristicDrain = span.drainOf(prob);
   assert(heuristicDrain <= horizon &&
@@ -1555,9 +1549,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   if (areaMode) {
     // Three solves on one model, sharing one budget: the structural bootstrap,
     // the full area complete-hinted from its whole solution, and the shortest
-    // drain the settled structure admits (see the modulo twin). The
-    // heuristic's schedule completes the bootstrap's hint, so an exhausted
-    // budget ships no worse than its realization.
+    // drain the settled structure admits. The heuristic's schedule completes
+    // the bootstrap's hint, so an exhausted budget ships no worse than it.
     LinearExpr structural;
     LinearExpr area = areaTerms(model, orderedStarts, span, startVars, allocs,
                                 /*ii=*/0, horizon, latExpr, sels, shared,
@@ -1585,7 +1578,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     if (solved(first)) {
       int64_t solvedArea = SolutionIntegerValue(first, area);
       model.AddLessOrEqual(area, solvedArea);
-      // The drain solve keeps the settled STRUCTURE: counts and rows pinned,
+      // The drain solve keeps the settled structure: counts and rows pinned,
       // only placement floats. Pinning the aggregate alone would let it spend
       // register-chain savings on extra units, which the model prices as a
       // wash and the fabric does not.
@@ -1728,7 +1721,7 @@ enum class ModuloOutcome { Scheduled, Infeasible, Exhausted };
 /// held under \p areaBound (the incumbent's), then the shortest drain the
 /// settled area admits. \p modelArea receives the shipped schedule's modeled
 /// area, the figure the caller compares intervals on; the host-side mirror
-/// below cannot serve there since it carries no register-chain term.
+/// below carries no register-chain term and cannot serve there.
 ///
 /// \p choices are the realization decisions this model carries (empty
 /// \p breaks then, the period stated through the sub-cycle system); \p chosen
@@ -1911,14 +1904,13 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
 
   if (areaMode) {
     assert(drainVar && "the area order runs only where a span composes");
-    // Three solves on one model, sharing one budget. A STRUCTURAL bootstrap
-    // first (instances, selects and rows, the clean part of the price): the
+    // Three solves on one model, sharing one budget. A structural bootstrap
+    // first (instances, selects and rows), which searches well: the
     // heuristic's hint completes only at its own interval and carries its own
     // realization, which a packed schedule degenerates to the ceiling
-    // allocation, while this objective searches well and lands the real
-    // lever. Then the FULL area, complete-hinted from the bootstrap's whole
-    // solution (its chain terms search too poorly to stand alone); then the
-    // shortest drain the settled structure admits.
+    // allocation. Then the full area, complete-hinted from the bootstrap's
+    // whole solution since its chain terms search too poorly to stand alone;
+    // then the shortest drain the settled structure admits.
     LinearExpr structural;
     LinearExpr area = areaTerms(model, orderedStarts, span, startVars, allocs,
                                 ii, horizon, latExpr, sels, shared,
@@ -1940,11 +1932,11 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     }
     // The full-area solve. INFEASIBLE under \p areaBound means nothing here
     // beats the incumbent. A run out of budget ships the bootstrap, whose
-    // chain terms hold feasible but unminimized values (nothing priced them),
-    // so the area recorded for it overstates. The boot minimized structure
-    // alone, so its full area can exceed the bound added below: a complete
-    // hint violating a model constraint must not be handed over (the
-    // interleaved portfolio check-fails repairing it).
+    // chain terms hold feasible but unminimized values, so the area recorded
+    // for it overstates. The bootstrap minimized structure alone, so its full
+    // area can exceed the bound added below, and a complete hint violating a
+    // model constraint must not be handed over: the interleaved portfolio
+    // check-fails repairing it.
     if (!areaBound || SolutionIntegerValue(boot, area) <= *areaBound)
       rehintAll(model, boot);
     if (areaBound)
@@ -1962,7 +1954,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     if (solved(first)) {
       int64_t solvedArea = SolutionIntegerValue(first, area);
       model.AddLessOrEqual(area, solvedArea);
-      // The drain solve keeps the settled STRUCTURE: counts and rows pinned,
+      // The drain solve keeps the settled structure: counts and rows pinned,
       // only placement floats. Pinning the aggregate alone would let it spend
       // register-chain savings on extra units, which the model prices as a
       // wash and the fabric does not.
@@ -2189,7 +2181,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   std::optional<unsigned> exhaustedAt;
 
   // The intervals to probe. Cycles order: ascending, the cut below breaking
-  // the scan. Area order: the greedy's own interval FIRST, since it is the one
+  // the scan. Area order: the greedy's own interval first, since it is the one
   // interval the heuristic's schedule can hint and the incumbent it yields
   // bounds every other probe; then the rest ascending.
   SmallVector<unsigned> probes;

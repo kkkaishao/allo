@@ -196,9 +196,8 @@ void nameValue(Value v, Location loc);
 void nameValue(Value v, llvm::StringRef name);
 
 /// Whether \p v already carries a name through either channel `nameValue`
-/// writes. One wire can serve two control roles (a container's launch is its
-/// zero-arm first child's issue), and the first role's name is the one a
-/// reader should keep seeing.
+/// writes. One wire can serve two control roles, and the first name assigned
+/// is the one kept.
 bool isNamedValue(Value v);
 
 } // namespace mlir::allo::uarch

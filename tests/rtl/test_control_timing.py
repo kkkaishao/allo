@@ -247,11 +247,10 @@ def _dev(write_latency: int):
     return d
 
 
-# The deeper write is honored by the scheduler too, not just tolerated by
-# the emitter: the memory-carried recurrence's II is read + add + write. A
-# one-cycle write is the exception, since only that window a store->load
-# shadow can cover: forwarding drops its round trip to read + add, while a
-# deeper write pays its scheduled cycles in full.
+# The memory-carried recurrence's II is read + add + write, so the scheduler
+# charges a deeper write rather than only tolerating it in the emitter. A
+# one-cycle write is the exception: store->load forwarding covers that window
+# and drops its round trip to read + add.
 def test_multi_cycle_write_costs_scheduled_cycles():
     @kernel
     def accumulate(A: i32[8], B: i32[8]):
@@ -378,11 +377,9 @@ def test_a_symbolic_bound_binds_like_any_other_arithmetic():
     # else.
     _to_rtl(band()).compile()
 
-    # And it is a device core that carries it, which is what says the bound's
-    # arithmetic is bound like any other integer arithmetic rather than left
-    # as an unrealizable index cone: the constant divide expands to its
-    # reciprocal, whose product rides the pipelined multiplier, and the region
-    # holding it is at least as deep as that core is long.
+    # A device core carries it rather than an unrealizable index cone: the
+    # constant divide expands to a reciprocal multiply on the pipelined
+    # multiplier, so the region holding it is at least as deep as that core.
     res = _sched(band())
     assert any(im.startswith("mulw_i64") for im in _impls(res))
     spans = [r for r in res.regions() if r.kind == "acyclic" and r.ops]
@@ -674,8 +671,8 @@ def test_a_chain_report_carries_the_proven_range():
 
 
 # An address cone delayed to a deep access stage holds one datum per in-flight
-# iteration, so at II > 1 it folds onto the region's phase like a model chain:
-# ceil(stage / II) enabled registers, never one per cycle of the stage.
+# iteration, so at II > 1 it folds onto the region's phase: ceil(stage / II)
+# enabled registers rather than one per cycle of the stage.
 def test_a_deep_access_address_folds_onto_the_phase():
     @kernel
     def deepstore(A: f32[16], B: f32[16]):

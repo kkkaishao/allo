@@ -68,12 +68,9 @@ struct ScalarizeMemoryPass
           }))
         continue;
       // A register file pays a read mux and a write demux per variable
-      // subscript, so it must buy something a ported memory cannot: either
-      // every subscript is a constant (the accesses are wires), or one block
-      // issues more accesses than the widest ported row serves in a cycle,
-      // which is what an unrolled or pipelined body does. A rolling loop
-      // touching the array once or twice per iteration is served by the
-      // priced storage tables instead.
+      // subscript, so it is worth it only when every subscript is a constant
+      // (the accesses are wires) or one block issues more accesses than a
+      // dual-ported row serves in a cycle.
       auto constantSubscripts = [](Operation *user) {
         AffineMap map;
         if (auto load = dyn_cast<affine::AffineLoadOp>(user))
@@ -95,7 +92,7 @@ struct ScalarizeMemoryPass
         unsigned most = 0;
         for (Operation *user : op->getUsers())
           most = std::max(most, ++perBlock[user->getBlock()]);
-        if (most <= 2) // a dual-ported row covers this without a mux in sight
+        if (most <= 2) // a dual-ported row serves this without a mux
           continue;
       }
 

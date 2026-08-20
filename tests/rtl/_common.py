@@ -30,10 +30,9 @@ PERIOD_NS = 1000.0 / default_device.default_freq_mhz
 REG_NS = default_device.reg_delay_ns
 
 
-# The library binds the shortest candidate of a kind and signature THAT THE
-# CLOCK CAN HOLD, so that is the latency a test predicts a schedule against. A
-# row whose cone or warranted period needs more than a clock -- a core declared
-# for slower clocks -- is not a candidate here any more than it is there.
+# The library binds the shortest candidate of a kind and signature that fits the
+# clock, so that is the latency a test predicts a schedule against. A row whose
+# cone or warranted period exceeds the period is not a candidate.
 _LAT: dict[tuple[str, str], int] = {}
 for _o in default_device.operators:
     if (
@@ -52,7 +51,7 @@ FADD = FSUB = _LAT[("add", "float32")]  # floating-point add/sub latency (cycles
 FMUL = _LAT[("mul", "float32")]  # floating-point multiply latency
 FDIV = _LAT[("div", "float32")]  # floating-point divide latency
 IMUL = _LAT[("mul", "int32")]  # 32-bit integer multiply (a DSP core, not comb)
-IMUL64 = _LAT[("mul", "int64")]  # 64-bit integer multiply, the reciprocal's ride
+IMUL64 = _LAT[("mul", "int64")]  # 64-bit integer multiply
 IDIV = _LAT[("divsi", "int32")]  # 32-bit signed integer divide
 MEM = default_device.storage["lutram"].read_latency  # default read/write
 MEM_URAM = default_device.storage["uram"].read_latency
@@ -72,11 +71,10 @@ def comb_step_ns(kind: str, width: int = 32) -> float:
 
 
 # A memory-carried accumulate (`M[x] += ...`) closes a distance-1 recurrence
-# read -> add -> write. The write's commit is shadowed by store->load
-# forwarding (the next read takes the store's datum on an address match), so
-# the II is the read plus the add, not the full round trip; a scalar-carried
-# accumulate keeps the partial in a register, so its II is just the add
-# latency.
+# read -> add -> write, but store->load forwarding hands the next read the
+# store's datum on an address match, so the II is read + add rather than the
+# full round trip. A scalar-carried accumulate keeps the partial in a register,
+# so its II is just the add latency.
 MEM_REDUCE_II = MEM + FADD
 
 

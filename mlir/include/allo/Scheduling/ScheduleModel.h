@@ -246,9 +246,8 @@ public:
   }
 
   /// Record that the solved schedule satisfies the RAW dependence from
-  /// \p store to \p load only through a store->load forwarding network: the
-  /// two can issue in one cycle, and the reify stamps the pair onto the dcp
-  /// accesses so the emitter builds the shadow.
+  /// \p store to \p load only through store->load forwarding: the two may
+  /// issue in one cycle, and the reify stamps the pair onto the dcp accesses.
   void addForward(Operation *load, Operation *store) {
     forwards[load].push_back(store);
   }

@@ -1,15 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""How each operator archetype is built as a Vivado IP core.
-
-One recipe per archetype, shared by every Xilinx fabric: a core configuration
-names no part, and the latency completing it comes from the fabric's own
-``IPRow``. The widths and signedness a recipe needs are read off the
-archetype's signature rather than restated here. Everything Vivado-specific
-about operator cores lives in this module; code outside ``devices/`` never
-sees its vocabulary.
-"""
+"""Vivado IP core recipes, one per operator archetype, shared by every Xilinx fabric."""
 
 from __future__ import annotations
 
@@ -30,19 +22,16 @@ class VivadoCore(NamedTuple):
     the core's default build spends DSPs; an ``IPRow`` whose area carries no
     ``dsp`` count is built with it. A full configuration applies
     ``CE_BASE[core]``, then ``shape``, then ``no_dsp`` if the row asks for it,
-    then ``LATENCY[core]``; the order is load-bearing (see ``LATENCY``).
+    then ``LATENCY[core]``, in that order (see ``LATENCY``).
 
     ``operation`` is the constant the wrapper drives on the core's operation
-    channel, where the shape leaves one: an ``Add_Subtract`` core selects at
-    runtime, so the add and sub archetypes are the same measured core with
-    different constants. Empty where the shape derives no channel; a compare's
-    constant comes from the predicate instead.
+    channel where the shape leaves one, empty otherwise; a compare's constant
+    comes from the predicate instead.
     """
 
     # `create_ip -name`: floating_point / mult_gen / div_gen; or `rtl`, which
-    # generates no core at all: the shim computes `shape` (an SV expression
-    # over the data ports) behind the row's latency, and synthesis infers the
-    # DSPs, which is the only Vivado build of a fused multiply-add.
+    # generates no core: the shim computes `shape` (an SV expression over the
+    # data ports) behind the row's latency and synthesis infers the DSPs.
     core: str
     shape: str  # `Key=Value` pairs, comma separated
     no_dsp: str = ""  # DSP-free fragment, empty where the core has no such knob
@@ -63,7 +52,7 @@ CE_BASE = {
 #: `set_property -dict` applies in list order and changing `Operation_Type`
 #: resets the latency to the new type's default. `C_Latency` is a disabled
 #: parameter until `Maximum_Latency` is false; left alone, a floating-point
-#: core silently builds at its own maximum depth instead.
+#: core builds at its own maximum depth.
 LATENCY = {
     "floating_point": "Maximum_Latency=false,C_Latency={lat}",
     "mult_gen": "PipeStages={lat}",
@@ -89,13 +78,12 @@ _BF16 = (
     "C_Result_Fraction_Width=8"
 )
 
-# One Programmable compare core serves every predicate: the predicate is a
-# constant the instantiating wrapper drives on the core's operation channel,
-# so it never becomes a second piece of hardware to price.
+# One Programmable compare core serves every predicate, which the instantiating
+# wrapper drives as a constant on the core's operation channel.
 _CMP = "Operation_Type=Compare,C_Compare_Operation=Programmable"
 
-# The Add_Subtract shape is the "Both" core: one operation channel selects
-# add against subtract, so the pair shares one measured piece of hardware.
+# The Add_Subtract shape is the "Both" core: an operation channel selects add
+# against subtract, so the pair shares one measured core.
 _ADD = "00000000"
 _SUB = "00000001"
 
@@ -176,9 +164,8 @@ for _w in (8, 16, 32, 64):
 
 del _a, _mul, _stem, _w
 
-# The fused multiply-add has no LogiCORE: `mult_gen` offers no post-adder and
-# `xbip_dsp48_macro` is a single slice, too narrow for a 32-bit product. The
-# `rtl` build lets synthesis infer the DSP cascade with the addend absorbed.
+# No LogiCORE builds a fused multiply-add at this width, so the `rtl` recipe
+# lets synthesis infer the DSP cascade with the addend absorbed.
 RECIPES[ip.imuladd32] = VivadoCore("rtl", "a * b + c")
 
 # The narrow core under `imulw33`'s 64-bit signature: the 33x33 product's low
@@ -193,8 +180,7 @@ RECIPES[ip.imulw33] = VivadoCore(
 
 _RECIPE_BY_NAME = {a.func_name: r for a, r in RECIPES.items()}
 
-# Operation-channel opcodes of the Programmable compare core (PG060). One core
-# serves every predicate; the wrapper drives the opcode as a constant. An
+# Operation-channel opcodes of the Programmable compare core (PG060). An
 # unordered relation takes its ordered opcode, the same NaN-free contract the
 # cosim behavioral models state.
 _CMP_OPCODE = {
@@ -220,7 +206,7 @@ class Generated(NamedTuple):
     """What the extern operator modules of a design need to synthesize with
     real cores: the wrapper Verilog, the core-generation script, and what no
     recipe covers. A ``missing`` module stays a black box and synthesizes to
-    nothing, so a caller must surface it loudly."""
+    nothing."""
 
     shims: str  # one wrapper module per extern operator module
     ip_tcl: str  # `create_ip` script building every core, deduplicated
@@ -263,9 +249,9 @@ def _fp_shim(op: Operator, recipe: VivadoCore) -> str:
     """The floating_point core: one AXI channel per operand, named as the
     operand is; `tvalid` ties high (non-blocking flow control computes every
     cycle) and the result `tvalid` is ignored. A core whose shape leaves an
-    operation channel gets its constant: the predicate's opcode on a compare,
-    the recipe's own on an add/sub. The core pads `tdata` to a byte boundary,
-    so a narrower result (a compare's single bit) slices a wire."""
+    operation channel gets its constant, the predicate's opcode on a compare.
+    The core pads `tdata` to a byte boundary, so a narrower result (a compare's
+    single bit) slices a wire."""
     data, clk, ce, out = _split(op)
     conns = [f".aclk({clk})", f".aclken({ce})"]
     for p in data:
@@ -335,12 +321,12 @@ def _div_shim(op: Operator, arche: OperatorIP) -> str:
 
 
 def _rtl_shim(op: Operator, arche: OperatorIP, expr: str) -> str:
-    """An ``rtl`` recipe's whole build, for the one shape it carries today,
-    ``x * y + z`` over the data ports: an input stage, the product staged on
-    registers of its own (which is what synthesis pipelines the DSP cascade
-    with; a product summed before its first register keeps the whole cascade
-    in one cycle), the addend delayed alongside, and the add as the last
-    stage, where the final slice's ALU absorbs it."""
+    """An ``rtl`` recipe's whole build, for the one shape it carries,
+    ``x * y + z`` over the data ports: an input stage, the product on registers
+    of its own, the addend delayed alongside, and the add as the last stage,
+    where the final slice's ALU absorbs it. The product needs its own registers
+    for synthesis to pipeline the DSP cascade; summed before its first register
+    the whole cascade lands in one cycle."""
     m = re.fullmatch(r"(\w+) \* (\w+) \+ (\w+)", expr)
     assert m, "an rtl recipe builds `x * y + z` today"
     x, y, z = m.groups()
@@ -449,8 +435,7 @@ def generate(interfaces: Interfaces, device: Device) -> Generated:
 
 def realize(interfaces: Interfaces, device: Device) -> Realization:
     """The fabrics' ``Device.realizer``: :func:`generate` folded into the
-    neutral shape a scaffold writes. Stateless, so a copied device keeps a
-    realizer that answers for the copy."""
+    neutral shape a scaffold writes."""
     g = generate(interfaces, device)
     files = {}
     if g.shims:

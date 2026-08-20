@@ -46,9 +46,7 @@ struct AddressCost {
   unsigned multipliers = 0; // generic multipliers (a non-constant coefficient)
   unsigned dividers = 0;    // dividers / remainder units
   /// Constant-divisor division sites, realized as a reciprocal multiply whose
-  /// shift-adds are already in `adders`. Counted apart because a division of
-  /// any realization is what the coalescing gate and the address warning ask
-  /// about.
+  /// shift-adds are already counted in `adders`.
   unsigned reciprocals = 0;
   /// Register-carried pieces (`SplitAddress` terms and reads). Zero means the
   /// cone is entirely residual and no register can shorten it.
@@ -61,10 +59,10 @@ struct AddressCost {
 };
 
 /// The rounded-up reciprocal for a w-bit non-negative dividend:
-/// `floor(n / d) == (n * magic) >> shift` for every `n` below `2^w`, `d` not a
-/// power of two and below `2^w` itself. The multiplier fits `w+1` bits, so the
-/// product takes `2w+1`. Shared by the pricing here, the address emitter and
-/// `legalize-arith`, so the reciprocal every layer answers for is one number.
+/// `floor(n / d) == (n * magic) >> shift` for every `n` below `2^w`, with `d`
+/// not a power of two and below `2^w` itself. The multiplier fits `w+1` bits,
+/// so the product takes `2w+1`. Shared by the pricing here, the address
+/// emitter and `legalize-arith`.
 uint64_t magicMultiplier(uint64_t d, unsigned w, unsigned &shift);
 
 /// \p e simplified, unless simplifying made it WORSE to build.

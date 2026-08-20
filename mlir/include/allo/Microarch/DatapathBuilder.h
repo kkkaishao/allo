@@ -58,9 +58,8 @@ struct DatapathBuilder {
   llvm::DenseMap<Value, Source> ioOf;
   llvm::DenseMap<Operation *, unsigned> regionIdxOf;
 
-  // Forwarding facts off the dcp attributes, resolved by `recordForwards` once
-  // every access is bound: `fwd_id` -> (mem, access), and each forwarded
-  // load's (mem, access, ids).
+  // Forwarding facts off the dcp attributes: `fwd_id` -> (mem, access), and
+  // each forwarded load's (mem, access, ids).
   llvm::DenseMap<int64_t, std::pair<MemId, unsigned>> fwdStoreOf;
   llvm::SmallVector<std::tuple<MemId, unsigned, llvm::SmallVector<int64_t, 1>>>
       fwdLoads;
