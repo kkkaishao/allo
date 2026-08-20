@@ -110,6 +110,23 @@ def run_schedule(
 _SWEEP_RUNGS = 8
 
 
+def _region_vector(result) -> dict:
+    """Every solved per-region quantity a span composes from, keyed stably
+    across probes of one kernel. Trip counts are what a span-less kernel is
+    missing, and none of these depend on one."""
+    out = {}
+    for f in result.funcs:
+        for r in f.regions:
+            for name, v in (
+                ("ii", r.interval),
+                ("len", r.iteration_latency),
+                ("drain", r.cost.drain),
+            ):
+                if v is not None:
+                    out[(f.name, r.order, name)] = v
+    return out
+
+
 def sweep_freq(
     top,
     make_module: Callable[[], Module],
@@ -122,7 +139,10 @@ def sweep_freq(
     ``options.cycle_ns`` with the heuristic scheduler, keep those whose span
     stays within ``span_tolerance`` of the span at the requested clock, and
     solve once at the tightest survivor under the caller's own scheduler
-    settings. Every probe recompiles from pristine IR (``make_module``), since
+    settings. A kernel with no composed span (unknown trip counts) is leashed
+    per region instead: every solved quantity the span composition is monotone
+    in must hold the same tolerance, which bounds the span for any trips.
+    Every probe recompiles from pristine IR (``make_module``), since
     the legalized op set depends on the period; all probes are heuristic so the
     chosen clock is deterministic. ``floor_ns`` is the device's register floor,
     which bounds how deep the probes reach. Returns the scheduled module and
@@ -132,10 +152,12 @@ def sweep_freq(
             f"span_tolerance must be non-negative; got {options.span_tolerance}"
         )
     margin = 1.0 - options.clock_margin
+    vectors: dict[float, dict] = {}
 
     def probe(period: float) -> SweepPoint:
         opts = replace(options, scheduler="heuristic", cycle_ns=period)
         result = run_schedule(top, make_module(), opts, prepass, allocate)
+        vectors[period] = _region_vector(result)
         fn = result.func(top)
         return SweepPoint(
             cycle_ns=period,
@@ -145,12 +167,6 @@ def sweep_freq(
         )
 
     asked = probe(options.cycle_ns)
-    if asked.latency is None:
-        raise RuntimeError(
-            f"O='freq' holds the span while it sweeps the period, and "
-            f"'{top}' publishes no span at the requested clock; add "
-            "allo.assume trip bounds or choose a different objective"
-        )
     # The aggressive probe: the least period whose cycle still holds logic,
     # twice the device's register floor (an 8x faster clock where the device
     # declares none). The derate lifts an unholdable ask, so what this one
@@ -177,12 +193,22 @@ def sweep_freq(
             seen.add(key)
             curve.append(p)
     # A bounded span compares as its worst case; `asked` always qualifies, so
-    # there is a winner.
-    leash = asked.latency * (1.0 + options.span_tolerance)
-    winner = min(
-        (p for p in curve if p.latency is not None and p.latency <= leash),
-        key=lambda p: (p.achieved_ns, p.latency),
-    )
+    # there is a winner. With no span to compare, hold the per-region vector:
+    # the composed span is monotone in every entry, so a probe inside the
+    # per-region leash spends no more than the tolerance at any trip counts.
+    tol = 1.0 + options.span_tolerance
+    if asked.latency is not None:
+        leash = asked.latency * tol
+        eligible = [p for p in curve if p.latency is not None and p.latency <= leash]
+    else:
+        ref = vectors[asked.cycle_ns]
+        eligible = [
+            p
+            for p in curve
+            if vectors[p.cycle_ns].keys() == ref.keys()
+            and all(vectors[p.cycle_ns][k] <= v * tol for k, v in ref.items())
+        ]
+    winner = min(eligible, key=lambda p: (p.achieved_ns, p.latency or 0))
     module = make_module()
     result = run_schedule(
         top, module, replace(options, cycle_ns=winner.cycle_ns), prepass, allocate

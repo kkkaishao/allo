@@ -91,6 +91,32 @@ def test_freq_objective_sweeps_the_period_and_writes_the_clock_back():
     _run(rtl)
 
 
+def test_freq_objective_sweeps_a_kernel_with_no_composed_span():
+    # A data-dependent trip publishes no span, so the sweep leashes the
+    # per-region quantities a span composes from instead of refusing: the
+    # clock still becomes an output.
+    @kernel
+    def acc(A: i32[64], out: i32[1]):
+        i: i32 = 0
+        s: i32 = 0
+        while A[i] < 100:
+            s += A[i]
+            i += 1
+        out[0] = s
+
+    rtl = _to_rtl(acc).set_scheduler_opt(O="freq")
+    result = rtl.schedule()
+    assert result.func("acc").latency is None
+    assert result.sweep and result.sweep[0].latency is None
+    assert rtl.freq_mhz > 1000.0 / result.sweep[0].achieved_ns - 0.5
+    A = np.zeros(64, dtype=np.int32)
+    A[:5] = 1
+    A[5] = 100
+    out = np.zeros(1, dtype=np.int32)
+    rtl.cosim(A, out)
+    assert out[0] == 5
+
+
 def test_tighten_clock_moves_the_operating_clock_to_the_realized_path():
     # Any compiled design may be reclocked at its realized critical path
     # without recompiling; the report's clock follows.

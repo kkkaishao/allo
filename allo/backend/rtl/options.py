@@ -70,7 +70,10 @@ class SchedulerOptions:
         span_tolerance: the cycle-count regression ``O="freq"`` may trade for
             a faster clock: the period sweep keeps a candidate only while the
             span stays within ``(1 + span_tolerance)`` of the span at the
-            requested clock. Zero refuses to pay any cycles for frequency.
+            requested clock, or, when unknown trip counts leave no composed
+            span, while every region holds its own II, iteration depth and
+            drain to the same tolerance. Zero refuses to pay any cycles for
+            frequency.
         budget: what one exact solve may spend, in the solver's deterministic
             time units (roughly a second of one core each).
         workers: how many search workers one exact solve runs. The portfolio is
