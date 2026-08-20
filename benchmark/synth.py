@@ -57,6 +57,7 @@ def emit_one(
     objective: str,
     freq: float | None,
     work: Path,
+    area_slack: float = 0.0,
 ) -> dict:
     """Compile one (benchmark, variant, scheduler) and scaffold it under
     ``work``, returning the row the synthesis phase consumes."""
@@ -82,7 +83,7 @@ def emit_one(
         sched = bench.schedules[variant](parts)
         opts = {"freq_mhz": freq} if freq is not None else {}
         rtl = sched.export("rtl", **opts).set_scheduler_opt(
-            scheduler=scheduler, O=objective
+            scheduler=scheduler, O=objective, area_slack=area_slack
         )
         if binding == "trivial":
             rtl.use_trivial_binding()
@@ -92,12 +93,12 @@ def emit_one(
             warnings.simplefilter("always")
             rtl.scaffold_project(str(work / f"{tag}.prj"))
         q = rtl.estimation
-        # Under O="freq" the compile wrote the clock it chose back to the
-        # handle, and that clock is what the design is held to; otherwise the
-        # model period (post-derate) is the honest constraint.
+        # Under a period policy the compile wrote the clock it chose back to
+        # the handle, and that clock is what the design is held to; otherwise
+        # the model period (post-derate) is the honest constraint.
         cycle_ns = (
             1000.0 / rtl.freq_mhz
-            if objective == "freq"
+            if objective in ("freq", "wall")
             else res.cycle_ns or 1000.0 / rtl.freq_mhz
         )
         out.update(
@@ -115,7 +116,8 @@ def emit_one(
 
 
 def _run_child(
-    item, binding: str, objective: str, freq: float | None, work: Path, timeout: int
+    item, binding: str, objective: str, freq: float | None, work: Path, timeout: int,
+    area_slack: float = 0.0,
 ) -> dict:
     key, variant, scheduler = item
     env = dict(os.environ)
@@ -137,6 +139,8 @@ def _run_child(
     ]
     if freq is not None:
         cmd += ["--freq", str(freq)]
+    if area_slack:
+        cmd += ["--area-slack", str(area_slack)]
     row = {
         "tag": f"{key}/{variant}/{scheduler}".replace("/", "_"),
         "key": key,
@@ -268,6 +272,7 @@ _UTIL_ROWS = {
     "LUT as Shift Register": "srl",
     "CLB Registers": "ff",
     "Block RAM Tile": "bram",
+    "URAM": "uram",
     "DSPs": "dsp",
     "CARRY8": "carry8",
 }
@@ -318,7 +323,7 @@ def read_wns(work: Path, tag: str) -> float | None:
 # --- the table and the CSV ---------------------------------------------------
 
 _PRED = ("lut", "ff", "dsp", "srl", "mem_bits")
-_ACT = ("lut", "lut_logic", "lut_mem", "srl", "ff", "dsp", "carry8", "bram")
+_ACT = ("lut", "lut_logic", "lut_mem", "srl", "ff", "dsp", "carry8", "bram", "uram")
 
 
 def write_csv(work: Path, rows: list[dict], impl: bool) -> None:
@@ -410,6 +415,12 @@ def main() -> None:
         "--freq", type=float, help="target clock (MHz), overriding the device default"
     )
     ap.add_argument(
+        "--area-slack",
+        type=float,
+        default=0.0,
+        help="fraction the area solve's span leash is widened by",
+    )
+    ap.add_argument(
         "--impl",
         action="store_true",
         help="place and route after synthesis, and report timing",
@@ -437,13 +448,14 @@ def main() -> None:
     ap.add_argument("--work", default=str(REPO / "benchmark" / "synth_work"))
     args = ap.parse_args()
 
-    work = Path(args.work)
+    work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
 
     if args.one:
         key, variant, scheduler = args.one.split("::")
         row = emit_one(
-            key, variant, scheduler, args.binding, args.objective, args.freq, work
+            key, variant, scheduler, args.binding, args.objective, args.freq, work,
+            args.area_slack,
         )
         print(MARK + json.dumps(row), flush=True)
         return
@@ -471,7 +483,7 @@ def main() -> None:
         futs = [
             pool.submit(
                 _run_child, it, args.binding, args.objective, args.freq, work,
-                args.timeout,
+                args.timeout, args.area_slack,
             )
             for it in items
         ]

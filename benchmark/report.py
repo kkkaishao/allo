@@ -215,6 +215,7 @@ def measure_one(
     binding: str = "trivial",
     workers: int | None = None,
     objective: str = "cycles",
+    area_slack: float = 0.0,
 ) -> dict:
     """Schedule (and by default compile) one variant, returning its metrics.
 
@@ -224,7 +225,8 @@ def measure_one(
     many search workers one exact solve runs. ``binding`` is ``"trivial"`` (one
     unit per op) or ``"auto"``, the binding the scheduler implies; the recorded
     row carries the resolved name. ``objective`` is the exact solver's
-    optimization direction (the ``O`` knob); the heuristic ignores it."""
+    optimization direction (the ``O`` knob); the heuristic ignores it.
+    ``area_slack`` widens the area solve's span leash by that fraction."""
     bench = _load(key)
     out: dict = {
         "key": key,
@@ -235,6 +237,7 @@ def measure_one(
         "workers": workers,
         "binding": binding,
         "objective": objective,
+        "area_slack": area_slack,
         "stage": "build",
         "status": "error",
     }
@@ -257,6 +260,8 @@ def measure_one(
             knobs["budget"] = budget
         if workers is not None:
             knobs["workers"] = workers
+        if area_slack:
+            knobs["area_slack"] = area_slack
         rtl = sched.export("rtl", **opts).set_scheduler_opt(**knobs)
         if binding == "trivial":
             rtl.use_trivial_binding()
@@ -364,6 +369,7 @@ def _run_child(
     binding: str,
     workers: int | None,
     objective: str,
+    area_slack: float,
 ) -> dict:
     key, variant, scheduler = item
     env = dict(os.environ)
@@ -389,6 +395,8 @@ def _run_child(
         cmd += ["--budget", str(budget)]
     if workers is not None:
         cmd += ["--workers", str(workers)]
+    if area_slack:
+        cmd += ["--area-slack", str(area_slack)]
     t0 = time.time()
     try:
         p = subprocess.run(
@@ -752,6 +760,13 @@ def main():
         help="the exact solver's optimization direction (the O knob); the "
         "heuristic ignores it",
     )
+    ap.add_argument(
+        "--area-slack",
+        type=float,
+        default=0.0,
+        help="fraction the area solve's span leash is widened by (the "
+        "area_slack knob); 0 keeps the strict leash",
+    )
     ap.add_argument("--timeout", type=int, default=900, help="wall seconds per run")
     ap.add_argument("-o", "--out", default="qor.json")
     ap.add_argument("--per-region", action="store_true")
@@ -786,6 +801,7 @@ def main():
                     args.binding,
                     args.workers,
                     args.objective,
+                    args.area_slack,
                 )
             )
         )
@@ -815,9 +831,10 @@ def main():
     pool_size = f", budget={args.budget}" if args.budget else ""
     nproc = f", workers={args.workers}" if args.workers else ""
     direction = f", O={args.objective}" if args.objective != "cycles" else ""
+    slack = f", area_slack={args.area_slack}" if args.area_slack else ""
     print(
         f"{len(work)} runs, {args.jobs} jobs, stage={args.stage}"
-        f", binding={args.binding}{clock}{pool_size}{nproc}{direction}",
+        f", binding={args.binding}{clock}{pool_size}{nproc}{direction}{slack}",
         flush=True,
     )
 
@@ -834,6 +851,7 @@ def main():
                 args.binding,
                 args.workers,
                 args.objective,
+                args.area_slack,
             )
             for w in work
         ]
