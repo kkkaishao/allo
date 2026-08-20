@@ -15,6 +15,7 @@
 #include "allo/Scheduling/Scheduler.h"       // solveSharing
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -205,51 +206,114 @@ private:
   llvm::SmallVector<double> memo; // per representative
 };
 
-/// First-fit sharing for one region: for each unit, the region-local index of
-/// the unit it runs on, its own where unshared. Same shape `solveSharing`
-/// returns, so this plan can seed it.
+/// Cost-ordered greedy sharing for one region: for each unit, the region-local
+/// index of the unit it runs on (its group's smallest member; itself where
+/// unshared). Same shape `solveSharing` returns, so this plan seeds it, and it
+/// mirrors that solve's objective: a fold happens only where the mux arms it
+/// grows cost less than the instance it saves, into the cheapest legal bin.
 llvm::SmallVector<unsigned> greedyShare(const Datapath &dp,
                                         const RegionBlock &rb,
-                                        const BindingContext &ctx) {
+                                        const BindingContext &ctx,
+                                        const SharingProblem &problem) {
   ShareCone cone(dp, rb, ctx);
-  // Each bin is one physical unit's ops, indexed as `rb.units`. `arms` is the
-  // mux the bin has grown: one source per member, plus one for each member
-  // that re-injects a reduction identity on its own arm.
+  auto n = static_cast<unsigned>(rb.units.size());
+  llvm::DenseSet<uint64_t> collide;
+  for (auto [a, b] : problem.conflicts)
+    collide.insert(uint64_t(a) * n + b);
+
+  // Each bin is one physical unit's ops, indexed as `rb.units`, growing one
+  // select per operand port. A port whose members all read one held value
+  // stays a wire (key nonzero) until a different driver joins. `coneArms` is
+  // `ShareCone`'s per-unit arm count for the timing check.
   struct Bin {
     llvm::SmallVector<unsigned, 2> members;
-    unsigned arms = 0;
+    llvm::SmallVector<unsigned, 2> arms;
+    llvm::SmallVector<unsigned, 2> keys;
+    unsigned coneArms = 0;
   };
   llvm::SmallVector<Bin> bins;
-  auto resOf = [&](const FuncUnit &u) {
-    return reservationOf(rb, u, u.boundOps.front().residue);
-  };
-  for (unsigned i = 0, e = rb.units.size(); i < e; ++i) {
-    const FuncUnit &u = dp.units[rb.units[i]];
-    auto ru = resOf(u);
-    unsigned own = cone.armsOf(i);
-    Bin *dest = nullptr;
-    for (Bin &bin : bins) {
-      if (dp.units[rb.units[bin.members.front()]].identity != u.identity)
+
+  // Big classes and tight slacks place first, while bins are still shallow;
+  // costlier instances next, so the largest savings get first pick.
+  llvm::SmallVector<unsigned> clsSize(problem.classes.size(), 0);
+  for (const SharingProblem::Unit &u : problem.units)
+    ++clsSize[u.cls];
+  llvm::SmallVector<unsigned> order(n);
+  for (unsigned i = 0; i < n; ++i)
+    order[i] = i;
+  llvm::sort(order, [&](unsigned a, unsigned b) {
+    const SharingProblem::Unit &ua = problem.units[a];
+    const SharingProblem::Unit &ub = problem.units[b];
+    if (clsSize[ua.cls] != clsSize[ub.cls])
+      return clsSize[ua.cls] > clsSize[ub.cls];
+    if (ua.slackPicos != ub.slackPicos)
+      return ua.slackPicos < ub.slackPicos;
+    int64_t pa = problem.classes[ua.cls].instancePrice;
+    int64_t pb = problem.classes[ub.cls].instancePrice;
+    if (pa != pb)
+      return pa > pb;
+    return a < b;
+  });
+
+  for (unsigned i : order) {
+    const SharingProblem::Unit &u = problem.units[i];
+    const SharingProblem::UnitClass &cls = problem.classes[u.cls];
+    unsigned ports = cls.ports.size();
+    assert(u.initArms.size() == ports && "one identity, one signature");
+    // What folding into a bin grows across its ports, cheapest first; a fold
+    // costing its instance price or more keeps the unit its own.
+    llvm::SmallVector<std::pair<int64_t, unsigned>> cands;
+    for (auto [b, bin] : llvm::enumerate(bins)) {
+      if (problem.units[bin.members.front()].cls != u.cls)
         continue;
-      bool free = llvm::all_of(bin.members, [&](unsigned m) {
-        return reservationsDisjoint(resOf(dp.units[rb.units[m]]), ru);
-      });
-      if (free && cone.tryFold(bin.members, i, bin.arms + own)) {
-        dest = &bin;
+      if (llvm::any_of(bin.members, [&](unsigned m) {
+            return collide.contains(uint64_t(std::min(m, i)) * n +
+                                    std::max(m, i));
+          }))
+        continue;
+      int64_t delta = 0;
+      for (unsigned p = 0; p < ports; ++p) {
+        unsigned after = bin.arms[p] + 1 + u.initArms[p];
+        bool staysWire = bin.keys[p] && u.drivers[p] == bin.keys[p];
+        delta += (staysWire ? 0 : cls.ports[p].muxPrice[after]) -
+                 (bin.keys[p] ? 0 : cls.ports[p].muxPrice[bin.arms[p]]);
+      }
+      if (delta < cls.instancePrice)
+        cands.push_back({delta, static_cast<unsigned>(b)});
+    }
+    llvm::sort(cands);
+    Bin *dest = nullptr;
+    for (auto [delta, b] : cands)
+      if (cone.tryFold(bins[b].members, i,
+                       bins[b].coneArms + cone.armsOf(i))) {
+        dest = &bins[b];
         break;
       }
-    }
     if (dest) {
       dest->members.push_back(i);
-      dest->arms += own;
+      for (unsigned p = 0; p < ports; ++p) {
+        if (u.drivers[p] != dest->keys[p])
+          dest->keys[p] = 0;
+        dest->arms[p] += 1 + u.initArms[p];
+      }
+      dest->coneArms += cone.armsOf(i);
     } else {
-      bins.push_back({{i}, own});
+      Bin bin;
+      bin.members.push_back(i);
+      for (unsigned p = 0; p < ports; ++p) {
+        bin.arms.push_back(1 + u.initArms[p]);
+        bin.keys.push_back(u.drivers[p]);
+      }
+      bin.coneArms = cone.armsOf(i);
+      bins.push_back(std::move(bin));
     }
   }
-  llvm::SmallVector<unsigned> assign(rb.units.size());
-  for (Bin &bin : bins)
+  llvm::SmallVector<unsigned> assign(n);
+  for (Bin &bin : bins) {
+    unsigned rep = *llvm::min_element(bin.members);
     for (unsigned m : bin.members)
-      assign[m] = bin.members.front();
+      assign[m] = rep;
+  }
   return assign;
 }
 
@@ -356,8 +420,8 @@ std::vector<llvm::SmallVector<UnitId, 2>>
 ExactShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
   std::vector<llvm::SmallVector<UnitId, 2>> groups;
   for (const RegionBlock &rb : dp.regions) {
-    llvm::SmallVector<unsigned> assign = greedyShare(dp, rb, ctx);
     SharingProblem problem = sharingProblemOf(dp, rb, ctx);
+    llvm::SmallVector<unsigned> assign = greedyShare(dp, rb, ctx, problem);
     if (auto solved = solveSharing(problem, assign, rb.op)) {
       // The solve's cone constraint charges each member its own producers,
       // but the built mux is one structure whose every arm is a timed path.

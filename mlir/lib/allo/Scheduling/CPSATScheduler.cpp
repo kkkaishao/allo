@@ -1504,7 +1504,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   DenseMap<Operation *, IntVar> inCycle;
   if (!sels.empty())
     inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, opts.regFloor,
-                               &sels, areaMode);
+                               &sels, /*hintSchedule=*/true);
 
   // The composition of the two decisions: which row each operation runs on,
   // and how many instances of each row to build, priced together. Only in
@@ -1538,7 +1538,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     cumulativeOn(alloc.rsrc, alloc.units);
   addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
                         opts.regFloor, sels.empty() ? nullptr : &inCycle,
-                        areaMode);
+                        /*hintSchedule=*/true);
 
   // What the region is charged, bounded by what the heuristic already reached
   // and below by the floor, which speeds the span proof. Under the area
@@ -1553,9 +1553,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   assert(floorDrain <= heuristicDrain &&
          "the drain floor is a lower bound on every schedule, the heuristic's "
          "included");
-  IntVar drain = drainVariable(
-      model, startVars, span.drain, horizon, heuristicDrain, latExpr,
-      areaMode ? std::optional(heuristicDrain) : std::nullopt);
+  IntVar drain = drainVariable(model, startVars, span.drain, horizon,
+                               heuristicDrain, latExpr, heuristicDrain);
   model.AddGreaterOrEqual(drain, floorDrain);
   // One unit of area outweighs the whole start-time sum, which settles ties
   // deterministically below it; the same weight puts the drain above the sum
@@ -1733,7 +1732,9 @@ struct ModuloAttempt {
 /// otherwise need a variable modulus.
 ///
 /// \p hint is only valid when the greedy placement itself reached this II; at
-/// any other II its start times are not a schedule.
+/// any other II its start times are not a schedule. It is dropped whole where
+/// \p drainBound cuts below the greedy schedule's own drain: the hint then
+/// violates the model, which the interleaved portfolio check-fails on.
 ///
 /// Two solves on one model, span then area, sharing one budget (see the
 /// acyclic entry). `out.spanProven` and `out.areaProven` are each solve's
@@ -1767,6 +1768,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
                         std::optional<int64_t> areaBound, bool areaMode,
                         unsigned ii, unsigned horizon, bool hint,
                         ModuloAttempt &out) {
+  if (hint && drainBound && span.drainOf(prob) > *drainBound)
+    hint = false;
   const auto &ops = prob.getOperations();
 
   CpModelBuilder model;
@@ -1808,7 +1811,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   DenseMap<Operation *, IntVar> inCycle;
   if (!sels.empty())
     inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, opts.regFloor,
-                               &sels, areaMode && hint);
+                               &sels, hint);
   // This model's own view of the collected classes; the copy carries the
   // per-model variables, the collection stays pristine for the writeback.
   SharedClasses shared = sharedMeta;
@@ -1835,7 +1838,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     model.AddEquality(startVars.at(op),
                       lap * static_cast<int64_t>(ii) +
                           LinearExpr::WeightedSum(slots, classes));
-    if (areaMode && hint) {
+    if (hint) {
       unsigned at = *prob.getStartTime(op);
       for (unsigned p = 0; p < ii; ++p)
         model.AddHint(slots[p], p == at % ii);
@@ -1911,8 +1914,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       model.AddLessOrEqual(usesIn(alloc.rsrc, slot), alloc.units);
   }
   addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
-                        opts.regFloor, sels.empty() ? nullptr : &inCycle,
-                        areaMode && hint);
+                        opts.regFloor, sels.empty() ? nullptr : &inCycle, hint);
 
   // `(trip - 1) * ii` is constant at a fixed II, so minimizing the span here is
   // minimizing the drain; the outer search carries the II term. With no span to
@@ -1921,9 +1923,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   if (span.trip) {
     drainVar = drainVariable(model, startVars, span.drain, horizon, drainBound,
                              latExpr,
-                             areaMode && hint
-                                 ? std::optional(span.drainOf(prob))
-                                 : std::nullopt);
+                             hint ? std::optional(span.drainOf(prob))
+                                  : std::nullopt);
     model.AddGreaterOrEqual(*drainVar, floorDrain);
   }
   IntVar primary = drainVar.value_or(orderedStarts[anchorIndex]);
