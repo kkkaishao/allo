@@ -59,6 +59,11 @@ class SchedulerOptions:
             this handle's own scheduler settings, and after emission the
             clock is tightened once more to the realized critical path. The
             handle's ``freq_mhz`` follows, and cosim runs at it.
+            ``"wall"`` makes the whole wall time the objective: candidate
+            periods on BOTH sides of the requested clock are probed and the
+            span-times-period winner is solved, so the clock may come back
+            slower than asked where a shallower operator row pays for itself.
+            The requested clock is a reference, not a bound.
         cycle_ns: the operating clock period, derived from the handle's
             ``freq_mhz``, which the cosim clock also reads. Chains are cut to
             it less the ``clock_margin`` withheld.

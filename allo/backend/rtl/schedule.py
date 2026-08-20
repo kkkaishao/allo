@@ -88,9 +88,9 @@ def run_schedule(
             top,
             model_ns,
             options.scheduler,
-            # "freq" is a period policy this driver sweeps; its region solves
-            # run under the cycles order.
-            "cycles" if options.O == "freq" else options.O,
+            # "freq" and "wall" are period policies this driver sweeps; their
+            # region solves run under the cycles order.
+            "cycles" if options.O in ("freq", "wall") else options.O,
             options.budget,
             allocate,
             options.workers,
@@ -209,6 +209,90 @@ def sweep_freq(
             and all(vectors[p.cycle_ns][k] <= v * tol for k, v in ref.items())
         ]
     winner = min(eligible, key=lambda p: (p.achieved_ns, p.latency or 0))
+    module = make_module()
+    result = run_schedule(
+        top, module, replace(options, cycle_ns=winner.cycle_ns), prepass, allocate
+    )
+    return module, replace(result, sweep=tuple(curve))
+
+
+# The wall sweep's ladder: this many geometric rungs between the aggressive
+# anchor and the slowest period any device row is built for.
+_WALL_RUNGS = 10
+
+
+def sweep_wall(
+    top,
+    make_module: Callable[[], Module],
+    options: SchedulerOptions,
+    prepass: PrepassOptions,
+    allocate: bool,
+    floor_ns: float,
+    cap_ns: float,
+) -> tuple[Module, ScheduleResult]:
+    """Minimize wall time under ``O="wall"``: probe candidate periods on both
+    sides of the requested clock with the heuristic scheduler, take the one
+    whose span times achieved period is least, and solve once there under the
+    caller's own scheduler settings. The requested clock is a reference, not a
+    bound: a slower clock that unlocks a shallower operator row can win.
+    ``cap_ns`` tops the ladder at the slowest period any device row is built
+    for, past which nothing new unlocks; ``floor_ns`` is the register floor
+    the aggressive anchor stands on. A kernel with no composed span has no
+    wall time to compare and is refused. Returns the scheduled module and its
+    result, with the probed curve published as ``ScheduleResult.sweep``."""
+    margin = 1.0 - options.clock_margin
+
+    def probe(period: float) -> SweepPoint:
+        opts = replace(options, scheduler="heuristic", cycle_ns=period)
+        result = run_schedule(top, make_module(), opts, prepass, allocate)
+        fn = result.func(top)
+        return SweepPoint(
+            cycle_ns=period,
+            achieved_ns=result.cycle_ns / margin,
+            latency=fn.latency,
+            latency_is_bound=fn.latency_is_bound,
+        )
+
+    asked = probe(options.cycle_ns)
+    if asked.latency is None:
+        raise RuntimeError(
+            f"O='wall' compares span times period, and '{top}' publishes no "
+            "span at the requested clock; add allo.assume trip bounds or "
+            "choose a different objective"
+        )
+    points = [asked]
+    best = asked.latency * asked.achieved_ns
+    lo = 2.0 * floor_ns / margin if floor_ns > 0 else options.cycle_ns / 8.0
+    hi = max(cap_ns, options.cycle_ns, lo)
+    # Descending walk with the incumbent: the laxest candidate's span bounds
+    # every candidate's from below (feasible sets only grow with the period),
+    # so a period that laxest span cannot win at is skipped unprobed.
+    floor_span = None
+    for k in range(_WALL_RUNGS):
+        period = hi * (lo / hi) ** (k / (_WALL_RUNGS - 1))
+        if abs(period - options.cycle_ns) < 1e-9:
+            continue
+        if floor_span is not None and floor_span * period >= best:
+            continue
+        p = probe(period)
+        assert p.latency is not None, (
+            "a span is a property of the kernel's trip structure, which no "
+            "probed period changes"
+        )
+        floor_span = floor_span if floor_span is not None else p.latency
+        best = min(best, p.latency * p.achieved_ns)
+        points.append(p)
+    # Candidates that derate onto the same achieved period are one design;
+    # keep the laxest ask of each.
+    seen: set[float] = set()
+    curve: list[SweepPoint] = []
+    for p in sorted(points, key=lambda p: p.cycle_ns, reverse=True):
+        if (key := round(p.achieved_ns, 3)) not in seen:
+            seen.add(key)
+            curve.append(p)
+    # Fewer cycles breaks a wall tie: the shorter schedule at the slower
+    # clock spends less on pipeline registers.
+    winner = min(curve, key=lambda p: (p.latency * p.achieved_ns, p.latency))
     module = make_module()
     result = run_schedule(
         top, module, replace(options, cycle_ns=winner.cycle_ns), prepass, allocate

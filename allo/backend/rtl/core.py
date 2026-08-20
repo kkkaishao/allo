@@ -32,7 +32,7 @@ from .interface import Interfaces
 from .options import PrepassOptions, SchedulerOptions
 from .qor import QoR, estimate
 from .reports import CompileReport, MicroarchReport, ScheduleResult
-from .schedule import run_schedule, sweep_freq
+from .schedule import run_schedule, sweep_freq, sweep_wall
 from .sim import shell
 from ...lang.core import ShapedType
 from ...lang.kernel import Kernel
@@ -193,17 +193,42 @@ class RTL(Backend[P, R]):
             # An allocation is only worth deciding where the emitter builds it:
             # the trivial binding keeps one unit per operation.
             allocate = self.binding != "trivial"
-            if self._sched_opts.O == "freq":
+            if self._sched_opts.O in ("freq", "wall"):
                 # The clock is an output: the sweep probes candidate periods
                 # on fresh copies, and the handle follows the winner.
-                self._dcp_ir, self._schedule_result = sweep_freq(
-                    self.top,
-                    make_module,
-                    self._sched_opts,
-                    self._prepass_opts,
-                    allocate,
-                    self._device.reg_delay_ns,
-                )
+                if self._sched_opts.O == "freq":
+                    self._dcp_ir, self._schedule_result = sweep_freq(
+                        self.top,
+                        make_module,
+                        self._sched_opts,
+                        self._prepass_opts,
+                        allocate,
+                        self._device.reg_delay_ns,
+                    )
+                else:
+                    # The slowest clock any operator row is built for caps the
+                    # wall ladder: past the deepest row nothing new unlocks.
+                    reg = self._device.reg_delay_ns
+                    cap = max(
+                        (
+                            max(
+                                reg + o.timing.in_delay_ns,
+                                o.timing.out_delay_ns,
+                                o.timing.min_period_ns,
+                            )
+                            for o in self._device.operators
+                        ),
+                        default=0.0,
+                    )
+                    self._dcp_ir, self._schedule_result = sweep_wall(
+                        self.top,
+                        make_module,
+                        self._sched_opts,
+                        self._prepass_opts,
+                        allocate,
+                        reg,
+                        cap,
+                    )
                 self._set_clock(
                     self._schedule_result.cycle_ns
                     / (1.0 - self._sched_opts.clock_margin)
@@ -288,9 +313,9 @@ class RTL(Backend[P, R]):
             # The boundary document verbatim, for `scaffold_project` to write.
             self._manifest = envelope["interfaces"]
             self._hw_ir = work
-            # freq mode's last step: collect the packing slack the sweep's
-            # winner left by clocking at the realized critical path.
-            if self._sched_opts.O == "freq":
+            # The period policies' last step: collect the packing slack the
+            # sweep's winner left by clocking at the realized critical path.
+            if self._sched_opts.O in ("freq", "wall"):
                 self.tighten_clock()
         return self._hw_ir
 
@@ -347,7 +372,7 @@ class RTL(Backend[P, R]):
         missed it slows down. A bound row's warranted period caps the move:
         internal pipeline stages are not paths the estimator can see. Returns
         the new ``freq_mhz``, which ``cosim`` then drives. Runs by itself at
-        compile under ``O="freq"``."""
+        compile under ``O="freq"`` and ``O="wall"``."""
         period = 1000.0 / self.estimation.fmax
         floors = {o.symbol: o.timing.min_period_ns for o in self._device.operators}
         bound = {op.impl for m in self.interfaces.values() for op in m.operators}

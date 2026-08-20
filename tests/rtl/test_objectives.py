@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from allo import kernel
-from allo.lang import i32
+from allo.lang import f32, i32
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import _impls, _to_rtl  # noqa: E402
@@ -115,6 +115,48 @@ def test_freq_objective_sweeps_a_kernel_with_no_composed_span():
     out = np.zeros(1, dtype=np.int32)
     rtl.cosim(A, out)
     assert out[0] == 5
+
+
+def test_wall_objective_trades_the_clock_for_iterations():
+    # O="wall" minimizes span times period. A float accumulation is II-bound
+    # by the adder's depth at the default clock; the latency-1 row at a slower
+    # clock costs less wall time per iteration, so the sweep slows the clock
+    # down and the shallow row wins.
+    @kernel
+    def acc(A: f32[64], out: f32[1]):
+        s: f32 = 0.0
+        for i in range(64):
+            s = s + A[i]
+        out[0] = s
+
+    base = _to_rtl(acc)
+    wall0 = base.schedule().func("acc").latency * (1000.0 / base.freq_mhz)
+
+    rtl = _to_rtl(acc).set_scheduler_opt(O="wall")
+    result = rtl.schedule()
+    assert result.sweep and len(result.sweep) > 2
+    assert rtl.freq_mhz < base.freq_mhz
+    assert "add_f32_f32_f32_l1" in _impls(result)
+    assert result.func("acc").latency * (1000.0 / rtl.freq_mhz) < wall0
+    A = np.ones(64, dtype=np.float32)
+    out = np.zeros(1, dtype=np.float32)
+    rtl.cosim(A, out)
+    assert out[0] == 64.0
+
+
+def test_wall_objective_refuses_a_kernel_with_no_composed_span():
+    # Wall time is span times period; with no span there is nothing to
+    # minimize, unlike O="freq", which leashes the per-region vector instead.
+    @kernel
+    def find(A: i32[64], out: i32[1]):
+        i: i32 = 0
+        while A[i] < 100:
+            i += 1
+        out[0] = i
+
+    rtl = _to_rtl(find).set_scheduler_opt(O="wall")
+    with pytest.raises(RuntimeError, match="publishes no span"):
+        rtl.schedule()
 
 
 def test_tighten_clock_moves_the_operating_clock_to_the_realized_path():
