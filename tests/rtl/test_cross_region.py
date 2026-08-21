@@ -431,6 +431,47 @@ def test_multiregion_latency_matches_cosim():
     assert np.array_equal(out, (A16 + 1) * 2 + 3)
 
 
+# A region's completion is already a pulse; latching it into a level only to
+# have the successor rebuild the pulse with a rising-edge detector spends two
+# registers where one does, since the registered pulse is high in the very cycle
+# the level would have risen in. So a sequenced region latches no level: it
+# hands its successor an `r<N>_drain` register. Only the container keeps a
+# `done`, whose level the module's own port reads.
+def test_a_sequenced_region_hands_over_a_registered_pulse():
+    @kernel
+    def k(A: i32[16, 16], B: i32[16], C: i32[16]):
+        for i in range(16):
+            s: i32 = 0
+            for j in range(16):
+                s += A[i, j]
+            B[i] = s
+            t: i32 = 0
+            for j2 in range(16):
+                t += A[i, j2] + 1
+            C[i] = t
+
+    rtl = _to_rtl(k)
+    m = Mod(rtl.mlir, "k")
+    assert m.regions_with("done") == [0], m.regions_with("done")
+    # The four children of the outer container: two reductions and two stores.
+    assert m.regions_with("drain") == [1, 2, 3, 4], m.regions_with("drain")
+    # One register per boundary, and no mux: a held level would be spelled
+    # `mux(start, false, mux(set, true, done))`.
+    for r in m.regions_with("drain"):
+        _, inp = m.reg_named(f"r{r}_drain")
+        assert not m.mux(inp), f"r{r}_drain holds a level: {m.defs[inp]}"
+    # A store region launches on its predecessor's drain and commits in that
+    # same cycle, so its own hand-off is that pulse one register later.
+    assert m.reg_named("r2_drain")[1] == "r1_drain"
+
+    A = (np.arange(16 * 16, dtype=np.int32) % 71).reshape(16, 16)
+    B = np.zeros(16, np.int32)
+    C = np.zeros(16, np.int32)
+    rtl.cosim(A, B, C)
+    assert np.array_equal(B, A.sum(1))
+    assert np.array_equal(C, (A + 1).sum(1))
+
+
 def test_independent_siblings_run_concurrently_cosim():
     # Two sibling sweeps on DISJOINT arrays (no shared memref, no survivor)
     # have no dependence, so the composer starts them together instead of

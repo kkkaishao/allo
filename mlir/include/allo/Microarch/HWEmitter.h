@@ -122,11 +122,13 @@ struct DatapathFeedback {
 //===----------------------------------------------------------------------===//
 struct IterationControl {
   RegionControl rc;
+  /// The latched completion level, null where the caller declared it unused
+  /// and only the pulse below was built.
   Value done;
   /// The pulse that sets `done`: high in the completion cycle itself, one
-  /// cycle before the latched level. Consumed only for the checked controller;
-  /// a counted region's pulse is its commit cycle and no successor may start
-  /// on it.
+  /// cycle before the latched level. A successor may start on it directly only
+  /// where `handoffSafe` says the region's state has settled; otherwise it is
+  /// registered, which lands in the level's own rising-edge cycle.
   Value donePulse;
 };
 
@@ -173,19 +175,22 @@ struct ControlEmitter {
   /// caller resolves once the body has emitted). \p rb's `shape` decides
   /// whether the first pass may launch on \p start itself. With \p chained,
   /// \p complete is the last child's commit pulse and the next pass launches
-  /// on it directly.
+  /// on it directly. Without \p wantLevel the completion latch is not built and
+  /// only `donePulse` is returned.
   IterationControl emitCountedIteration(const uarch::RegionBlock &rb,
                                         const Terminator &term, Value start,
-                                        Value complete, bool chained) const;
+                                        Value complete, bool chained,
+                                        bool wantLevel) const;
   /// The conditional done-driven controller: `Container` x `Conditional`, a
   /// sequential-wrapper while. A CHECK pulse one cycle after \p start and after
   /// each body drain (\p complete) re-evaluates \p cond on the settled
   /// iter-args, \p tCond cycles later for a condition that reads memory or an
   /// IP, then forks to continue or finish. The region has no counter, so the
-  /// returned `rc.counter` is null.
+  /// returned `rc.counter` is null. Without \p wantLevel the completion latch
+  /// is not built and only `donePulse` is returned.
   IterationControl emitCheckedIteration(unsigned region, Value cond,
                                         unsigned tCond, Value start,
-                                        Value complete) const;
+                                        Value complete, bool wantLevel) const;
 
   /// The region's completion signal, one latched level for every regime: it
   /// rises when \p lastIssue delayed `rb.drainStage` cycles lands, or
@@ -198,11 +203,14 @@ struct ControlEmitter {
   /// back-pressure, the last store or token not being committed until it is
   /// accepted.
   /// Returns {level, pulse}: the latched level and the pulse that sets it,
-  /// which is high in the last commit cycle itself.
+  /// which is high in the last commit cycle itself. Without \p wantLevel the
+  /// latch is not built and the level comes back null: a successor reading only
+  /// the level's rising edge registers the pulse instead, which is the same
+  /// cycle for one register rather than two.
   std::pair<Value, Value> emitDone(const uarch::RegionBlock &rb,
                                    Value lastIssue, Value emptyDone,
                                    Value start, bool retrig,
-                                   const StallShell &sh) const;
+                                   const StallShell &sh, bool wantLevel) const;
 };
 
 //===----------------------------------------------------------------------===//
@@ -742,8 +750,12 @@ struct HWEmitter {
   /// Emit one region and return its `done`. A leaf runs one imperative path for
   /// every regime (counted / dynamic-trip / while): control -> datapath ->
   /// resolve the F->G condition, capture results, done. A container runs its
-  /// children once per outer iteration.
-  Value emitRegion(const uarch::RegionBlock &rb, Value start, bool retrig);
+  /// children once per outer iteration. With \p levelUnused the caller reads
+  /// only `donePulse`, so the completion latch is skipped and the return is
+  /// null; a region completing on a call's done has no pulse and keeps its
+  /// level regardless.
+  Value emitRegion(const uarch::RegionBlock &rb, Value start, bool retrig,
+                   bool levelUnused);
   /// A loop-over-call region: a counted `dcp.pipeline` wrapping one
   /// `dcp.instance`. One child instance is fired \p tripCount times, a counter
   /// driving its index and each invocation advancing on the child's real
@@ -762,12 +774,18 @@ struct HWEmitter {
   unsigned captureResults(const uarch::RegionBlock &rb, Value captureOn,
                           Value start);
   /// Run \p regions in program order, each starting when its predecessor drains
-  /// (the first on \p start); returns the last region's done. The shared
-  /// sequencer for func-scope siblings and a container's children. A successor
-  /// starts on its predecessor's completion pulse where `handoffSafe` allows,
-  /// saving the done-latch cycle.
+  /// (the first on \p start); returns the last region's drain pulse. The shared
+  /// sequencer for a container's children and a guard's arms. No done level is
+  /// wanted anywhere along the chain, so no region in it builds one. With \p
+  /// tailOnPulse the tail's drain is its completion pulse itself, which only a
+  /// caller that has checked the tail's state has settled may ask for.
   Value sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
-                 bool retrig);
+                 bool retrig, bool tailOnPulse = false);
+  /// The cycle a successor of region \p rid may start in: its completion pulse
+  /// where `handoffSafe` allows the same cycle, that pulse registered
+  /// otherwise, and the rising edge of \p done for a region that recorded no
+  /// pulse and so kept its level.
+  Value drainPulse(uarch::RegionId rid, Value done);
   /// Whether a successor may start on \p rb's completion pulse rather than on
   /// its latched done. True for a conditional region, whose exit trails every
   /// commit and every iter-arg latch by at least a cycle, and for a
@@ -827,19 +845,21 @@ struct HWEmitter {
   /// A counted container: wire `emitCountedIteration` to a body that sequences
   /// its children, so the outer counter advances when the last child drains. A
   /// cross-region result crosses child-to-child as a survivor register.
-  Value emitContainer(const uarch::RegionBlock &rb, Value start);
+  Value emitContainer(const uarch::RegionBlock &rb, Value start,
+                      bool levelUnused);
   /// A conditional container (a sequential-wrapper while): the same
   /// per-iteration child sequencing as emitContainer, but the outer iter-args
   /// are frozen survivor registers advanced by the children's results and the
   /// loop terminates on a continue-condition re-evaluated over them, so the
   /// controller is `emitCheckedIteration` rather than the counted one.
-  Value emitConditionalContainer(const uarch::RegionBlock &rb, Value start);
+  Value emitConditionalContainer(const uarch::RegionBlock &rb, Value start,
+                                 bool levelUnused);
   /// A guard region (a dcp.select): a predicated container whose children run
   /// once iff the held predicate (`rb.condition`) holds, else are skipped. The
   /// predicate start-gates child 0 (`start & cond`); a false predicate
   /// completes the region in one cycle (`start & ~cond`) without ever issuing
   /// the children, so their stores never fire.
-  Value emitGuard(const uarch::RegionBlock &rb, Value start);
+  Value emitGuard(const uarch::RegionBlock &rb, Value start, bool levelUnused);
   /// Emit the whole module body: preamble + each top-level region in order.
   void emit();
 };

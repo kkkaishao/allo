@@ -200,10 +200,9 @@ RegionControl ControlEmitter::emitPipelined(const uarch::RegionBlock &rb,
 // the `isLast` test against the bound, the launch pulse, and a done latch
 // cleared on `start`. They differ only in when the FIRST pass launches, spelled
 // as the two families' `arm` in `LatencyModel.h`.
-IterationControl
-ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
-                                     const Terminator &term, Value start,
-                                     Value complete, bool chained) const {
+IterationControl ControlEmitter::emitCountedIteration(
+    const uarch::RegionBlock &rb, const Terminator &term, Value start,
+    Value complete, bool chained, bool wantLevel) const {
   assert(term.lb && "a counted iteration controller needs induction bounds");
   // A chained container turns over for free: `complete` is the last child's
   // commit pulse and the next pass launches on it. Its first child samples
@@ -256,8 +255,11 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
                 "done latch; a different declared cost must be built here");
   Value empty = c.reg(c.andBits(start, term.isEmpty(c)), c.f1);
   Value donePulse = c.orBits(empty, c.andBits(complete, last));
-  Value done = c.holdDone(donePulse, start);
-  nameValue(done, regionSignal(rb.id, "done"));
+  Value done;
+  if (wantLevel) {
+    done = c.holdDone(donePulse, start);
+    nameValue(done, regionSignal(rb.id, "done"));
+  }
   return {{/*issue=*/launch, /*counter=*/iv, /*wantIssue=*/Value(),
            /*running=*/Value(), /*phase=*/Value(),
            /*scaledCounters=*/std::move(scaled)},
@@ -274,11 +276,10 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
 // into launch / finish. The zero-iteration case needs no separate empty term:
 // the first CHECK already answers it, a cycle after `start`, which is exactly
 // the edge hygiene `done` needs.
-IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
-                                                      Value cond,
-                                                      unsigned tCond,
-                                                      Value start,
-                                                      Value complete) const {
+IterationControl
+ControlEmitter::emitCheckedIteration(unsigned region, Value cond,
+                                     unsigned tCond, Value start,
+                                     Value complete, bool wantLevel) const {
   static_assert(kCheckedBoundary.arm == kCheckedBoundary.reArm,
                 "one CHECK register serves both the start and the drain path; "
                 "differing costs would need them split as in the counted "
@@ -292,8 +293,11 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
   Value settled = c.delayValid(check, tCond, StallShell{});
   auto [launch, finish] = c.branchPulse(settled, cond);
   nameValue(launch, regionSignal(region, "fire"));
-  Value done = c.holdDone(finish, start);
-  nameValue(done, regionSignal(region, "done"));
+  Value done;
+  if (wantLevel) {
+    done = c.holdDone(finish, start);
+    nameValue(done, regionSignal(region, "done"));
+  }
   return {{/*issue=*/launch, /*counter=*/Value(), /*wantIssue=*/Value(),
            /*running=*/Value(), /*phase=*/Value(), /*scaledCounters=*/{}},
           done,
@@ -349,12 +353,12 @@ RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
 // sibling starting on this done's edge reads every committed store and
 // survivor. Keying on `lastIssue` rather than a store-retire count keeps a
 // region that retires several stores in one cycle from completing early. A
-// `retrig` region resets its completion state on `start`.
-std::pair<Value, Value> ControlEmitter::emitDone(const uarch::RegionBlock &rb,
-                                                 Value lastIssue,
-                                                 Value emptyDone, Value start,
-                                                 bool retrig,
-                                                 const StallShell &sh) const {
+// `retrig` region resets its completion state on `start`. A caller that wants
+// no level takes the pulse alone and registers it where it needs the edge.
+std::pair<Value, Value>
+ControlEmitter::emitDone(const uarch::RegionBlock &rb, Value lastIssue,
+                         Value emptyDone, Value start, bool retrig,
+                         const StallShell &sh, bool wantLevel) const {
   Value fire = c.delayValid(lastIssue, rb.drainStage, sh);
   // The final put is not committed until accepted, so gate the completion pulse
   // on the region's clock-enable: `done` holds through back-pressure on the
@@ -366,6 +370,8 @@ std::pair<Value, Value> ControlEmitter::emitDone(const uarch::RegionBlock &rb,
   static_assert(kDoneLatchCycles == 1,
                 "completion is one latch register below; a different declared "
                 "cost would have to be built here, not just written down");
+  if (!wantLevel)
+    return {Value(), fire};
   auto dNext = c.bb.get(c.i1);
   Value done = c.reg(dNext, c.f1);
   nameValue(done, regionSignal(rb.id, "done"));
