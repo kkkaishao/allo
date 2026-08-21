@@ -179,8 +179,10 @@ public:
   /// non-comb rows of `matchEntries` that fit the period and are measured at
   /// \p op's width, in declaration order. The row `lookup` resolves is always
   /// among them when it is an IP: selection ranks fit rows first, and a derate
-  /// raises the period until one fits.
-  SmallVector<OperatorChar, 2> candidateChars(Operation *op) const;
+  /// raises the period until one fits. \p withComb appends the combinational
+  /// row too, where it is measured at the width and its chain fits the period.
+  SmallVector<OperatorChar, 2> candidateChars(Operation *op,
+                                              bool withComb = false) const;
 
   /// The clock period (ns) selection ranks IP rows against: a row that fits it
   /// outranks one that does not. Set when the module's period resolves and
@@ -243,6 +245,12 @@ public:
   /// \p results.
   bool hasAdvancedRow(llvm::StringRef mnem, TypeRange args,
                       TypeRange results) const;
+
+  /// The cheapest price among the advanced rows declaring \p mnem at exactly
+  /// \p args -> \p results, at \p width; nullopt where none is priced there.
+  std::optional<int64_t> advancedRowPrice(llvm::StringRef mnem, TypeRange args,
+                                          TypeRange results,
+                                          int64_t width) const;
 
   /// The same two, for a caller holding a reified realization (a
   /// `dcp.compute`'s `comb_kind`). Falls back to the default row, not to 0.0,
@@ -406,20 +414,26 @@ NodeTiming accessCharacterization(Operation *op, const OperatorLibrary &opLib,
                                   const MemoryLibrary &memLib);
 
 /// The rows an exact solve may choose among for \p op, the library's own pick
-/// among them: at least two fit, measured IP candidates that differ somewhere
+/// among them: at least two fit, measured candidates that differ somewhere
 /// a schedule can see (latency, a delay, a price). Empty where the
-/// realization is not a solver decision: a comb or default realization, a
+/// realization is not a solver decision: a default realization, a
 /// zero-delay rename, a single usable candidate, a zero-latency row with
 /// unequal delays (`checkDelays` rejects it), or under \p cyclic a pick the
 /// pipelined-only limit drops (an occupancy window that varied with the
 /// decision would move the interval bound the search starts from).
 ///
+/// \p withComb admits the combinational row beside the IPs, which is what
+/// lets a resource weight steer an operation between fabrics. Only the area
+/// objective passes it: the cycles order would take the zero-latency comb row
+/// on span wherever its chain fits, a flip no price can veto.
+///
 /// An operation with choices joins no STATIC class:
 /// `populateOperatorAllocation` skips it, and the exact solve folds it into
 /// the class of the row it decides (a shared class), straight-line and
 /// modulo alike.
-SmallVector<OperatorChar, 2>
-selectionCandidates(Operation *op, const OperatorLibrary &lib, bool cyclic);
+SmallVector<OperatorChar, 2> selectionCandidates(Operation *op,
+                                                 const OperatorLibrary &lib,
+                                                 bool cyclic, bool withComb);
 
 /// Assign an operator type (latency + chaining delays) to every operation
 /// \p problem holds. Three sources, because a problem holds three kinds of
@@ -574,7 +588,7 @@ enum class AllocationScope { All, Static, Selecting };
 
 template <class ProblemT>
 void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib,
-                                AllocationScope scope) {
+                                AllocationScope scope, bool withComb = false) {
   using namespace circt::scheduling;
   constexpr bool isCyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
   // The loop whose carried values a shared unit re-injects; its own induction
@@ -604,7 +618,7 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib,
     if (!c.identity.realized() || c.identity.comb)
       continue;
     bool selects = scope != AllocationScope::All &&
-                   !selectionCandidates(op, lib, isCyclic).empty();
+                   !selectionCandidates(op, lib, isCyclic, withComb).empty();
     if (scope == AllocationScope::Static && selects)
       continue; // the realization is the solver's decision
     if (scope == AllocationScope::Selecting && !selects)

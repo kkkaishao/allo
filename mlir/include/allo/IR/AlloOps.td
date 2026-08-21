@@ -573,9 +573,15 @@ def DCPathResourceOp : DCPath_Op<"dcp.resource", [Symbol]> {
     independently, so a whole-device budget is not a quantity any one solve can
     enforce; what capacity is for is deriving a price (a resource the device has
     less of costs more) and reporting utilization.
+
+    `weight` scales the derived price multiplicatively: preference the scarcity
+    currency cannot express (a design that must keep its DSPs free, a part
+    whose DSPs would otherwise sit idle). Absent means 1.0.
   }];
-  let arguments = (ins SymbolNameAttr:$sym_name, I64Attr:$capacity);
-  let assemblyFormat = "$sym_name `capacity` `=` $capacity attr-dict";
+  let arguments = (ins SymbolNameAttr:$sym_name, I64Attr:$capacity,
+                       OptionalAttr<F32Attr>:$weight);
+  let assemblyFormat =
+      "$sym_name `capacity` `=` $capacity (`weight` `=` $weight^)? attr-dict";
 }
 
 def DCPathCombOp : DCPath_Op<"dcp.comb",

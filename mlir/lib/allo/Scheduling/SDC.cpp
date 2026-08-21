@@ -856,7 +856,8 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
     populateOperatorAllocation(problem, dev.operators,
                                usesExactScheduler(opts.kind)
                                    ? AllocationScope::Static
-                                   : AllocationScope::All);
+                                   : AllocationScope::All,
+                               opts.objective == ScheduleObjective::Area);
   // Overlapping iterations only: without overlap the RAW round trip costs
   // depth, not II, and a shadow would buy latency a mux is not worth.
   ForwardRelaxation relax;
@@ -969,7 +970,8 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
     populateOperatorAllocation(problem, dev.operators,
                                usesExactScheduler(opts.kind)
                                    ? AllocationScope::Static
-                                   : AllocationScope::All);
+                                   : AllocationScope::All,
+                               opts.objective == ScheduleObjective::Area);
   Operation *anchor = w.getYieldOp().getOperation();
   // Honor a requested target II (>=1) as a lower bound. `ii=-1` (pipelining
   // off) is not modeled for while loops.
@@ -1079,7 +1081,8 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops,
     populateOperatorAllocation(problem, dev.operators,
                                usesExactScheduler(opts.kind)
                                    ? AllocationScope::Static
-                                   : AllocationScope::All);
+                                   : AllocationScope::All,
+                               opts.objective == ScheduleObjective::Area);
   // A straight-line region runs once, so its whole cost is its drain, and it
   // carries nothing between iterations it does not have.
   SpanObjective span(problem, spanEscapingValues(ops),

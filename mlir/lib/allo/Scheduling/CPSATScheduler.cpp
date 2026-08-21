@@ -133,12 +133,13 @@ struct SelectionChoice {
 /// rows (`selectionCandidates`, which also keeps such an operation out of
 /// every allocation class), and the library's own pick located among them.
 template <class ProblemT>
-SmallVector<SelectionChoice, 0> selectionChoices(ProblemT &prob,
-                                                 const OperatorLibrary &lib) {
+SmallVector<SelectionChoice, 0>
+selectionChoices(ProblemT &prob, const OperatorLibrary &lib, bool withComb) {
   constexpr bool cyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
   SmallVector<SelectionChoice, 0> choices;
   for (Operation *op : prob.getOperations()) {
-    SmallVector<OperatorChar, 2> cands = selectionCandidates(op, lib, cyclic);
+    SmallVector<OperatorChar, 2> cands =
+        selectionCandidates(op, lib, cyclic, withComb);
     if (cands.empty())
       continue;
     std::string own = lib.lookup(op).timing.typeName;
@@ -393,6 +394,10 @@ SharedClasses collectSharedClasses(ProblemT &prob, const OperatorLibrary &lib,
     if (auto it = choiceOf.find(op); it != choiceOf.end()) {
       bool carried = readsCarried(op);
       for (auto [m, cand] : llvm::enumerate(choices[it->second].cands)) {
+        // A comb candidate builds no allocatable instance: choosing it means
+        // joining no class, and its price rides the selection term alone.
+        if (cand.identity.comb)
+          continue;
         SharedClassVar &cls = byIdentity[cand.identity.key()];
         shapeOf(cls, op, cand);
         cls.conds.push_back(
@@ -1147,9 +1152,10 @@ void applyAllocation(OccupancyProblem &prob, const Allocated &decided,
 /// instance instead of opening the whole class to its ceiling.
 template <class ProblemT>
 void applyFallbackAllocation(ProblemT &prob, const OperatorLibrary &lib,
-                             bool allocate, unsigned ii, float cycleTime) {
+                             bool allocate, unsigned ii, float cycleTime,
+                             bool withComb) {
   if (allocate)
-    populateOperatorAllocation(prob, lib, AllocationScope::Selecting);
+    populateOperatorAllocation(prob, lib, AllocationScope::Selecting, withComb);
   int64_t built = 0, ops = 0;
   unsigned classes = 0;
   for (Problem::ResourceType rsrc : prob.getResourceTypes()) {
@@ -1420,8 +1426,12 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     return failure();
 
   // Which row realizes each multi-candidate operation is this solve's
-  // decision too, made alongside the start times.
-  SmallVector<SelectionChoice, 0> choices = selectionChoices(prob, span.device);
+  // decision too, made alongside the start times. Only the area objective
+  // admits the comb row: the cycles order would take its zero latency on span
+  // wherever the chain fits, a flip no price can veto.
+  bool combSel = opts.objective == ScheduleObjective::Area;
+  SmallVector<SelectionChoice, 0> choices =
+      selectionChoices(prob, span.device, combSel);
 
   // The pre-pass is schedule-independent, so taking its edges hands CP-SAT the
   // chain breaks the heuristic just used. They state the period only for the
@@ -1581,7 +1591,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     prob.telemetry.fallback = true;
     prob.telemetry.budgetExhausted = true;
     applyFallbackAllocation(prob, span.device, opts.allocate, /*ii=*/0,
-                            cycleTime);
+                            cycleTime, combSel);
     return success();
   };
 
@@ -2096,8 +2106,11 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
          "placement only ever grows the II");
 
   // Which row realizes each multi-candidate operation is this solve's
-  // decision too, made alongside the placement at each interval.
-  SmallVector<SelectionChoice, 0> choices = selectionChoices(prob, span.device);
+  // decision too, made alongside the placement at each interval. The comb row
+  // joins only under the area objective (see the acyclic entry).
+  bool combSel = opts.objective == ScheduleObjective::Area;
+  SmallVector<SelectionChoice, 0> choices =
+      selectionChoices(prob, span.device, combSel);
 
   // The heuristic ran the same pre-pass, so the schedule this falls back to
   // meets the period. The edges state the period only for the rows the
@@ -2343,7 +2356,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     if (exhaustedAt)
       prob.telemetry.exhaustedAtII = (int64_t)*exhaustedAt;
     applyFallbackAllocation(prob, span.device, opts.allocate, greedyII,
-                            cycleTime);
+                            cycleTime, combSel);
     return success();
   }
 

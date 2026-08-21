@@ -174,6 +174,24 @@ def test_generate_builds_the_row_the_area_measured():
         assert ("CONFIG.C_Mult_Usage No_Usage" in block) != spends_dsp
 
 
+def test_generate_builds_the_fabric_multiply_out_of_luts():
+    # The multiply's fabric row spends no DSPs, so it rebuilds with the recipe's
+    # DSP-free fragment. That fragment repeats a key the shape already sets and
+    # has to land after it, which is what a `set_property -dict` list resolves.
+    @kernel
+    def mk(x: i32[8], y: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = x[i] * y[i]
+
+    rtl = mk.schedule().export("rtl")
+    rtl.set_scheduler_opt(resource_weights={"dsp": 8.0})
+    rtl.compile()
+    g = vivado.generate(rtl.interfaces, default_device)
+    (mul,) = [op for op in _operators(rtl) if op.impl.startswith("mullut")]
+    block = _tcl_of(g, mul.impl)
+    assert block.index("Use_LUTs") > block.index("Use_Mults")
+
+
 def test_generate_wraps_integer_cores():
     # `t` has two consumers, so it keeps the plain multiplier core; the
     # single-use `x * z` over a ready addend fuses and builds the `rtl` shim.

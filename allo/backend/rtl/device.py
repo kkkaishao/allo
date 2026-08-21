@@ -33,11 +33,13 @@ class Resource:
     different names and the compiler, which only adds and multiplies these, does
     not care. ``capacity`` is a price input rather than a constraint: regions are
     scheduled independently, so a whole-device budget is not a quantity any one
-    solve can enforce.
+    solve can enforce. ``weight`` scales the derived scarcity price, expressing
+    a preference the capacity alone cannot.
     """
 
     name: str
     capacity: int
+    weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -469,14 +471,20 @@ class Device:
             )
         return delay
 
-    def add_resource(self, name: str, capacity: int) -> Resource:
+    def add_resource(
+        self, name: str, capacity: int, *, weight: float = 1.0
+    ) -> Resource:
         """Declare a resource this device has ``capacity`` of, and return the
-        handle a cost refers to."""
+        handle a cost refers to. ``weight`` scales the price the compiler
+        derives from scarcity; a schedule-time ``resource_weights`` map
+        composes onto it multiplicatively."""
         if name in self.resources:
             raise ValueError(f"resource {name!r} already declared")
         if capacity <= 0:
             raise ValueError(f"resource {name!r} must have a positive capacity")
-        r = Resource(name, int(capacity))
+        if weight <= 0.0:
+            raise ValueError(f"resource {name!r} must have a positive weight")
+        r = Resource(name, int(capacity), float(weight))
         self.resources[name] = r
         return r
 
@@ -953,11 +961,13 @@ def _uses_attr(spent, scope: str = ""):
     return _res_use_array(spent, scope) if spent else None
 
 
-def inject_device(module, device: Device):
+def inject_device(module, device: Device, weights: dict[str, float] | None = None):
     """Inject the device technology tables as a module-level ``dcp.device`` op:
     the per-kind combinational chaining delays and the storage model, which
     override the built-in library defaults. Target frequency is not injected: it
-    is a per-run scheduling parameter, not technology data."""
+    is a per-run scheduling parameter, not technology data. ``weights`` are the
+    schedule-time resource price multipliers, composed onto each resource's own
+    declared weight."""
     from ..._mlir.ir import (
         InsertionPoint,
         Location,
@@ -1001,9 +1011,20 @@ def inject_device(module, device: Device):
         # symbol the others refer to. One op to inject, one to erase.
         body = dev.regions[0].blocks.append()
         with InsertionPoint(body):
+            for name in weights or {}:
+                if name not in device.resources:
+                    raise ValueError(
+                        f"resource_weights names {name!r}, which device "
+                        f"{device.name!r} does not declare"
+                    )
             for r in device.resources.values():
+                w = r.weight * (weights or {}).get(r.name, 1.0)
+                if w <= 0.0:
+                    raise ValueError(f"resource {r.name!r} weight must be positive")
                 DCPathResourceOp(
-                    sym_name=r.name, capacity=IntegerAttr.get(i64, r.capacity)
+                    sym_name=r.name,
+                    capacity=IntegerAttr.get(i64, r.capacity),
+                    weight=None if w == 1.0 else FloatAttr.get(f32ty, w),
                 )
             for kind, delay in device.comb.items():
                 DCPathCombOp(

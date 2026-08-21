@@ -962,9 +962,23 @@ static bool onRecurrence(arith::AddIOp op, arith::MulIOp mul, Value addend) {
 // advanced `muladd` row declares this exact signature; a constant factor is
 // left to `NafConstMul`, whose shift-add expansion is cheaper.
 struct FuseMulAdd : OpRewritePattern<arith::AddIOp> {
-  FuseMulAdd(MLIRContext *ctx, OperatorLibrary &lib)
-      : OpRewritePattern(ctx), lib(lib) {}
+  FuseMulAdd(MLIRContext *ctx, OperatorLibrary &lib, bool areaGate)
+      : OpRewritePattern(ctx), lib(lib), areaGate(areaGate) {}
   OperatorLibrary &lib;
+  /// Under the area objective the fusion must pay for itself: the fused core
+  /// is refused where it prices above the multiply's cheapest row plus the
+  /// combinational add it replaces. The cycles order fuses unconditionally,
+  /// since the span win is what it optimizes.
+  bool areaGate;
+
+  /// The cheapest priced realization of \p op, comb rows included; nullopt
+  /// where the device prices none, which leaves the fusion capability-gated.
+  std::optional<int64_t> cheapest(Operation *op) const {
+    std::optional<int64_t> best;
+    for (const OperatorChar &c : lib.candidateChars(op, /*withComb=*/true))
+      best = best ? std::min(*best, c.price) : c.price;
+    return best;
+  }
   LogicalResult matchAndRewrite(arith::AddIOp op,
                                 PatternRewriter &rewriter) const override {
     auto ity = dyn_cast<IntegerType>(op.getType());
@@ -989,6 +1003,13 @@ struct FuseMulAdd : OpRewritePattern<arith::AddIOp> {
       if (!lib.hasAdvancedRow("muladd", args, ress) ||
           onRecurrence(op, mul, addend))
         continue;
+      if (areaGate) {
+        std::optional<int64_t> fused =
+            lib.advancedRowPrice("muladd", args, ress, ity.getWidth());
+        std::optional<int64_t> mulP = cheapest(mul), addP = cheapest(op);
+        if (fused && mulP && addP && *fused > *mulP + *addP)
+          continue;
+      }
       rewriter.replaceOpWithNewOp<MulAddOp>(op, mul.getLhs(), mul.getRhs(),
                                             addend);
       return success();
@@ -1030,7 +1051,7 @@ struct LegalizeArithPass
     // the fold plus NAF recoding build cheaper constant shift-adds.
     if (expandConstArith) {
       RewritePatternSet fuse(&getContext());
-      fuse.add<FuseMulAdd>(&getContext(), lib);
+      fuse.add<FuseMulAdd>(&getContext(), lib, areaFuseGate);
       if (failed(applyPatternsGreedily(module, std::move(fuse))))
         return signalPassFailure();
     }

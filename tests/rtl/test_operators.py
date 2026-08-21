@@ -2692,3 +2692,147 @@ def test_a_multiply_feeding_one_add_fuses_onto_the_device_row():
 
     for kern in (mac16, shared, constf, tree):
         assert "muladd" not in kern.schedule().export("rtl").mlir
+
+
+# A resource weight scales the derived scarcity price, so it decides which
+# fabric realizes an operation. Two cores with one timing and different spends
+# make the price the only difference, which the static rank already reads.
+def test_resource_weights_steer_a_realization_between_fabrics():
+
+    @operator_ip(
+        optype=OperatorType.MUL,
+        mnemonic="mul_on_lut",
+        latency=1,
+        in_delay_ns=0.5,
+        pipelined=True,
+        style="ce",
+    )
+    def mul_on_lut(a: i16, b: i16) -> i16: ...
+
+    @kernel
+    def mulk(x: i16[8], y: i16[8], out: i16[8]):
+        for i in range(8):
+            out[i] = x[i] * y[i]
+
+    dev = default_device.copy()
+    dev.add_operator(mul_on_lut)
+    dev.set_operator_uses(mul_on_lut, {dev.resources["lut"]: Const(200.0)})
+
+    def chosen(**weights):
+        rtl = _to_rtl(mulk, device=dev)
+        rtl.set_scheduler_opt(scheduler="exact", O="area", resource_weights=weights)
+        return _impls(rtl.schedule())
+
+    # One DSP (2311) undercuts 200 LUTs (3200); at eight times the price the
+    # LUT core wins instead, and undercuts the device's own fabric row too.
+    assert mul_on_lut.symbol not in chosen()
+    assert mul_on_lut.symbol in chosen(dsp=8.0)
+
+
+# The combinational row joins the candidates under the area objective, so a
+# weight can move an operation off its IP and onto the fabric, and the comb
+# decision reaches the emitted design whole.
+def test_a_weight_moves_a_multiply_onto_the_comb_row():
+    @kernel
+    def mulk(x: i16[8], y: i16[8], out: i16[8]):
+        for i in range(8):
+            out[i] = x[i] * y[i]
+
+    # Retune the comb multiply into pure fabric: 300 LUTs (4800) against the
+    # builtin DSP cores, which an eightfold DSP price ranks past.
+    dev = default_device.copy()
+    dev.set_comb_delay(CombKind.MUL, 2.0, uses={dev.resources["lut"]: Const(300.0)})
+
+    rtl = _to_rtl(mulk, device=dev)
+    rtl.set_scheduler_opt(scheduler="exact", O="area")
+    assert any("mul" in s for s in _impls(rtl.schedule()))
+
+    rtl = _to_rtl(mulk, device=dev)
+    rtl.set_scheduler_opt(
+        scheduler="exact", O="area", resource_weights={"dsp": 8.0}
+    )
+    assert "weight = 8" in rtl.dcp
+    assert not _impls(rtl.schedule())
+    rng = np.random.default_rng(3)
+    x = rng.integers(-(2**15), 2**15, 8, dtype=np.int16)
+    y = rng.integers(-(2**15), 2**15, 8, dtype=np.int16)
+    out = np.zeros(8, np.int16)
+    rtl.cosim(x, y, out)
+    assert np.array_equal(out, (x.astype(np.int32) * y).astype(np.int16))
+
+
+# Under the area objective the fusion pays for itself or does not happen: the
+# fused core prices above the multiply plus the combinational add it replaces
+# on this device, so the pair stays apart there and fuses under cycles.
+def test_the_area_objective_gates_the_muladd_fusion_by_price():
+    @kernel
+    def mac(A: i32[16], B: i32[16], C: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = A[i] * B[i] + C[i]
+
+    # The device row's declaration is always in the module; a second mention
+    # is a compute op bound to it.
+    row = "@muladd_i32_i32_i32_i32_l3"
+    rtl = _to_rtl(mac)
+    rtl.set_scheduler_opt(scheduler="exact", O="cycles")
+    assert rtl.dcp.count(row) > 1
+
+    rtl = _to_rtl(mac)
+    rtl.set_scheduler_opt(scheduler="exact", O="area")
+    assert rtl.dcp.count(row) == 1
+
+
+# The device declares each multiply twice, as DSP columns and as fabric, at one
+# depth: the rows differ only in what they spend, so a DSP weight moves the
+# design onto LUTs and leaves its schedule where it was.
+def test_a_dsp_weight_moves_a_multiply_onto_the_fabric_row():
+    @kernel
+    def mulk(x: i32[8], y: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = x[i] * y[i]
+
+    def built(scheduler, **weights):
+        rtl = _to_rtl(mulk)
+        rtl.set_scheduler_opt(scheduler=scheduler, resource_weights=weights)
+        res = rtl.schedule()
+        return rtl, _impls(res), [r.latency for r in res.regions()]
+
+    # Both scheduler paths read the same prices: the static rank ranks the two
+    # rows, and the exact solve drops the dearer of a same-timing pair before it
+    # ever becomes a selection variable.
+    for scheduler in ("heuristic", "exact"):
+        _, dsp, dsp_lat = built(scheduler)
+        rtl, lut, lut_lat = built(scheduler, dsp=8.0)
+        assert dsp == {"mul_i32_i32_i32_l2"}
+        assert lut == {"mullut_i32_i32_i32_l2"}
+        assert dsp_lat == lut_lat
+
+    rng = np.random.default_rng(5)
+    x = rng.integers(-(2**31), 2**31, 8, dtype=np.int32)
+    y = rng.integers(-(2**31), 2**31, 8, dtype=np.int32)
+    out = np.zeros(8, np.int32)
+    rtl.cosim(x, y, out)
+    assert np.array_equal(out, (x.astype(np.int64) * y).astype(np.int32))
+
+
+# The i16 pair differs in cone as well as in spend: the fabric product is
+# combinational up to its consumer's register, so taking it costs the chain
+# around it a cycle. That leaves a trade a schedule can see, where the i32
+# pair leaves none.
+def test_the_fabric_i16_row_pays_a_cycle_for_the_dsp_it_saves():
+    @kernel
+    def mulk(x: i16[8], y: i16[8], out: i16[8]):
+        for i in range(8):
+            out[i] = x[i] * y[i]
+
+    def built(**weights):
+        rtl = _to_rtl(mulk)
+        rtl.set_scheduler_opt(resource_weights=weights)
+        res = rtl.schedule()
+        return _impls(res), [r.latency for r in res.regions()]
+
+    dsp, dsp_lat = built()
+    lut, lut_lat = built(dsp=8.0)
+    assert dsp == {"mul_i16_i16_i16_l1"}
+    assert lut == {"mullut_i16_i16_i16_l1"}
+    assert [a + 1 for a in dsp_lat] == lut_lat

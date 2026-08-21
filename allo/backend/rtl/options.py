@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,11 @@ class SchedulerOptions:
             worker.
         seed: the exact solver's random seed. Shifts which optimum of equal cost
             a solve lands on.
+        resource_weights: multipliers on the per-resource scarcity prices, by
+            resource name (``{"dsp": 0.25}`` makes DSPs a quarter of their
+            derived price, steering every area decision toward them). Composes
+            multiplicatively with the weight a device declares on the resource
+            itself; unnamed resources keep weight 1.0.
     """
 
     scheduler: str = "heuristic"
@@ -103,3 +108,4 @@ class SchedulerOptions:
     budget: float = 30.0
     workers: int = 8
     seed: int = 0
+    resource_weights: dict[str, float] = field(default_factory=dict)

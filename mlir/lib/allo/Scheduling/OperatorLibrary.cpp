@@ -310,14 +310,21 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
     }
 
     // The currency: the most plentiful resource sets the scale, so a price is
-    // how scarce a resource is relative to the one the part has most of.
+    // how scarce a resource is relative to the one the part has most of. A
+    // declared weight scales the scarcity, expressing preference the capacity
+    // alone cannot.
     int64_t widest = 1;
     for (auto r : device.getBody().getOps<dcp::DCPathResourceOp>())
       widest = std::max<int64_t>(widest, r.getCapacity());
-    for (auto r : device.getBody().getOps<dcp::DCPathResourceOp>())
-      lib.resourcePrices[r.getSymName()] =
+    for (auto r : device.getBody().getOps<dcp::DCPathResourceOp>()) {
+      int64_t price =
           std::max<int64_t>(1, llvm::divideNearest<int64_t>(
                                    kPriceResolution * widest, r.getCapacity()));
+      if (auto w = r.getWeight())
+        price =
+            std::max<int64_t>(1, std::llround(price * w->convertToDouble()));
+      lib.resourcePrices[r.getSymName()] = price;
+    }
     for (auto m : device.getBody().getOps<dcp::DCPathMuxOp>()) {
       lib.muxUses = m.getUsesAttr();
       lib.muxDelay = m.getDelayAttr();
@@ -470,6 +477,24 @@ bool OperatorLibrary::hasAdvancedRow(llvm::StringRef mnem, TypeRange args,
            ArrayRef<Type>(e.argTypes) == ArrayRef<Type>(aTys) &&
            ArrayRef<Type>(e.resTypes) == ArrayRef<Type>(rTys);
   });
+}
+
+std::optional<int64_t> OperatorLibrary::advancedRowPrice(llvm::StringRef mnem,
+                                                         TypeRange args,
+                                                         TypeRange results,
+                                                         int64_t width) const {
+  auto aTys = elementTypes(args);
+  auto rTys = elementTypes(results);
+  std::optional<int64_t> best;
+  for (const OperatorEntry &e : advancedEntries) {
+    if (e.mlirOp != mnem ||
+        ArrayRef<Type>(e.argTypes) != ArrayRef<Type>(aTys) ||
+        ArrayRef<Type>(e.resTypes) != ArrayRef<Type>(rTys))
+      continue;
+    if (std::optional<int64_t> p = priceOf(e.uses, {width}))
+      best = best ? std::min(*best, *p) : *p;
+  }
+  return best;
 }
 
 double OperatorLibrary::combMarginalDelay(CombOpKindEnum kind,
@@ -774,19 +799,35 @@ OperatorChar OperatorLibrary::characterize(Operation *op,
 }
 
 OperatorChar OperatorLibrary::lookup(Operation *op, StringRef symbol) const {
-  for (const OperatorEntry *e : matchEntries(advancedEntries, entries, op))
-    if (e->symbol == symbol)
-      return characterize(op, *e, combParamWidth(op));
+  int64_t width = combParamWidth(op);
+  // A comb row has no symbol of its own; a decided comb realization travels
+  // as its characterization's type name, matched on the last row of the kind
+  // (the one every comb read resolves).
+  const OperatorEntry *comb = nullptr;
+  for (const OperatorEntry *e : matchEntries(advancedEntries, entries, op)) {
+    if (e->comb)
+      comb = e;
+    else if (e->symbol == symbol)
+      return characterize(op, *e, width);
+  }
+  if (comb) {
+    OperatorChar c = characterize(op, *comb, width);
+    if (c.timing.typeName == symbol)
+      return c;
+  }
   llvm_unreachable("a decided realization names one of its op's candidates");
 }
 
 SmallVector<OperatorChar, 2>
-OperatorLibrary::candidateChars(Operation *op) const {
+OperatorLibrary::candidateChars(Operation *op, bool withComb) const {
   SmallVector<OperatorChar, 2> out;
   int64_t width = combParamWidth(op);
+  const OperatorEntry *comb = nullptr;
   for (const OperatorEntry *e : matchEntries(advancedEntries, entries, op)) {
-    if (e->comb)
+    if (e->comb) {
+      comb = e; // the last comb row of a kind wins, as every comb read reads
       continue;
+    }
     // The same float fit test `selectImplementation` ranks by, so the set here
     // and the row `lookup` picks never disagree about what fits.
     float need = periodNeed(static_cast<float>(regFloor), e->inDelay,
@@ -796,6 +837,15 @@ OperatorLibrary::candidateChars(Operation *op) const {
     if (!priceOf(e->uses, {width}))
       continue; // unmeasured at this width: it cannot realize the op
     out.push_back(characterize(op, *e, width));
+  }
+  if (withComb && comb) {
+    std::optional<double> delay = comb->delay.evaluate(width);
+    if (delay && priceOf(comb->uses, {width})) {
+      auto d = static_cast<float>(std::max(0.0, *delay - regFloor));
+      if (periodNeed(static_cast<float>(regFloor), d, d, 0.0f) <=
+          selectionPeriodNs)
+        out.push_back(characterize(op, *comb, width));
+    }
   }
   return out;
 }
@@ -843,30 +893,42 @@ SmallVector<StringRef, 2> OperatorLibrary::candidateIPs(Operation *op) const {
 
 SmallVector<OperatorChar, 2>
 mlir::allo::selectionCandidates(Operation *op, const OperatorLibrary &lib,
-                                bool cyclic) {
+                                bool cyclic, bool withComb) {
   if (isSyncSubKernelCall(op) || asMemAccess(op) || isZeroDelay(op))
     return {};
   OperatorChar own = lib.lookup(op);
-  if (own.identity.ipSymbol.empty())
-    return {}; // comb and default realizations stay the library's
-  SmallVector<OperatorChar, 2> cands = lib.candidateChars(op);
+  if (own.identity.ipSymbol.empty() &&
+      !StringRef(own.timing.typeName).starts_with("comb."))
+    return {}; // the default realization stays the library's
+  SmallVector<OperatorChar, 2> cands = lib.candidateChars(op, withComb);
   llvm::erase_if(cands, [&](const OperatorChar &c) {
     return (cyclic && !c.pipelined) ||
            (c.timing.latency == 0 && c.timing.inDelay != c.timing.outDelay);
   });
+  // Latency, the two cones and the price are everything a schedule can tell
+  // apart, so a row another candidate beats or matches on all four is never
+  // the answer and only costs a selection variable. Ties break on the name, or
+  // two rows equal on every field would drop each other.
+  auto asGood = [](const OperatorChar &d, const OperatorChar &c) {
+    return d.timing.latency == c.timing.latency &&
+           d.timing.inDelay <= c.timing.inDelay &&
+           d.timing.outDelay <= c.timing.outDelay && d.price <= c.price;
+  };
+  SmallVector<OperatorChar, 2> distinct;
+  for (const OperatorChar &c : cands)
+    if (llvm::none_of(cands, [&](const OperatorChar &d) {
+          return asGood(d, c) &&
+                 (!asGood(c, d) || d.timing.typeName < c.timing.typeName);
+        }))
+      distinct.push_back(c);
+  cands = std::move(distinct);
   if (cands.size() < 2)
     return {};
-  const auto *pick = llvm::find_if(cands, [&](const OperatorChar &c) {
-    return c.timing.typeName == own.timing.typeName;
-  });
-  if (pick == cands.end())
-    return {}; // the library's pick fell to a scope limit above
-  auto differs = [&](const OperatorChar &c) {
-    return c.timing.latency != pick->timing.latency ||
-           c.timing.inDelay != pick->timing.inDelay ||
-           c.timing.outDelay != pick->timing.outDelay || c.price != pick->price;
-  };
-  if (llvm::none_of(cands, differs))
-    return {}; // nothing a schedule can see distinguishes them
+  // The library's pick has to be among them, or the schedule and the emitter
+  // would resolve different rows.
+  if (llvm::none_of(cands, [&](const OperatorChar &c) {
+        return c.timing.typeName == own.timing.typeName;
+      }))
+    return {}; // the pick fell to a scope limit above
   return cands;
 }

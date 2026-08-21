@@ -204,7 +204,9 @@ class RTL(Backend[P, R]):
             def make_module() -> Module:
                 m = ir_ext.clone_module(self.module)
                 inject_operators(m, self._device)
-                inject_device(m, self._device)
+                inject_device(
+                    m, self._device, weights=self._sched_opts.resource_weights
+                )
                 return m
 
             # An allocation is only worth deciding where the emitter builds it:

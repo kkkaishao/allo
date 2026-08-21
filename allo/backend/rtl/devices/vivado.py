@@ -128,6 +128,12 @@ RECIPES: dict[OperatorIP, VivadoCore] = {
 }
 
 
+# The fabric build of a multiply: an adder tree in LUTs instead of DSP columns.
+# It repeats a key the shape already sets; the last value in a
+# `set_property -dict` list is the one that takes.
+_LUT_MULT = "Multiplier_Construction=Use_LUTs"
+
+
 # `arith.muli` on iN returns the low N bits, so the core is asked for exactly
 # those: without `Use_Custom_Output_Width` the width bounds are ignored and the
 # core builds the full 2N-bit product (36 DSPs at 32x32 against a handful).
@@ -139,6 +145,7 @@ def _mult(width: int) -> VivadoCore:
         "Multiplier_Construction=Use_Mults,OptGoal=Speed,"
         f"Use_Custom_Output_Width=true,OutputWidthHigh={width - 1},"
         "OutputWidthLow=0",
+        _LUT_MULT,
     )
 
 

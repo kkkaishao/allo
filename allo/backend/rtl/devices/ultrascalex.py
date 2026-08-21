@@ -331,18 +331,43 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ip.f2i: IPRow(3, {"lut": 183, "ff": 127, "carry8": 6}),  # 678
     ip.fcvt: IPRow(2, {"lut": 50, "ff": 99, "carry8": 1}),  # 1032
     ip.bf2f: IPRow(2, {"lut": 34, "ff": 53, "carry8": 1}),  # 1181
+    # Each multiply also has a `mullut` row: the same core built out of the
+    # fabric instead of DSP columns, declared at the depth of the DSP row it
+    # competes with. Selection ranks depth before price, so a shorter fabric row
+    # would take every multiply; at one depth the two differ only in what they
+    # spend, which is what a `dsp` resource weight steers between.
     ip.imul16: (
         IPRow(3, {"dsp": 1}),  # 1073
         IPRow(1, {"dsp": 1}),  # 544
+        IPRow(
+            1,
+            {"lut": 192, "ff": 16, "carry8": 22},
+            mnemonic="mullut",
+            in_delay_ns=2.10,
+        ),  # 398
     ),
     ip.imul32: (
         IPRow(2, {"ff": 32, "dsp": 3}, min_period_ns=2.94),  # 341
+        IPRow(
+            2,
+            {"lut": 768, "ff": 112, "carry8": 76},
+            mnemonic="mullut",
+            min_period_ns=2.50,
+        ),  # 401
         # A combinational 3-DSP cascade up to its output register: routed in
         # context the cone runs 3.0 ns (2.9 ns of DSP logic plus route), which
         # rules the row out at 300 MHz and leaves it to lower targets.
         IPRow(1, {"ff": 32, "dsp": 3}, in_delay_ns=3.0),  # 320
     ),
-    ip.imul64: IPRow(6, {"slicem_lut": 64, "ff": 81, "dsp": 10}),  # 333
+    ip.imul64: (
+        IPRow(6, {"slicem_lut": 64, "ff": 81, "dsp": 10}),  # 333
+        IPRow(
+            6,
+            {"lut": 3072, "slicem_lut": 16, "ff": 2168, "carry8": 280},
+            mnemonic="mullut",
+            min_period_ns=1.77,
+        ),  # 568
+    ),
     ip.imulw33: IPRow(3, {"ff": 34, "dsp": 4}),  # 431
     ip.imuladd32: IPRow(3, {"lut": 47, "ff": 113, "dsp": 3, "carry8": 6}),  # 448
     ip.idiv8: IPRow(4, {"lut": 126, "slicem_lut": 1, "ff": 166, "carry8": 18}),  # 311
@@ -473,8 +498,36 @@ IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
         ip.fdiv: IPRow(
             16, {"lut": 765, "slicem_lut": 39, "ff": 699, "carry8": 111}
         ),  # 361
-        ip.imul32: IPRow(3, {"ff": 32, "dsp": 3}),  # 341
-        ip.imul64: IPRow(8, {"slicem_lut": 113, "ff": 160, "dsp": 10}),  # 325
+        # This grade holds its multiplies at other depths than -2L, so each
+        # fabric row sits at the depth of the DSP row beside it here.
+        ip.imul16: (
+            IPRow(3, {"dsp": 1}),  # 837
+            IPRow(1, {"dsp": 1}),  # 412
+            IPRow(
+                1,
+                {"lut": 192, "ff": 16, "carry8": 22},
+                mnemonic="mullut",
+                in_delay_ns=2.44,
+            ),  # 326
+        ),
+        ip.imul32: (
+            IPRow(3, {"ff": 32, "dsp": 3}),  # 341
+            IPRow(
+                3,
+                {"lut": 768, "ff": 384, "carry8": 76},
+                mnemonic="mullut",
+                min_period_ns=3.01,
+            ),  # 333
+        ),
+        ip.imul64: (
+            IPRow(8, {"slicem_lut": 113, "ff": 160, "dsp": 10}),  # 325
+            IPRow(
+                8,
+                {"lut": 3072, "slicem_lut": 80, "ff": 2232, "carry8": 280},
+                mnemonic="mullut",
+                min_period_ns=2.07,
+            ),  # 483
+        ),
         ip.idiv8: IPRow(
             12, {"lut": 130, "slicem_lut": 2, "ff": 264, "carry8": 18}
         ),  # 804
