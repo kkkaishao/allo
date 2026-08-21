@@ -709,8 +709,11 @@ struct Mux {
 /// cycle. Bounds the combinational delay binding may add in front of the unit.
 /// Empty where any bound op carries no `z`: its room is unknown rather than
 /// maximal, so binding must not fold onto it.
-std::optional<double> unitSlack(const FuncUnit &u, const OperatorLibrary &lib,
-                                float cycleTime);
+/// \p sinkTails, non-null, further charges each bound op the committed delay a
+/// non-unit sink it feeds still spends after its result (`sinkTails` below).
+std::optional<double>
+unitSlack(const FuncUnit &u, const OperatorLibrary &lib, float cycleTime,
+          const llvm::DenseMap<Operation *, double> *sinkTails = nullptr);
 
 /// A top-level scalar input port (a scalar kernel argument). Memref arguments
 /// become external `MemUnit`s and a scalar function result becomes a `Result`,
@@ -1166,6 +1169,15 @@ struct SourceSite {
 void forEachSource(
     const Datapath &dp,
     llvm::function_ref<void(const Source &, const SourceSite &)> fn);
+
+/// The committed delay each op's result still spends inside its own cycle at a
+/// non-unit sink it feeds directly: a memory port's setup past a store's data
+/// or an unregistered address, or a stream port's, none of which any unit's
+/// room accounts for. Keyed by the producing op and read off the schedule's
+/// own access stamps, so it is the same map before binding (each unit one op)
+/// and at emit (per bound op); a port-colour select is deliberately not in it,
+/// being a reported quality finding rather than a refusable binding cone.
+llvm::DenseMap<Operation *, double> sinkTails(const Datapath &dp);
 
 //===----------------------------------------------------------------------===//
 // Timing readers over the scheduled dcp IR, for the builder only: every cycle

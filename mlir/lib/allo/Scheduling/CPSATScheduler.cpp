@@ -801,7 +801,9 @@ allocationVars(CpModelBuilder &model, ProblemT &prob, unsigned ii, bool hint,
 /// select cone its decided count implies: `z + inDelay + headroom(N) <=
 /// period`. A count then only shrinks where its multiplexer fits the slack the
 /// same solve leaves, which is what lets a `planned` binding realize the
-/// allocation as built.
+/// allocation as built. The same cone reaches whatever a combinational member
+/// feeds within its cycle, so each same-cycle def-use consumer is held to the
+/// period alongside, against its own incoming delay.
 ///
 /// \p sharedInCycle is the sub-cycle system a selection model already built,
 /// reused so one model never carries two; null creates one on demand. The
@@ -835,6 +837,39 @@ void addAllocationHeadroom(CpModelBuilder &model, ProblemT &prob,
       int64_t in =
           picos(*prob.getIncomingDelay(*prob.getLinkedOperatorType(op)));
       model.AddLessOrEqual(inCycle.at(op) + *alloc.headroom, period - in);
+    }
+  }
+  // The consumer half: a combinational producer hands its select cone on, and
+  // covering the consumer is what covers a non-unit sink (a store's port and
+  // address setup, a stream port), which uses no allocatable operator of its
+  // own.
+  for (Operation *op : prob.getOperations()) {
+    llvm::SmallDenseSet<Operation *, 4> seen;
+    for (auto &dep : prob.getDependences(op)) {
+      if (!dep.isDefUse())
+        continue;
+      Operation *src = dep.getSource();
+      if (prob.latencyOf(src) != 0 || !seen.insert(src).second)
+        continue;
+      std::optional<BoolVar> same;
+      for (const AllocationVar &alloc : allocs) {
+        if (!alloc.headroom || !prob.usesResource(src, alloc.rsrc) ||
+            prob.usesResource(op, alloc.rsrc))
+          continue;
+        if (!same) {
+          LinearExpr separation = startVars.at(op) - startVars.at(src);
+          same = model.NewBoolVar();
+          model.AddLessOrEqual(separation, 0).OnlyEnforceIf(*same);
+          model.AddGreaterOrEqual(separation, 1).OnlyEnforceIf(same->Not());
+          if (hintSchedule)
+            model.AddHint(*same,
+                          *prob.getStartTime(op) == *prob.getStartTime(src));
+        }
+        int64_t in =
+            picos(*prob.getIncomingDelay(*prob.getLinkedOperatorType(op)));
+        model.AddLessOrEqual(inCycle.at(op) + *alloc.headroom, period - in)
+            .OnlyEnforceIf(*same);
+      }
     }
   }
 }

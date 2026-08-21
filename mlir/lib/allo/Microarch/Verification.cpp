@@ -419,6 +419,7 @@ LogicalResult checkBindingMuxHeadroom(const Datapath &dp, float cycleTime,
   // One picosecond of slop, the resolution the scheduler's own model carries.
   constexpr double kSlop = 1e-3;
   AddedDelay added(dp, lib);
+  llvm::DenseMap<Operation *, double> sinks = sinkTails(dp);
 
   bool ok = true;
   for (const FuncUnit &u : dp.units) {
@@ -454,7 +455,7 @@ LogicalResult checkBindingMuxHeadroom(const Datapath &dp, float cycleTime,
     // reports through the published paths instead.
     if (mux <= kSlop)
       continue;
-    std::optional<double> slack = unitSlack(u, lib, cycleTime);
+    std::optional<double> slack = unitSlack(u, lib, cycleTime, &sinks);
     if (slack && mux <= *slack + kSlop)
       continue;
     // A planned fold realizes the solve's own allocation, which held

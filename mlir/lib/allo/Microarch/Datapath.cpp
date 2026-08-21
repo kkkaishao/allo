@@ -339,13 +339,18 @@ static llvm::StringRef startPolicyName(CallUnit::StartPolicy p) {
   llvm_unreachable("unhandled CallUnit::StartPolicy");
 }
 
-std::optional<double> unitSlack(const FuncUnit &u, const OperatorLibrary &lib,
-                                float cycleTime) {
+std::optional<double>
+unitSlack(const FuncUnit &u, const OperatorLibrary &lib, float cycleTime,
+          const llvm::DenseMap<Operation *, double> *sinkTails) {
   double slack = cycleTime;
   for (const FuncUnit::BoundOp &bo : u.boundOps) {
     if (!bo.z)
       return std::nullopt;
-    slack = std::min(slack, cycleTime - *bo.z - u.inDelay);
+    // A cone added in front of this unit also delays whatever this op's result
+    // reaches in the same cycle, so a non-unit sink downstream takes its
+    // committed delay out of the room the same way the unit's own does.
+    double tail = sinkTails ? sinkTails->lookup(bo.op) : 0.0;
+    slack = std::min(slack, cycleTime - *bo.z - u.inDelay - tail);
   }
   // The identity re-injection select `emitUnits` builds in front of a
   // recurrence port: one arm per early iteration plus the carried value. A
@@ -357,6 +362,48 @@ std::optional<double> unitSlack(const FuncUnit &u, const OperatorLibrary &lib,
           cone, muxCone(lib, inits.size() + 1,
                         datapathWidth(u.repOp()->getOperand(k).getType())));
   return slack - cone;
+}
+
+llvm::DenseMap<Operation *, double> sinkTails(const Datapath &dp) {
+  llvm::DenseMap<Operation *, double> out;
+  // Only a unit's own result carries a binding cone into the sink: any other
+  // producer (a constant, a counter, a register tap) is settled when the cycle
+  // starts, and a producer issuing in an earlier cycle hands off in a register.
+  auto credit = [&](Value v, Operation *sink, double d) {
+    Operation *def = v.getDefiningOp();
+    if (!def || d <= 0.0 || !dp.opToUnit.contains(def))
+      return;
+    if (dcpLatency(def) != 0 || dcpStart(def) != dcpStart(sink))
+      return;
+    double &tail = out[def];
+    tail = std::max(tail, d);
+  };
+  for (const MemUnit &m : dp.mems)
+    for (const MemUnit::Access &acc : m.accesses) {
+      if (acc.isWrite)
+        credit(cast<dcp::DCPathStoreOp>(acc.op).getValue(), acc.op,
+               acc.portDelay);
+      // An address landing in a delay register launches the port path from
+      // that register, out of reach of any unit cone. Unset before
+      // `resolveEdges` decides it, so the pre-binding read is conservative.
+      if (acc.addrDelay == 0) {
+        auto indices = acc.isWrite
+                           ? cast<dcp::DCPathStoreOp>(acc.op).getIndices()
+                           : cast<dcp::DCPathLoadOp>(acc.op).getIndices();
+        for (Value v : indices)
+          credit(v, acc.op, acc.inDelay);
+      }
+    }
+  for (const StreamChannel &ch : dp.streams)
+    for (const StreamChannel::Access &acc : ch.accesses) {
+      if (!acc.isPut)
+        continue;
+      auto put = cast<StreamPutOp>(acc.op);
+      credit(put.getValue(), acc.op, acc.inDelay);
+      if (Value pred = put.getPred())
+        credit(pred, acc.op, acc.inDelay);
+    }
+  return out;
 }
 
 // Does \p a reach \p b by walking `preds` backwards from \p b? Memoized in

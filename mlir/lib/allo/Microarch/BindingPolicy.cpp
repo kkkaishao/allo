@@ -103,12 +103,13 @@ struct ShareCone {
         rep(rb.units.size()), pack(rb.units.size()), base(rb.units.size(), 1),
         preds(rb.units.size()), slack(rb.units.size()) {
     llvm::DenseMap<Operation *, unsigned> owner = unitOwners(dp, rb);
+    llvm::DenseMap<Operation *, double> sinks = sinkTails(dp);
     for (auto [i, uid] : llvm::enumerate(rb.units)) {
       rep[i] = i;
       pack[i].push_back(i);
       const FuncUnit &u = dp.units[uid];
       // An unpriced unit (no `z`) gets no room, so no fold's cone may reach it.
-      slack[i] = unitSlack(u, ctx.lib, ctx.cycleTime).value_or(0.0);
+      slack[i] = unitSlack(u, ctx.lib, ctx.cycleTime, &sinks).value_or(0.0);
       Operation *y = u.repOp();
       // A recurrence identity is re-injected through a select the emitter
       // builds fold or no fold, so it counts as the unshared baseline.
@@ -353,6 +354,7 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
   SharingProblem problem;
   problem.units.resize(rb.units.size());
   llvm::DenseMap<Operation *, unsigned> owner = unitOwners(dp, rb);
+  llvm::DenseMap<Operation *, double> sinks = sinkTails(dp);
   std::map<std::string, unsigned> classIdx;
   llvm::SmallVector<llvm::SmallVector<unsigned>> members;
   // Held-driver keys, interned per class: equal keys name one value.
@@ -368,8 +370,9 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
     SharingProblem::Unit &unit = problem.units[i];
     unit.cls = it->second;
     unit.slackPicos = std::max<int64_t>(
-        0, std::floor(unitSlack(u, ctx.lib, ctx.cycleTime).value_or(0.0) *
-                      1000.0));
+        0,
+        std::floor(unitSlack(u, ctx.lib, ctx.cycleTime, &sinks).value_or(0.0) *
+                   1000.0));
     Operation *y = u.repOp();
     for (auto [k, v] : llvm::enumerate(y->getOperands())) {
       unit.initArms.push_back(carriedOperand(rb, v) ? 1 : 0);
