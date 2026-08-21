@@ -829,6 +829,11 @@ struct RegionBlock {
   Source stepSource; // step (counter increment)
   // The width the iteration counter is built at.
   Type counterType;
+  /// The counter never goes negative, so it is built at an unsigned width (one
+  /// bit under the signed hull) and every predicate and resize that reads it is
+  /// unsigned. False for a genuinely signed counter (a negative lb) and for a
+  /// while, whose 0-based counter keeps the default 32-bit signed form.
+  bool counterUnsigned = false;
   /// Signed hull of every value the counter holds or compares, set only when
   /// a runtime bound narrowed below `kIndexWidth`; the recurrence gates widen
   /// `lb + n*step` past `counterType` where it leaves this range.

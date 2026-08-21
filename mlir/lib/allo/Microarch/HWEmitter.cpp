@@ -36,14 +36,17 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
   auto ivType = cast<IntegerType>(rb.counterType);
   // A bound resized to the counter's width: identity for a literal bound, which
   // `recordRegionBounds` already tied in at that width, a real resize for a
-  // runtime bound, which arrives as an ordinary index.
+  // runtime bound, which arrives as an ordinary index. The counter's own
+  // signedness picks the extension; a non-negative runtime bound is the same
+  // either way.
+  bool isUnsigned = rb.counterUnsigned;
   auto at = [&](const uarch::Source &s) {
     return resize(ctx.b, ctx.loc, datapath.resolveSource(s), ivType.getWidth(),
-                  /*isSigned=*/true);
+                  /*isSigned=*/!isUnsigned);
   };
   Value lb = at(rb.lbSource), step = at(rb.stepSource);
   if (rb.ubSource)
-    return Terminator::counted(lb, at(rb.ubSource), step);
+    return Terminator::counted(lb, at(rb.ubSource), step, isUnsigned);
   // No ubSource (see `RegionBlock::ubSource`): a constant trip K over a runtime
   // lb or step, so `ub = lb + K*step`. A literal step still folds its span.
   int64_t trip = *rb.tripCount;
@@ -53,7 +56,8 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
                                                  ctx.konst(ivType, trip),
                                                  /*twoState=*/false));
   return Terminator::counted(
-      lb, ctx.R(comb::AddOp::create(ctx.b, ctx.loc, lb, span, false)), step);
+      lb, ctx.R(comb::AddOp::create(ctx.b, ctx.loc, lb, span, false)), step,
+      isUnsigned);
 }
 
 // Check region \p rb's built drain against the span its consumers were placed

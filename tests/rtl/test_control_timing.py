@@ -681,8 +681,10 @@ def test_a_chain_report_carries_the_proven_range():
     from_counter = [c for c in f.chains if c.source == "counter"]
     assert from_counter, f"no counter-fed chain in {f.chains}"
     for c in from_counter:
-        # i runs [0, 16); the hull includes one-past, sized like the counter.
-        assert c.range_bits == 6 and c.width >= c.range_bits
+        # i runs [0, 16); the hull includes the one-past value 16, which needs 5
+        # unsigned bits, and the non-negative counter is built unsigned, so the
+        # reported range never exceeds the chain's own width.
+        assert c.range_bits == 5 and c.width >= c.range_bits
     # Chains are a subset of the value-role ledger: read-data alignment delays
     # are charged there but built outside the model.
     from allo.backend.rtl.reports.microarch import RegRole

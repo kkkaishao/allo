@@ -43,24 +43,31 @@ struct Terminator {
   // (lb=0/step=1, ub null), terminating on ~cond.
   Value lb, ub, step;
   Value cond; // Conditional: the i1 continue condition (a datapath value)
+  /// The counter is unsigned, so its bound compares are unsigned. A negative
+  /// `lb` or the 32-bit fallback keeps the signed form.
+  bool unsignedCounter = false;
 
-  static Terminator counted(Value lb, Value ub, Value step) {
-    return {Kind::Counted, lb, ub, step, Value()};
+  static Terminator counted(Value lb, Value ub, Value step, bool isUnsigned) {
+    return {Kind::Counted, lb, ub, step, Value(), isUnsigned};
   }
   static Terminator conditional(Value cond, Value zero, Value one) {
-    return {Kind::Conditional, zero, Value(), one, cond};
+    return {Kind::Conditional, zero, Value(), one, cond, false};
   }
 
+  /// `a >= b` at the counter's signedness.
+  Value ge(EmitContext &c, Value a, Value b) const {
+    return unsignedCounter ? c.icmpUgeV(a, b) : c.icmpSgeV(a, b);
+  }
   /// The iteration issued at `iv` is the last one: `iv + step` reaches `ub`, or
   /// the continue-condition is false. \p ivStep is `iv + step`.
   Value isLast(EmitContext &c, Value ivStep) const {
-    return kind == Kind::Conditional ? c.notBit(cond) : c.icmpSgeV(ivStep, ub);
+    return kind == Kind::Conditional ? c.notBit(cond) : ge(c, ivStep, ub);
   }
   /// The region is empty (issues nothing): lb >= ub. A while is never empty
   /// here; its zero-iteration case is the condition false on iteration 0,
   /// handled by the normal exit pulse.
   Value isEmpty(EmitContext &c) const {
-    return kind == Kind::Conditional ? c.f1 : c.icmpSgeV(lb, ub);
+    return kind == Kind::Conditional ? c.f1 : ge(c, lb, ub);
   }
   /// The start pulse gated so an empty region issues nothing; a while passes
   /// through unconditionally.
@@ -487,8 +494,12 @@ struct DatapathEmitter {
     RegionControl &slot = controlOf[region];
     if (rc.counter) {
       slot.counter = rc.counter;
+      // Widen the counter to the index width a Source::Counter is read at, at
+      // the counter's own signedness: an unsigned counter zero-extends, its top
+      // bit being magnitude not sign.
       counterIndex[region] =
-          resize(c.b, c.loc, rc.counter, kIndexWidth, /*isSigned=*/true);
+          resize(c.b, c.loc, rc.counter, kIndexWidth,
+                 /*isSigned=*/!dp.regions[region].counterUnsigned);
     }
     slot.issue = rc.issue;
     if (rc.wantIssue)

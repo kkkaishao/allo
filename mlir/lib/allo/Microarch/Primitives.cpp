@@ -826,6 +826,11 @@ Value EmitContext::icmpSgeV(Value lhs, Value rhs) {
       comb::ICmpOp::create(b, loc, comb::ICmpPredicate::sge, lhs, rhs, false));
 }
 
+Value EmitContext::icmpUgeV(Value lhs, Value rhs) {
+  return R(
+      comb::ICmpOp::create(b, loc, comb::ICmpPredicate::uge, lhs, rhs, false));
+}
+
 Value EmitContext::notBit(Value v) {
   return R(comb::XorOp::create(b, loc, v, t1, false));
 }

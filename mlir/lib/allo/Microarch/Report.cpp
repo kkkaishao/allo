@@ -77,6 +77,16 @@ unsigned bitsOfHull(Hull h) {
   return std::max(bits(h.first), bits(h.second));
 }
 
+// The bits a chain register holds its proven range in, at the register's own
+// signedness: a non-negative range drops the sign bit, matching the unsigned
+// width the counter is built at, so the reported range never exceeds it.
+unsigned storedBitsOfHull(Hull h) {
+  if (h.first >= 0)
+    return std::max(1u,
+                    (unsigned)APInt(64, (uint64_t)h.second).getActiveBits());
+  return bitsOfHull(h);
+}
+
 std::optional<Hull> rangeOfSource(const Datapath &dp, const Source &s,
                                   unsigned fuel);
 
@@ -371,7 +381,7 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
       cr.taps = rg.taps.size();
       cr.source = sourceClassOf(dp, rg.input);
       if (auto h = rangeOfSource(dp, rg.input, /*fuel=*/16))
-        cr.rangeBits = bitsOfHull(*h);
+        cr.rangeBits = storedBitsOfHull(*h);
       chains.push_back(std::move(cr));
     }
     regions.push_back(std::move(r));

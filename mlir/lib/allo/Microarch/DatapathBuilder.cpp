@@ -160,7 +160,12 @@ void DatapathBuilder::collectConstants() {
 Source DatapathBuilder::constant(int64_t v, Type t) {
   ConstCell c;
   c.id = dp.consts.size();
-  c.value = IntegerAttr::get(t, v);
+  // Keep the bit pattern at the type's width: an unsigned counter's one-past
+  // bound (e.g. 32 in i6) has its top bit set, which the signed-fit check of
+  // the plain int64 `IntegerAttr` builder would reject.
+  c.value = IntegerAttr::get(
+      t, APInt(cast<IntegerType>(t).getWidth(), static_cast<uint64_t>(v),
+               /*isSigned=*/true, /*implicitTrunc=*/true));
   c.type = t;
   dp.consts.push_back(c);
   return Source{Source::Kind::Const, c.id, 0};
@@ -773,6 +778,16 @@ static unsigned hullBits(const ValueHull &h) {
   return std::max(bits(h.lo), bits(h.hi));
 }
 
+// The unsigned width of a non-negative hull: the active bits of its top, one
+// fewer than `hullBits` gives it, since a value that never goes negative needs
+// no sign bit. At least one bit, for a hull pinned to zero.
+static unsigned unsignedHullBits(const ValueHull &h) {
+  assert(h.lo >= 0 && "an unsigned width for a hull that can go negative");
+  return std::max(
+      1u, static_cast<unsigned>(
+              APInt(64, static_cast<uint64_t>((int64_t)h.hi)).getActiveBits()));
+}
+
 static std::optional<CounterBounds> counterBoundsOf(dcp::DCPathPipelineOp pipe,
                                                     unsigned fuel);
 
@@ -989,8 +1004,12 @@ void DatapathBuilder::deriveCounterTypes() {
     if (!rb.conditional) {
       if (auto cb = counterBoundsOf(pipe, kHullFuel)) {
         ValueHull h = storageHullOf(*cb);
-        if (fitsSigned(h, 64) && hullBits(h) < kIndexWidth) {
-          width = hullBits(h);
+        // A non-negative counter drops its sign bit: an unsigned register and
+        // unsigned predicates hold the same range in one fewer bit.
+        rb.counterUnsigned = h.lo >= 0;
+        unsigned bits = rb.counterUnsigned ? unsignedHullBits(h) : hullBits(h);
+        if (fitsSigned(h, 64) && bits < kIndexWidth) {
+          width = bits;
           // A runtime bound narrowed below `kIndexWidth` publishes its hull,
           // so the recurrence gates can size `lb + n*step` against it. A
           // literal-bound counter keeps in-range gates by construction.
@@ -999,6 +1018,8 @@ void DatapathBuilder::deriveCounterTypes() {
             rb.counterHull = {{(int64_t)h.lo, (int64_t)h.hi}};
             rb.counterStepHi = (int64_t)cb->step.hi;
           }
+        } else {
+          rb.counterUnsigned = false; // the 32-bit fallback stays signed
         }
       }
     }

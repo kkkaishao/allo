@@ -69,11 +69,14 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     return v;
   }
   case uarch::Source::Kind::Reg: {
-    // A counter chain runs at the region's own counter width; the tap
-    // sign-extends back to the width the value is read at.
+    // A counter chain runs at the region's own counter width; the tap resizes
+    // back to the width the value is read at, at the counter's signedness so an
+    // unsigned counter's high values do not sign-extend into a negative index.
     const uarch::Register &rg = dp.regs[s.id];
+    bool isSigned = !(rg.input.kind == uarch::Source::Kind::Counter &&
+                      dp.regions[rg.input.id].counterUnsigned);
     return resize(c.b, c.loc, regStages[s.id].tap(s.outPort),
-                  datapathWidth(rg.value.getType()), /*isSigned=*/true);
+                  datapathWidth(rg.value.getType()), isSigned);
   }
   case uarch::Source::Kind::Mem:
     return readData.lookup(accKey(s.id, s.outPort));
@@ -156,14 +159,15 @@ unsigned DatapathEmitter::gateWidth(const uarch::RegionBlock &rb, unsigned n) {
 }
 
 // Both at \p w bits: the counter register's own width, or a gate's widened
-// one, with the counter and the bound resized into it.
+// one, with the counter and the bound resized into it at the counter's own
+// signedness.
 std::pair<Value, Value>
 DatapathEmitter::counterAndLb(const uarch::RegionBlock &rb, unsigned w) {
   Value iv = controlOf.lookup(rb.id).counter;
   assert(iv && "a recurrence input in a region with no iteration counter");
-  return {resize(c.b, c.loc, iv, w, /*isSigned=*/true),
-          resize(c.b, c.loc, resolveSource(rb.lbSource), w,
-                 /*isSigned=*/true)};
+  bool isSigned = !rb.counterUnsigned;
+  return {resize(c.b, c.loc, iv, w, isSigned),
+          resize(c.b, c.loc, resolveSource(rb.lbSource), w, isSigned)};
 }
 
 Value DatapathEmitter::firstIterations(const uarch::RegionBlock &rb,
@@ -171,10 +175,13 @@ Value DatapathEmitter::firstIterations(const uarch::RegionBlock &rb,
   auto [iv, lb] = counterAndLb(rb, gateWidth(rb, dist <= 1 ? 0 : dist));
   if (dist <= 1)
     return c.icmpEqV(iv, lb);
-  // iv < lb + dist*step == !(iv >= lb + dist*step). Signed, as
-  // `Terminator::isLast` compares the same counter against the same kind of
-  // bound; an unsigned predicate would order a negative `lb` wrongly.
-  return c.notBit(c.icmpSgeV(iv, ivAt(rb, dist, lb)));
+  // iv < lb + dist*step == !(iv >= lb + dist*step), at the counter's
+  // signedness, as `Terminator::isLast` compares the same counter against the
+  // same kind of bound: an unsigned predicate orders a negative `lb` wrongly,
+  // a signed one an unsigned counter's high values wrongly.
+  Value bound = ivAt(rb, dist, lb);
+  return c.notBit(rb.counterUnsigned ? c.icmpUgeV(iv, bound)
+                                     : c.icmpSgeV(iv, bound));
 }
 
 Value DatapathEmitter::atIteration(const uarch::RegionBlock &rb,

@@ -354,6 +354,9 @@ struct EmitContext {
   /// lower bound (`affine.for %i = -4 to 4`) compares correctly. Identical to
   /// the unsigned test for a non-negative counter.
   Value icmpSgeV(Value lhs, Value rhs);
+  /// Combinational (0-cycle) UNSIGNED `lhs >= rhs`, the bound test of a counter
+  /// built at an unsigned width, whose top bit is a magnitude bit not a sign.
+  Value icmpUgeV(Value lhs, Value rhs);
   /// Combinational (0-cycle) logical NOT of an i1 (`v XOR 1`).
   Value notBit(Value v);
   /// Combinational (0-cycle) AND of two i1s.

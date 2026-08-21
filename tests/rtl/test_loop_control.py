@@ -919,10 +919,11 @@ def test_assume_bounded_trip_narrows_the_counter():
     assert Dcp(rtl).attrs("allo.dcp.pipeline", "trip_bound") == [100]
     hinted = widths(rtl.mlir)
     assert hinted.keys() == plain.keys()
-    # 100 iterations of a stride-1 counter need 8 signed bits, and every
-    # address off it indexes within the same span.
-    assert hinted["i"] == 8
-    assert all(w <= 8 for w in hinted.values()), hinted
+    # A trip up to 100 puts the one-past value at 100, which needs 7 unsigned
+    # bits; the non-negative counter is built unsigned, so it drops the sign bit
+    # the signed hull would have carried. Every address off it stays in range.
+    assert hinted["i"] == 7
+    assert all(w <= 7 for w in hinted.values()), hinted
 
     # The bound is not the bound: a run well inside it writes its own trip, not
     # the assumed one.
@@ -962,6 +963,39 @@ def test_an_unrolled_triangular_bound_narrows_the_counter():
     B = np.zeros(32, np.int32)
     rtl.cosim(A, B)
     assert np.array_equal(B, [A[i, :i].sum() for i in range(32)])
+
+
+# A counter that never goes negative is built unsigned: it drops the sign bit
+# the signed hull would carry, and its bound test is unsigned. The delayed copy
+# of the counter that a later-stage store reads must then zero-extend, since its
+# top bit is a magnitude bit -- sign-extending a value like 19 in i5 (0b10011)
+# would index far out of the array.
+def test_a_non_negative_counter_is_unsigned_and_zero_extends_when_delayed():
+    N = 20
+
+    @kernel
+    def tri(A: f32[N, N]):
+        for i in range(N):
+            for j in range(i + 1, N):
+                A[i, j] = A[i, j] * 2.0  # the multiply delays the store's address
+
+    rtl = _to_rtl(tri)
+    m = rtl.mlir
+    widths = {
+        n: int(w) for n, w in re.findall(r"%(\w+) = seq\.compreg[^\n]*: i(\d+)", m)
+    }
+    # j reaches 19 and its one-past 20 needs 5 unsigned bits, not the 6 the
+    # signed hull would take.
+    assert widths["j"] == 5, widths
+    # Every induction bound test is unsigned; none is signed.
+    assert "icmp uge" in m and "icmp sge" not in m
+
+    A = (np.arange(N * N, dtype=np.float32) % 17).reshape(N, N) + 1.0
+    exp = A.copy()
+    for i in range(N):
+        exp[i, i + 1 : N] *= 2.0
+    rtl.cosim(A)
+    assert np.allclose(A, exp, rtol=2e-3, atol=2e-3), A
 
 
 # --- the shared iteration-control controller skeleton ------------------------
