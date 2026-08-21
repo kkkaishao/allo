@@ -2360,6 +2360,35 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     return success();
   }
 
+  // Cycles order settled the span, but its per-interval area tie-break runs on
+  // whatever budget the span solve left (lessBudget) and cannot fold a jumbo
+  // region: where it did not prove the area minimal, a proven span ships the
+  // datapath at the span solve's accidental allocation. Re-solve once at the
+  // winning interval in the area order, leashed to the proven span and seeded
+  // from its own schedule, on a fresh budget, so the same cycles hold on the
+  // fewest units. The area order never exceeds its drain leash, so this only
+  // shortens the span or shrinks the area, and where the tie-break already
+  // proved the area minimal it is skipped and the region is left untouched.
+  bool foldedArea = false;
+  if (bySpan && !areaMode && !bestAttempt.areaProven &&
+      (allocates || !choices.empty() || !span.regs.empty() ||
+       span.device.pulsePrice())) {
+    for (Operation *op : ops)
+      prob.setStartTime(op, bestAttempt.starts.at(op));
+    ModuloAttempt folded;
+    ModuloOutcome outcome = solveAtII(
+        prob, lastOp, breaks, choices, sharedMeta, cycleTime, span, opts,
+        /*drainBound=*/*best - iiWeight * bestII, floorDrain,
+        /*areaBound=*/std::nullopt, /*areaMode=*/true, bestII,
+        window + bestII * contending, /*hint=*/warm.placed, folded);
+    if (outcome == ModuloOutcome::Scheduled) {
+      best = iiWeight * bestII + folded.drain;
+      bestArea = folded.modelArea;
+      bestAttempt = std::move(folded);
+      foldedArea = true;
+    }
+  }
+
   prob.setInitiationInterval(bestII);
   for (Operation *op : ops)
     prob.setStartTime(op, bestAttempt.starts.at(op));
@@ -2389,12 +2418,12 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
       if (heuristicSpan)
         d << " against the heuristic's " << *heuristicSpan;
     }
-    if (areaMode)
+    if (areaMode || foldedArea)
       d << "; area " << bestArea;
   }
   // An exhausted budget leaves the primary objective's placement unproven,
   // and that placement is what the region is charged.
-  if (areaMode) {
+  if (areaMode || foldedArea) {
     if (!bestAttempt.areaProven)
       warn(Stage::Sched, prob.getContainingOp())
           << "Exact scheduling ran out of budget placing the region at II="
