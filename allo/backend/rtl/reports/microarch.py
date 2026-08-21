@@ -323,16 +323,20 @@ class Call:
 class StrideCost:
     """One address stride register beside the counter: its width and which
     update cells it builds (a step adder, a carry adder with its select, a
-    wrap compare with its fix adder and select)."""
+    wrap compare with its fix adder and select). ``is_counter`` marks the
+    stride that is the counter itself and so builds no register."""
 
     width: int
     step: bool
     carry: bool
     wrap: bool
+    is_counter: bool = False
 
     @classmethod
     def from_json(cls, d: dict) -> StrideCost:
-        return cls(d["width"], d["step"], d["carry"], d["wrap"])
+        return cls(
+            d["width"], d["step"], d["carry"], d["wrap"], d.get("is_counter", False)
+        )
 
 
 @dataclass(frozen=True)

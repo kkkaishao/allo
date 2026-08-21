@@ -494,16 +494,16 @@ def test_an_address_that_follows_the_counters_is_carried_in_a_register():
     mod = _to_rtl(stencil)
     m = mod.mlir
     assert "comb.mul" not in m, "a constant stride survived on the address path"
-    # One scaled counter per level, shared by the two accesses, except at the
-    # outermost, where `out`'s own constant 421 rides in the register's reset
-    # value instead of an adder on the address path. That fourth register is
-    # what buys the adder off the memory port's setup, and a register is the
-    # cheap side of that trade.
+    # One scaled counter per NON-UNIT level: the outer two multiply their
+    # counter (400, 20) so they ride their own registers, at the outermost also
+    # a second one whose reset value carries `out`'s constant 421 off the memory
+    # port's setup. The innermost term is the bare counter `k` for both accesses
+    # -- `out`'s `k+1` puts the 1 in the base, not the stride -- so it reads the
+    # `k` register directly rather than duplicating it into an `r2_addr0`.
     assert sorted(set(re.findall(r"r\d+_addr\d+", m))) == [
         "r0_addr0",
         "r0_addr1",
         "r1_addr0",
-        "r2_addr0",
     ]
     inits = dict(
         re.findall(r"%(r\d+_addr\d+) = seq\.compreg [^\n]*reset %rst, %(\w+)", m)
@@ -517,6 +517,32 @@ def test_an_address_that_follows_the_counters_is_carried_in_a_register():
     exp = np.zeros((20, 20, 20), np.int32)
     exp[1:19, 1:19, 1:19] = A[0:18, 0:18, 0:18] + 1
     assert np.array_equal(out, exp)
+
+
+def test_a_unit_stride_address_reads_the_counter_and_builds_no_register():
+    # The end of strength reduction: a term that is `1 * counter + 0` is the
+    # counter, so the register the reduction would build holds a bit-for-bit
+    # copy of it, advanced by the same adder on the same enable. The access
+    # reads the counter directly and no `r0_addr` register is built. `B[i]`'s
+    # write and `A[i]`'s read share the one counter.
+    @kernel
+    def copy(A: i32[64], B: i32[64]):
+        for i in range(64):
+            B[i] = A[i] + 1
+
+    mod = _to_rtl(copy)
+    m = mod.mlir
+    assert not re.findall(r"r\d+_addr\d+", m), "a unit-stride address kept a register"
+    # The report agrees with the emitter: the counter-aliased stride counts as
+    # no register riding beside the counter, and is flagged so.
+    region = mod.microarch.funcs[0].regions[0]
+    assert region.cost.addr_strides == 0, region.cost.addr_strides
+    assert any(s.is_counter for s in region.cost.strides), region.cost.strides
+
+    A = (np.arange(64, dtype=np.int32) * 5 + 1) & 0xFF
+    B = np.zeros(64, np.int32)
+    mod.cosim(A, B)
+    assert np.array_equal(B, A + 1)
 
 
 def test_a_subscript_that_cannot_be_carried_keeps_the_row_its_register():

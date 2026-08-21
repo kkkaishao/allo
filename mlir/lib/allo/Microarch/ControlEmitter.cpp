@@ -35,7 +35,8 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
   bool chained = bypassesStart(term, sh);
   Value first = chained ? term.gateStart(c, start) : Value();
   rc.scaledCounters = emitScaledCounters(
-      rb, /*bypassStart=*/first, [&](Value cur, Value stepped, Value init) {
+      rb, /*bypassStart=*/first, rc.counter,
+      [&](Value cur, Value stepped, Value init) {
         return chained ? c.mux(rc.issue, stepped, c.mux(rc.running, cur, init))
                        : c.mux(rc.running, c.mux(rc.issue, stepped, cur), init);
       });
@@ -47,7 +48,7 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
 // counters are written beside the counter they have to track: drifting from
 // that counter is the only way these can be wrong.
 llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
-    const uarch::RegionBlock &rb, Value bypassStart,
+    const uarch::RegionBlock &rb, Value bypassStart, Value counter,
     llvm::function_ref<Value(Value, Value, Value)> update) const {
   llvm::SmallVector<Value> scaled;
   // Whether each slot's register wraps THIS advance, which is what a digit
@@ -55,6 +56,14 @@ llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
   // signal exists by the time it is read.
   llvm::SmallVector<Value> wrapped(rb.addrStrides.size());
   for (auto [slot, s] : llvm::enumerate(rb.addrStrides)) {
+    // The stride that IS the counter reads the counter register: same value,
+    // same start-cycle bypass, one register for both. It never carries a digit
+    // above it (no wrap), so `wrapped[slot]` stays unset with no consumer.
+    if (s.isCounter) {
+      assert(counter && "an identity stride in a region with no counter");
+      scaled.push_back(counter);
+      continue;
+    }
     // Each register at the width ITS OWN range needs, not what the counter
     // happens to be: a cyclic-4 bank digit is 3 bits beside a 32-bit iteration
     // counter.
@@ -230,7 +239,7 @@ IterationControl ControlEmitter::emitCountedIteration(
   Value advance = c.andBits(complete, c.notBit(last));
   ivNext.setValue(c.mux(start, term.lb, c.mux(advance, ivStep, iv)));
   llvm::SmallVector<Value> scaled = emitScaledCounters(
-      rb, /*bypassStart=*/launchAtStart ? start : Value(),
+      rb, /*bypassStart=*/launchAtStart ? start : Value(), iv,
       [&](Value cur, Value stepped, Value init) {
         // Exactly `ivNext` above, with `lb` and `step` scaled.
         return c.mux(start, init, c.mux(advance, stepped, cur));

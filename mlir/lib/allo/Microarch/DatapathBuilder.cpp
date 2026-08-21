@@ -1581,6 +1581,19 @@ void DatapathBuilder::planAddressGenerators() {
       }
     }
   }
+  // A plain scaled counter whose init and step ARE the region's counter is that
+  // counter, holding the same value cycle for cycle. The emitter reads
+  // `rc.counter` for it rather than building a second register and adder; here
+  // is the one place both the emitter and the report learn of the fold.
+  for (RegionBlock &rb : dp.regions) {
+    std::optional<int64_t> lb = dp.constantOf(rb.lbSource);
+    std::optional<int64_t> step = dp.constantOf(rb.stepSource);
+    if (!lb || !step)
+      continue;
+    for (RegionBlock::AddrStride &s : rb.addrStrides)
+      s.isCounter =
+          s.init == *lb && s.step == *step && !s.bump && !s.wrap && !s.hasCarry;
+  }
 }
 
 void DatapathBuilder::resolveMemoryOperands() {

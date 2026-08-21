@@ -138,10 +138,11 @@ struct CallReport {
 
 /// One address stride register beside the counter: its width and which update
 /// cells it builds (a step adder, a carry adder with its select, a wrap
-/// compare with its fix adder and select).
+/// compare with its fix adder and select). `isCounter` names the stride that
+/// is the counter itself, which builds no register at all.
 struct StrideCost {
   unsigned width = 0;
-  bool step = false, carry = false, wrap = false;
+  bool step = false, carry = false, wrap = false, isCounter = false;
 };
 
 /// What the cost model needs of one region and no reader does. Grouped apart

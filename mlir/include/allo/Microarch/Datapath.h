@@ -895,6 +895,10 @@ struct RegionBlock {
     /// own width: `clog2` of the modulus for a wrapping digit, of the array for
     /// a row stride. `kIndexWidth` when the range is unbounded (`slotFor`).
     unsigned width = kIndexWidth;
+    /// This stride IS the region's own counter (`init == lb`, `step`, no bump,
+    /// wrap or carry), so the emitter reads `rc.counter` for it and builds no
+    /// register. Set by `planAddressGenerators`.
+    bool isCounter = false;
   };
   /// Deduplicated, since two accesses down the same row share a stride. Some
   /// slots exist only to carry another (the `x mod D` companion of a quotient

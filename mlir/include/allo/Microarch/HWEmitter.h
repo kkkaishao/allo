@@ -145,9 +145,11 @@ struct ControlEmitter {
   /// at its OWN width (`AddrStride::width`) rather than the counter's. \p
   /// update is the counter's next-value expression with `lb` and `step` scaled,
   /// supplied by the caller since the two controller families disagree about
-  /// it. \p bypassStart mirrors a done-driven counter's start-cycle bypass.
+  /// it. \p bypassStart mirrors a done-driven counter's start-cycle bypass. A
+  /// slot flagged `isCounter` builds no register and takes \p counter directly,
+  /// the two being the same value at the counter's own width.
   llvm::SmallVector<Value> emitScaledCounters(
-      const uarch::RegionBlock &rb, Value bypassStart,
+      const uarch::RegionBlock &rb, Value bypassStart, Value counter,
       llvm::function_ref<Value(Value cur, Value stepped, Value init)> update)
       const;
   /// The one pipelined control skeleton for the free-running (II==1), modulo

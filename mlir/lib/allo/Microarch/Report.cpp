@@ -321,9 +321,14 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     r.kind = rb.kind == RegionBlock::Kind::Cyclic ? "cyclic" : "acyclic";
     if (rb.ii)
       r.interval = (int64_t)*rb.ii;
-    r.cost.addrStrides = rb.addrStrides.size();
-    for (const RegionBlock::AddrStride &s : rb.addrStrides)
-      r.cost.strides.push_back({s.width, s.step != 0, s.hasCarry, s.wrap != 0});
+    for (const RegionBlock::AddrStride &s : rb.addrStrides) {
+      // The counter-aliased stride builds no register, so it does not count
+      // among the ones riding beside the counter.
+      if (!s.isCounter)
+        ++r.cost.addrStrides;
+      r.cost.strides.push_back(
+          {s.width, s.step != 0, s.hasCarry, s.wrap != 0, s.isCounter});
+    }
     if (rb.counterType)
       r.cost.counterWidth = datapathWidth(rb.counterType);
     // The phase counter exists exactly where `emitPipelined` builds one: a
@@ -500,6 +505,7 @@ std::string MicroarchReport::toJSON() const {
                         j.attribute("step", s.step);
                         j.attribute("carry", s.carry);
                         j.attribute("wrap", s.wrap);
+                        j.attribute("is_counter", s.isCounter);
                       });
                   });
                 });
