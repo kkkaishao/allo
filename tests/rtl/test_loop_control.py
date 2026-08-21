@@ -934,6 +934,36 @@ def test_assume_bounded_trip_narrows_the_counter():
     assert np.array_equal(B, exp)
 
 
+# Unrolling a triangular loop divides its bound, and by the time the counter is
+# sized that division is a compare/negate/shift cone rather than an affine
+# expression. The counter's hull is read off that cone, so it is still the
+# loop's own range that sizes the register and the strides riding it.
+def test_an_unrolled_triangular_bound_narrows_the_counter():
+    @kernel
+    def k(A: i32[32, 32], B: i32[32]):
+        for i in range(32):
+            acc: i32 = 0
+            for j in range(i):
+                acc += A[i, j]
+            B[i] = acc
+
+    s = k.schedule()
+    s.unroll(s.loop("j"), factor=2)
+    rtl = s.export("rtl")
+    widths = {
+        name: int(w)
+        for name, w in re.findall(r"%(\w+) = seq\.compreg[^\n]*: i(\d+)", rtl.mlir)
+    }
+    # At most 32 iterations either way, so neither counter reaches the index
+    # width the reified bound is carried at.
+    assert widths["i"] <= 8 and widths["j"] <= 8, widths
+
+    A = (np.arange(32 * 32, dtype=np.int32) % 89).reshape(32, 32)
+    B = np.zeros(32, np.int32)
+    rtl.cosim(A, B)
+    assert np.array_equal(B, [A[i, :i].sum() for i in range(32)])
+
+
 # --- the shared iteration-control controller skeleton ------------------------
 
 

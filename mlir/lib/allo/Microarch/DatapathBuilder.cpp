@@ -753,6 +753,12 @@ static ValueHull hullUnion(ValueHull a, ValueHull b) {
   return {std::min(a.lo, b.lo), std::max(a.hi, b.hi)};
 }
 
+/// Floor division at hull width; an arithmetic right shift is one by 2^k.
+static __int128 divideFloor(__int128 a, __int128 b) {
+  __int128 q = a / b;
+  return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+}
+
 static bool fitsSigned(const ValueHull &h, unsigned width) {
   __int128 lim = (__int128)1 << (std::min(width, 64u) - 1);
   return h.lo >= -lim && h.hi < lim;
@@ -805,18 +811,42 @@ static std::optional<ValueHull> hullOfValue(Value v, unsigned fuel) {
   auto of = [&](unsigned i) {
     return hullOfValue(comp.getInputs()[i], fuel - 1);
   };
+  // An operand pinned to one value, which the shift and mask rules below need.
+  // Read off its hull rather than the op, since a constant reaches an operand
+  // through whatever region hoisted it.
+  auto literal = [&](unsigned i) -> std::optional<__int128> {
+    std::optional<ValueHull> h = of(i);
+    if (!h || h->lo != h->hi)
+      return std::nullopt;
+    return h->lo;
+  };
+  // A widening cast bounds its result by the source type even where the source
+  // value has no hull of its own, which is how the `extui` of a comparison in a
+  // lowered floor division is bounded.
+  auto typeHull = [](Value v, bool isSigned) -> std::optional<ValueHull> {
+    auto ty = dyn_cast<IntegerType>(v.getType());
+    if (!ty || ty.getWidth() > 62)
+      return std::nullopt;
+    __int128 span = (__int128)1 << (ty.getWidth() - (isSigned ? 1 : 0));
+    return isSigned ? ValueHull{-span, span - 1} : ValueHull{0, span - 1};
+  };
   std::optional<ValueHull> h;
   switch (*kind) {
   case CombOpKindEnum::IndexCast:
-  case CombOpKindEnum::Extsi:
   case CombOpKindEnum::Trunci:
     h = of(0);
+    break;
+  case CombOpKindEnum::Extsi:
+    if (!(h = of(0)))
+      h = typeHull(comp.getInputs()[0], /*isSigned=*/true);
     break;
   case CombOpKindEnum::IndexCastUi:
   case CombOpKindEnum::Extui:
     // Zero-extension preserves the value only where it is non-negative.
     if ((h = of(0)) && h->lo < 0)
-      return std::nullopt;
+      h = std::nullopt;
+    if (!h)
+      h = typeHull(comp.getInputs()[0], /*isSigned=*/false);
     break;
   case CombOpKindEnum::Addi:
   case CombOpKindEnum::Subi: {
@@ -851,6 +881,40 @@ static std::optional<ValueHull> hullOfValue(Value v, unsigned fuel) {
         *kind == CombOpKindEnum::Minsi || *kind == CombOpKindEnum::Minui;
     h = isMin ? ValueHull{std::min(a->lo, b->lo), std::min(a->hi, b->hi)}
               : ValueHull{std::max(a->lo, b->lo), std::max(a->hi, b->hi)};
+    break;
+  }
+  case CombOpKindEnum::Select: {
+    // One arm or the other, so the union of the two.
+    auto a = of(1), b = of(2);
+    if (!a || !b)
+      return std::nullopt;
+    h = hullUnion(*a, *b);
+    break;
+  }
+  case CombOpKindEnum::Shli:
+  case CombOpKindEnum::Shrsi:
+  case CombOpKindEnum::Shrui: {
+    // A literal shift is a monotone multiply or floor-divide by 2^k; a
+    // computed one is not a rule this walk carries.
+    std::optional<__int128> k = literal(1);
+    auto a = of(0);
+    if (!k || *k < 0 || *k > 62 || !a)
+      return std::nullopt;
+    if (*kind == CombOpKindEnum::Shrui && a->lo < 0)
+      return std::nullopt;
+    __int128 p = (__int128)1 << *k;
+    h = *kind == CombOpKindEnum::Shli
+            ? ValueHull{a->lo * p, a->hi * p}
+            : ValueHull{divideFloor(a->lo, p), divideFloor(a->hi, p)};
+    break;
+  }
+  case CombOpKindEnum::Andi: {
+    // Masking with a non-negative literal lands in [0, mask] whatever the
+    // other side holds.
+    std::optional<__int128> m = literal(1);
+    if (!m || *m < 0)
+      return std::nullopt;
+    h = ValueHull{0, *m};
     break;
   }
   default:
