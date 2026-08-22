@@ -1161,25 +1161,11 @@ void pinStructure(CpModelBuilder &model, const CpSolverResponse &from,
     model.AddEquality(cls.units, SolutionIntegerValue(from, cls.units));
 }
 
-/// The tie-break that follows a settled primary: the start-time sum, which
-/// packs the placement toward the front, minimized under the primary held to
-/// what it reached and the structure already pinned. Proving a start sum
-/// minimal rarely closes and is not worth a solve's budget, so this runs on a
-/// slice of one; a solve that decided nothing leaves \p from to ship.
-constexpr double kTieBreakShare = 0.1;
-CpSolverResponse polishStarts(CpModelBuilder &model, ArrayRef<IntVar> starts,
-                              const LinearExpr &primary,
-                              const CpSolverResponse &from,
-                              const SchedulerOptions &opts, double remaining) {
-  SchedulerOptions share = opts;
-  share.budget = std::min(remaining, opts.budget * kTieBreakShare);
-  if (share.budget <= 0.0)
-    return CpSolverResponse();
-  model.AddLessOrEqual(primary, SolutionIntegerValue(from, primary));
-  model.Minimize(LinearExpr::Sum(starts));
-  rehintAll(model, from);
-  return solveBuilt(model, solverParameters(share));
-}
+/// Share of the budget the cycles order's area tie-break gets where a span
+/// composes: the fold re-solve at the winning interval carries the area on a
+/// fresh budget there, and an uncapped tie-break on a jumbo region burns its
+/// whole remainder without proving anything the fold does not redo.
+constexpr double kAreaTieBreakShare = 0.3;
 
 /// What \p decided costs the device: every resource, at the price of the count
 /// it settled on.
@@ -1475,11 +1461,10 @@ int64_t drainFloor(ProblemT &prob, ArrayRef<Problem::Dependence> breaks,
 ///
 /// A straight-line region runs once, so its whole cost is its drain,
 /// upper-bounded by the heuristic's own drain so the search prunes like a
-/// branch and bound. Two solves on one model and a tie-break: the first
-/// minimizes the drain alone, the second the area under the drain the first
-/// settled, and `polishStarts` the start sum under both, so a budget that runs
-/// short is spent proving the span before polishing the area. Both decide
-/// which row realizes an operation the device offers several for
+/// branch and bound. Two solves on one model: the first minimizes the drain
+/// alone, the second the area under the drain the first settled, so a budget
+/// that runs short is spent proving the span before minimizing the area. Both
+/// decide which row realizes an operation the device offers several for
 /// (`selectionChoices`), alongside its start time.
 LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                                         Operation *lastOp, float cycleTime,
@@ -1661,9 +1646,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   if (areaMode) {
     // Three solves on one model, sharing one budget: the structural bootstrap,
     // the full area complete-hinted from its whole solution, and the shortest
-    // drain the settled structure admits, then the start-sum tie-break under
-    // that drain. The heuristic's schedule completes the bootstrap's hint, so
-    // an exhausted budget ships no worse than it.
+    // drain the settled structure admits. The heuristic's schedule completes
+    // the bootstrap's hint, so an exhausted budget ships no worse than it.
     LinearExpr structural;
     LinearExpr area = areaTerms(model, orderedStarts, span, startVars, allocs,
                                 /*ii=*/0, horizon, latExpr, sels, shared,
@@ -1682,24 +1666,18 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
            "the bootstrap's schedule satisfies the same model");
     bool areaProven = first.status() == CpSolverStatus::OPTIMAL;
     const CpSolverResponse *pick = solved(first) ? &first : &boot;
-    CpSolverResponse second, third;
+    CpSolverResponse second;
     if (solved(first)) {
       int64_t solvedArea = SolutionIntegerValue(first, area);
       model.AddLessOrEqual(area, solvedArea);
       pinStructure(model, first, allocs, sels, shared);
       model.Minimize(drain);
       rehintAll(model, first);
-      SchedulerOptions restDrain = lessBudget(restArea, first);
-      second = solveBuilt(model, solverParameters(restDrain));
+      second = solveBuilt(model, solverParameters(lessBudget(restArea, first)));
       assert(second.status() != CpSolverStatus::INFEASIBLE &&
              "the area solve's schedule satisfies the pinned model");
-      if (solved(second)) {
+      if (solved(second))
         pick = &second;
-        third = polishStarts(model, orderedStarts, drain, second, opts,
-                             lessBudget(restDrain, second).budget);
-        if (solved(third))
-          pick = &third;
-      }
     }
     if (!areaProven)
       warn(Stage::Sched, prob.getContainingOp())
@@ -1758,15 +1736,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
          "the span solve's schedule satisfies the pinned model");
   if (!solved(second) && !ranFirst)
     return giveUp(second);
-  CpSolverResponse third;
-  if (solved(second)) {
-    pinStructure(model, second, allocs, sels, shared);
-    third = polishStarts(model, orderedStarts, area, second, opts,
-                         lessBudget(rest, second).budget);
-  }
-  const CpSolverResponse &pick = solved(third)    ? third
-                                 : solved(second) ? second
-                                                  : first;
+  const CpSolverResponse &pick = solved(second) ? second : first;
 
   if (!spanProven)
     warn(Stage::Sched, prob.getContainingOp())
@@ -1809,7 +1779,10 @@ struct ModuloAttempt {
   Allocated decided;
   SmallVector<unsigned> chosen, classUnits;
   bool spanProven = false, areaProven = false;
-  int64_t drain = 0, modelArea = 0;
+  int64_t drain = 0;
+  /// The shipped schedule's modeled area, chains included. Absent where the
+  /// cycles order's area solve found nothing under the settled span.
+  std::optional<int64_t> modelArea;
 };
 
 /// Solve \p prob at the FIXED initiation interval \p ii, writing what it
@@ -1823,9 +1796,12 @@ struct ModuloAttempt {
 /// \p drainBound cuts below the greedy schedule's own drain: the hint then
 /// violates the model, which the interleaved portfolio check-fails on.
 ///
-/// Two solves on one model, span then area, then the start-sum tie-break,
-/// sharing one budget (see the acyclic entry). `out.spanProven` and
-/// `out.areaProven` are each solve's
+/// Two solves on one model, span then area, sharing one budget (see the
+/// acyclic entry). Where a span composes
+/// (\p span.trip) the area solve is held to `kAreaTieBreakShare` of it: the
+/// caller folds the winning interval in the area order on a fresh budget, so
+/// the area solve here only breaks the interval tie and seeds that fold.
+/// `out.spanProven` and `out.areaProven` are each solve's
 /// OPTIMAL against FEASIBLE, which the II search cannot otherwise tell apart,
 /// and an unproven placement's drain is still what the region's span gets
 /// charged.
@@ -1838,8 +1814,10 @@ struct ModuloAttempt {
 /// drain held to \p drainBound (the caller's leash at this II) and the area
 /// held under \p areaBound (the incumbent's), then the shortest drain the
 /// settled area admits. `out.modelArea` receives the shipped schedule's
-/// modeled area, the figure the caller compares intervals on; the host-side
-/// mirror below carries no register-chain term and cannot serve there.
+/// modeled area, the figure the caller compares intervals on and holds the
+/// fold re-solve to; the host-side mirror below carries no register-chain
+/// term and cannot serve there. The cycles order sets it only where its area
+/// solve found a schedule.
 ///
 /// \p choices are the realization decisions this model carries (empty
 /// \p breaks then, the period stated through the sub-cycle system);
@@ -2032,8 +2010,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     // realization, which a packed schedule degenerates to the ceiling
     // allocation. Then the full area, complete-hinted from the bootstrap's
     // whole solution since its chain terms search too poorly to stand alone;
-    // then the shortest drain the settled structure admits and the start-sum
-    // tie-break under it.
+    // then the shortest drain the settled structure admits.
     LinearExpr structural;
     LinearExpr area = areaTerms(model, orderedStarts, span, startVars, allocs,
                                 ii, horizon, latExpr, sels, shared,
@@ -2079,25 +2056,19 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       return ModuloOutcome::Infeasible;
     out.areaProven = first.status() == CpSolverStatus::OPTIMAL;
     const CpSolverResponse *pick = solved(first) ? &first : &boot;
-    CpSolverResponse second, third;
+    CpSolverResponse second;
     if (solved(first)) {
       int64_t solvedArea = SolutionIntegerValue(first, area);
       model.AddLessOrEqual(area, solvedArea);
       pinStructure(model, first, allocs, sels, shared);
       model.Minimize(*drainVar);
       rehintAll(model, first);
-      SchedulerOptions restDrain = lessBudget(restArea, first);
-      second = solveBuilt(model, solverParameters(restDrain));
+      second = solveBuilt(model, solverParameters(lessBudget(restArea, first)));
       assert(second.status() != CpSolverStatus::INFEASIBLE &&
              "the area solve's schedule satisfies the pinned model");
       out.spanProven = second.status() == CpSolverStatus::OPTIMAL;
-      if (solved(second)) {
+      if (solved(second))
         pick = &second;
-        third = polishStarts(model, orderedStarts, *drainVar, second, opts,
-                             lessBudget(restDrain, second).budget);
-        if (solved(third))
-          pick = &third;
-      }
     }
     for (Operation *op : ops)
       out.starts[op] = SolutionIntegerValue(*pick, startVars.at(op));
@@ -2129,20 +2100,14 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   model.Minimize(area);
   rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, shared, first);
   SchedulerOptions rest = lessBudget(opts, first);
+  if (span.trip)
+    rest.budget = std::min(rest.budget, opts.budget * kAreaTieBreakShare);
   CpSolverResponse second =
       solveBuilt(model, solverParameters(rest));
   assert(second.status() != CpSolverStatus::INFEASIBLE &&
          "the span solve's schedule satisfies the pinned model");
   out.areaProven = second.status() == CpSolverStatus::OPTIMAL;
-  CpSolverResponse third;
-  if (solved(second)) {
-    pinStructure(model, second, allocs, sels, shared);
-    third = polishStarts(model, orderedStarts, area, second, opts,
-                         lessBudget(rest, second).budget);
-  }
-  const CpSolverResponse &pick = solved(third)    ? third
-                                 : solved(second) ? second
-                                                  : first;
+  const CpSolverResponse &pick = solved(second) ? second : first;
 
   for (Operation *op : ops)
     out.starts[op] = SolutionIntegerValue(pick, startVars.at(op));
@@ -2150,6 +2115,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   out.chosen = readSelection(pick, sels);
   out.classUnits = readSharedUnits(pick, shared);
   out.drain = drainVar ? SolutionIntegerValue(pick, *drainVar) : 0;
+  if (solved(second))
+    out.modelArea = SolutionIntegerValue(pick, area);
   return ModuloOutcome::Scheduled;
 }
 
@@ -2398,13 +2365,13 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     // reverse under the area objective, where the compared area is the model's
     // (chains included).
     int64_t solved = iiWeight * ii + attempt.drain;
-    int64_t area = areaMode
-                       ? attempt.modelArea
-                       : areaOf(prob, attempt.decided) +
-                             selectionPrice(choices, attempt.chosen,
-                                            sharedMeta.covered) +
-                             sharedAreaOf(span.device, sharedMeta, choices,
-                                          attempt.chosen, attempt.classUnits);
+    int64_t area =
+        areaMode
+            ? *attempt.modelArea
+            : areaOf(prob, attempt.decided) +
+                  selectionPrice(choices, attempt.chosen, sharedMeta.covered) +
+                  sharedAreaOf(span.device, sharedMeta, choices, attempt.chosen,
+                               attempt.classUnits);
     bool adopt = areaMode ? (!adopted || area < bestArea ||
                              (area == bestArea && solved < *best))
                           : (!adopted || solved < *best ||
@@ -2466,14 +2433,17 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   }
 
   // Cycles order settled the span, but its per-interval area tie-break runs on
-  // whatever budget the span solve left (lessBudget) and cannot fold a jumbo
+  // a capped share of the budget (kAreaTieBreakShare) and cannot fold a jumbo
   // region: where it did not prove the area minimal, a proven span ships the
   // datapath at the span solve's accidental allocation. Re-solve once at the
   // winning interval in the area order, leashed to the proven span and seeded
   // from its own schedule, on a fresh budget, so the same cycles hold on the
-  // fewest units. The area order never exceeds its drain leash, so this only
-  // shortens the span or shrinks the area, and where the tie-break already
-  // proved the area minimal it is skipped and the region is left untouched.
+  // fewest units. The area order never exceeds its drain leash, but a fold
+  // whose own area solve runs out ships its bootstrap, chains unminimized, so
+  // it is adopted only where its modeled area beats what the tie-break found
+  // (or the tie-break found nothing), a tie going to the shorter drain. Where
+  // the tie-break already proved the area minimal the fold is skipped and the
+  // region is left untouched.
   bool foldedArea = false;
   if (bySpan && !areaMode && !bestAttempt.areaProven &&
       (allocates || !choices.empty() || !span.regs.empty() ||
@@ -2486,9 +2456,12 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
         /*drainBound=*/*best - iiWeight * bestII, floorDrain,
         /*areaBound=*/std::nullopt, /*areaMode=*/true, bestII,
         window + bestII * contending, /*hint=*/warm.placed, folded);
-    if (outcome == ModuloOutcome::Scheduled) {
+    if (outcome == ModuloOutcome::Scheduled &&
+        (!bestAttempt.modelArea || *folded.modelArea < *bestAttempt.modelArea ||
+         (*folded.modelArea == *bestAttempt.modelArea &&
+          folded.drain < bestAttempt.drain))) {
       best = iiWeight * bestII + folded.drain;
-      bestArea = folded.modelArea;
+      bestArea = *folded.modelArea;
       bestAttempt = std::move(folded);
       foldedArea = true;
     }
