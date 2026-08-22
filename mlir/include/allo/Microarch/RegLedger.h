@@ -15,10 +15,10 @@
 
 namespace mlir::allo::uarch {
 
-/// Why a register exists. The emitter knows this where it BUILDS the register,
+/// Why a register exists. The emitter knows this where it builds the register
 /// and nowhere later: a reader of the emitted design sees a `seq.compreg` and
-/// can recover the reason only by parsing the name it happens to carry, which
-/// is a second copy of a convention `Naming.h` owns.
+/// can recover the reason only from the name it carries, a convention
+/// `Naming.h` owns.
 enum class RegRole {
   Value,    // a value delay chain: one datum carried across cycle boundaries
   Pulse,    // an activation chain: a region's issue delayed to an op's stage
@@ -31,19 +31,15 @@ enum class RegRole {
 
 llvm::StringRef roleName(RegRole role);
 
-/// One class of register RUN: `count` runs of `depth` registers in series,
-/// `width` bits each, all built for the same reason. A lone register is a run
-/// of depth 1, so every register belongs to exactly one class and the design's
-/// flip-flop count is `sum(width * depth * count)`.
+/// One class of register run: `count` runs of `depth` registers in series,
+/// `width` bits each, all built for the same reason. A lone register is a run of
+/// depth 1, so the design's flip-flop count is `sum(width * depth * count)`.
 ///
-/// The run, not the register, is the cost unit. Past the synthesizer's
-/// shift-register extraction threshold a run stops costing flip-flops per
-/// stage, so a cost model handed only a register total cannot price it. A
-/// multi-tapped chain is charged as one run per maximal inter-tap segment, the
-/// pieces extraction can form. `reset` and `enable` complete that shape: a
-/// synchronous reset blocks the extraction and pays fabric per bit, a clock
-/// enable is free, and a cost model needs both to pick its characterization
-/// row.
+/// The run, not the register, is the cost unit: past the synthesizer's
+/// shift-register extraction threshold a run stops costing flip-flops per stage.
+/// A multi-tapped chain is charged as one run per maximal inter-tap segment.
+/// `reset` blocks extraction and pays fabric per bit; `enable` is free; a cost
+/// model needs both to pick its characterization row.
 struct RegClass {
   RegRole role = RegRole::Control;
   unsigned width = 0, depth = 0, count = 0;
@@ -53,7 +49,7 @@ struct RegClass {
 
 /// Every register one module's emission built. Filled at the one point that
 /// creates a `seq.compreg` (`EmitContext::reg`) plus the chain builders, which
-/// charge a whole run at once, so the total is a COUNT and not an estimate.
+/// charge a whole run at once, so the total is a count, not an estimate.
 class RegLedger {
 public:
   /// Charge one run of \p depth registers of \p width bits. A depth of zero is

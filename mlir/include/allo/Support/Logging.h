@@ -20,23 +20,23 @@ class Location;
 namespace mlir::allo::logging {
 
 // Severity, ascending. `Error` (an illegal program) and `Unsupported` (a legal
-// one this backend does not lower yet) are siblings, both FATAL; `Unsupported`
+// one this backend does not lower yet) are siblings, both fatal; `Unsupported`
 // sits last only so the ascending threshold never filters it.
 enum class Level { Debug, Info, Warn, Error, Unsupported };
 
 // Compiler stage printed in the second bracket. Extend as new stages log.
 enum class Stage { Prep, Sched, Dcp, Emit };
 
-/// The REASON a compile is refused, and the only stable token a diagnostic
-/// carries: the wording of every message is free to change, so a caller that
-/// must recognize a refusal matches the code instead.
+/// The reason a compile is refused, and the only stable token a diagnostic
+/// carries: message wording is free to change, so a caller recognizing a
+/// refusal matches the code instead.
 ///
-/// One code per reason, never per call site. Two sites that refuse for the same
+/// One code per reason, never per call site: two sites refusing for the same
 /// reason share one, and a code is retired rather than reused when its reason
-/// goes away. The `E` series is an illegal program and the `N` series a legal
-/// one this backend does not lower yet, so a code names its level too; only
-/// `error` and `unsupported` accept one, since a non-fatal line reports a
-/// decision that SUCCEEDED and that decision belongs in a report.
+/// goes away. The `E` series is an illegal program, the `N` series a legal one
+/// this backend does not lower yet, so a code names its level too; only `error`
+/// and `unsupported` take one, a non-fatal line reporting a decision that
+/// belongs in a report.
 enum class Code {
   // Illegal input (`error`).
   TopFunctionMissing,         // the named top function is not there

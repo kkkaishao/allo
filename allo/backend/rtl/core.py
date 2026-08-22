@@ -67,13 +67,13 @@ def _operator_period_cap(device: Device) -> float:
 
 class LatencyModelWarning(UserWarning):
     """A cosim ran for fewer cycles than the exact contract the kernel
-    publishes. Its own class so a test run can filter it to an error."""
+    publishes."""
 
 
 class RealizationWarning(UserWarning):
     """A scaffolded project instantiates an extern module its device cannot
     build, so it synthesizes as a black box until an implementation is
-    supplied. Its own class so a test run can filter it to an error."""
+    supplied."""
 
 
 # pylint: disable-next=too-many-instance-attributes
@@ -109,8 +109,8 @@ class RTL(Backend[P, R]):
         )
         self._cycle_time = 1000.0 / self.freq_mhz
         self.simulator = simulator
-        # Operator-sharing binding, resolved from the scheduler when the
-        # schedule is built. `use_trivial_binding` overrides it.
+        # Operator-sharing binding, resolved from the scheduler when the schedule
+        # is built; `use_trivial_binding` overrides it.
         self.binding: str | None = None
         self._sched_opts = SchedulerOptions(cycle_ns=self._cycle_time)
         self._prepass_opts = PrepassOptions()

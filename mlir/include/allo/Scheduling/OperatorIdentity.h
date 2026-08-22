@@ -26,18 +26,18 @@ class OperatorLibrary;
 /// one unit can run both. The library's second key, finer than
 /// `NodeTiming::typeName`, which names a timing row.
 struct OperatorIdentity {
-  /// The realization, on exactly one of the two exclusive paths a
-  /// `dcp.compute` takes. Both empty when no functional unit is built for the
-  /// operation: a memory or stream access, a literal, a call.
+  /// The realization, on exactly one of the two exclusive paths a `dcp.compute`
+  /// takes. Both empty when no functional unit is built (a memory or stream
+  /// access, a literal, a call).
   std::optional<CombOpKindEnum> comb; // native: emitted inline by `emitCompute`
   std::string ipSymbol;               // IP: a `dcp.operator` symbol
   llvm::SmallVector<Type, 2> argTypes; // operand types, so width is in here
   Type resultType;
   Attribute predicate; // a compare's `predicate`; null otherwise
   Attribute map;       // an `affine.apply`'s `map`; null otherwise
-  /// A bit rename (a shift by a literal, a width-kept resize): wiring, priced
-  /// at nothing. Part of the identity so a rename never shares a class with
-  /// the real operator its mnemonic spells.
+  /// A bit rename (a shift by a literal, a width-kept resize): wiring, priced at
+  /// nothing. In the identity so a rename never shares a class with the real
+  /// operator its mnemonic spells.
   bool rename = false;
 
   /// Whether an operation of this identity gets a functional unit.
@@ -51,9 +51,9 @@ struct OperatorIdentity {
   }
   bool operator!=(const OperatorIdentity &o) const { return !(*this == o); }
 
-  /// How the realization itself spells, whichever path it took: the comb
-  /// mnemonic or the IP symbol. A DISPLAY name, for a report or a debug dump;
-  /// `Naming.h` owns the RTL ones (`operatorModuleName`).
+  /// How the realization spells, whichever path it took: the comb mnemonic or
+  /// the IP symbol. A display name for a report or debug dump; `Naming.h` owns
+  /// the RTL ones (`operatorModuleName`).
   llvm::StringRef realizationName() const {
     return comb ? stringifyCombOpKindEnum(*comb) : llvm::StringRef(ipSymbol);
   }

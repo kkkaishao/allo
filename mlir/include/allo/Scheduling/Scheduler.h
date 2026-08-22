@@ -20,25 +20,12 @@
 
 namespace mlir::allo {
 
-/// The device view. Declared rather than included: `OperatorLibrary` is built
-/// on the problems below, so the dependence only runs one way.
+/// The device view, forward-declared here: `OperatorLibrary` is built on the
+/// problems below, so the dependence runs one way.
 class OperatorLibrary;
 
-/// A resource-constrained problem whose shared instances need not be fully
-/// pipelined: it carries a per-operation occupancy window, so a synchronous
-/// call that holds its callee's instance until the callee is done can be
-/// modeled (`populateCallOccupancy`).
-///
-/// An operation may hold several units at once; `setLinkedResourceTypes` states
-/// its complete unit list, and a cycle is feasible for it only where every unit
-/// in that list has room across the whole window.
-///
-/// A limited operation may also have zero latency here (CIRCT requires
-/// non-zero): a combinational access still occupies its port for the cycle it
-/// issues in and contends like any other.
-/// How one region's solve ran: `proven` means every deciding status was
-/// OPTIMAL, and a `budgetExhausted` solve may ship a different schedule on the
-/// next run of the same compile.
+/// How one region's solve ran: `proven` = every deciding status OPTIMAL; a
+/// `budgetExhausted` solve may ship a different schedule on the next run.
 struct SolveTelemetry {
   bool proven = false;
   bool budgetExhausted = false;
@@ -47,6 +34,13 @@ struct SolveTelemetry {
   std::optional<int64_t> exhaustedAtII;
 };
 
+/// A resource-constrained problem with per-operation occupancy windows, so a
+/// synchronous call holding its callee's instance until done can be modeled
+/// (`populateCallOccupancy`). An operation may hold several units at once
+/// (`setLinkedResourceTypes`); a cycle is feasible only where every linked unit
+/// has room across the whole window. A limited operation may have zero latency
+/// (CIRCT requires non-zero): a combinational access still occupies its issue
+/// cycle and contends like any other.
 class OccupancyProblem
     : public virtual circt::scheduling::SharedOperatorsProblem {
 public:
@@ -62,8 +56,8 @@ protected:
   LogicalResult checkLatency(Operation *op) override;
 
 public:
-  /// The number of consecutive cycles \p op holds its resource unit, counting
-  /// from its start time. One (the fully-pipelined case) unless set.
+  /// Consecutive cycles \p op holds its resource unit from its start; one
+  /// (fully pipelined) unless set.
   unsigned getResourceCycles(Operation *op) {
     return resourceCycles.lookup(op).value_or(1);
   }
@@ -71,9 +65,8 @@ public:
     resourceCycles[op] = cycles;
   }
 
-  /// How many units of every resource linked to \p op it holds at once. One
-  /// unless set: a write to an array held in several copies reaches all of
-  /// them, taking a port of each.
+  /// Units of each linked resource \p op holds at once; one unless set (a write
+  /// to a multi-copy array takes a port of each).
   unsigned getResourceDemand(Operation *op) {
     return resourceDemand.lookup(op).value_or(1);
   }
@@ -81,21 +74,16 @@ public:
     resourceDemand[op] = units;
   }
 
-  /// The cycles a dependent waits after \p op issues before its result has
-  /// arrived: the latency of the operator type \p op is linked to. Every
-  /// operation carries one, `populateOperatorTypes` having linked every
-  /// operation the problem holds.
-  ///
-  /// Signed, though the underlying latency is not: every caller composes it
-  /// into an expression that subtracts, and an `unsigned` one silently
-  /// evaluates `latencyOf(op) - 1` on a combinational operator as 2^32 - 1.
+  /// Cycles a dependent waits after \p op issues for its result: the latency of
+  /// \p op's linked operator type. Every op carries one. Signed though latency
+  /// is not, so composing it into a subtraction cannot underflow (a
+  /// combinational `unsigned` `latencyOf(op) - 1` would be 2^32 - 1).
   int64_t latencyOf(Operation *op);
 
   /// Store->load dependences a forwarding network relaxes: the load may issue
-  /// in the cycle the store does, a shadow register supplying the datum on an
-  /// address match instead of the RAM, which has not committed it yet. Set
-  /// before solving; every solver and verifier weighs such an edge at latency
-  /// zero instead of the store's write latency.
+  /// in the store's cycle, a shadow register supplying the datum on an address
+  /// match. Set before solving; every solver and verifier weighs such an edge
+  /// at latency zero instead of the store's write latency.
   void setForwarded(Dependence dep) { forwardedEdges.insert(dep); }
   bool isForwarded(Dependence dep) const {
     return forwardedEdges.contains(dep);
@@ -103,14 +91,14 @@ public:
   /// Forget every forwarded edge, for a re-solve of the unrelaxed problem.
   void clearForwarded() { forwardedEdges.clear(); }
 
-  /// The schedule DEPTH of a SOLVED problem: the cycle by which every operation
-  /// has completed. A REPORT only, since a span composes from the drain
-  /// instead, which the solver may leave below the depth. A combinational
-  /// operation still occupies the cycle it issues in, hence the floor of one.
+  /// Schedule depth of a solved problem: the cycle by which every op has
+  /// completed. Report only; a span composes from the drain instead, which may
+  /// sit below the depth. A combinational op still occupies its issue cycle,
+  /// hence the floor of one.
   int64_t scheduleDepth();
 
-  /// Whether \p op holds at least one unit whose count is capped. An unlimited
-  /// link constrains nothing and no reservation tracks it.
+  /// Whether \p op holds at least one capped unit; an unlimited link constrains
+  /// nothing and no reservation tracks it.
   bool holdsLimitedUnit(Operation *op);
 
   /// Whether \p op holds a unit of \p rsrc.
@@ -119,34 +107,31 @@ public:
     return linked && llvm::is_contained(*linked, rsrc);
   }
 
-  /// The operations holding a unit of \p rsrc, earliest start first, so a
-  /// derived assignment is a function of the schedule rather than of walk
-  /// order. Every operation must be scheduled.
+  /// Operations holding a unit of \p rsrc, earliest start first, so a derived
+  /// assignment depends on the schedule not walk order. Every op must be
+  /// scheduled.
   SmallVector<Operation *> usersOf(ResourceType rsrc);
 
   //===--------------------------------------------------------------------===//
-  // Allocatable resources: how many units to build, as opposed to how many
-  // exist. An allocatable resource carries no limit, so `holdsLimitedUnit`
-  // stays false for it and no reservation table of the heuristic ever sees it.
+  // Allocatable resources: how many units to build, not how many exist. An
+  // allocatable resource carries no limit, so `holdsLimitedUnit` stays false
+  // and no heuristic reservation table sees it.
   //===--------------------------------------------------------------------===//
 
   /// What one allocatable resource may cost and how many of it may exist.
   struct AllocatableUnit {
-    /// The trivial allocation: one unit per operation linked to the resource,
-    /// so declaring a resource never makes a problem infeasible.
+    /// Max units. The trivial allocation is one per linked op, so declaring a
+    /// resource never makes a problem infeasible.
     unsigned ceiling = 0;
-    /// What building `n` instances costs, indexed by `n` over `[0, ceiling]`:
-    /// the instances themselves plus the multiplexers that many of them puts
-    /// in front of the operations sharing each one. A TABLE and not a
-    /// coefficient because a multiplexer's cost per bit rises in plateaus (a
-    /// LUT6 absorbs three source/select pairs), so the total is not monotone
-    /// in the count and no linear term can stand for it.
+    /// Cost of building `n` instances, indexed by `n` over `[0, ceiling]`: the
+    /// instances plus the muxes they put in front of the ops sharing each. A
+    /// table, not a coefficient: a mux's per-bit cost rises in plateaus (a LUT6
+    /// absorbs three source/select pairs), so the total is not monotone in `n`.
     llvm::SmallVector<int64_t> price;
-    /// The delay of the select cone in front of the fullest instance at `n`
-    /// instances, in ns, indexed like `price`. Zero at the ceiling, where
-    /// nothing shares. A solve charges it on every linked operation's sub-cycle
-    /// start, so a count only shrinks where the cone fits the slack the same
-    /// schedule leaves.
+    /// Delay (ns) of the select cone in front of the fullest instance at `n`
+    /// instances, indexed like `price`; zero at the ceiling where nothing
+    /// shares. Charged on every linked op's sub-cycle start, so a count shrinks
+    /// only where the cone fits the slack the schedule leaves.
     llvm::SmallVector<double> headroomNs;
   };
 
@@ -167,56 +152,49 @@ public:
   }
 
   /// Which instance of its allocatable operator \p op runs on: an index below
-  /// `getAllocation` of that operator's resource. Absent until `assignUnits`
-  /// derives it, and for every operation on nothing allocatable.
+  /// `getAllocation`. Absent until `assignUnits` derives it, and for ops on
+  /// nothing allocatable.
   std::optional<unsigned> getAssignedUnit(Operation *op) {
     return assignedUnit.lookup(op);
   }
 
-  /// Record which instance \p op runs on, for a caller that derives the
-  /// assignment itself rather than through `assignUnits`.
+  /// Record which instance \p op runs on, for a caller deriving the assignment
+  /// itself rather than via `assignUnits`.
   void setAssignedUnit(Operation *op, unsigned index) {
     assignedUnit[op] = index;
   }
 
-  /// Turn every decided count into an assignment of operations to instances,
-  /// spread round-robin over all the instances the decision bought rather than
-  /// packed into the fewest that would fit.
-  ///
-  /// Valid at the occupancies an allocation is offered for: cyclic (\p ii > 0)
-  /// occupancy is one cycle, so handing out 0, 1, 2, ... within each congruence
-  /// class fits the count the model bounded that class by; acyclic (\p ii == 0)
-  /// windows form an interval graph, so as many instances as the busiest cycle
-  /// needs suffice.
+  /// Turn every decided count into an assignment of ops to instances, spread
+  /// round-robin over the instances bought rather than packed into the fewest
+  /// that fit. Valid at the offered occupancies: cyclic (\p ii > 0) occupancy
+  /// is one cycle, so 0, 1, 2, ... within each congruence class fits its bound;
+  /// acyclic (\p ii == 0) windows form an interval graph, so the busiest
+  /// cycle's count suffices.
   void assignUnits(unsigned ii);
 
   /// Whether \p op contends for a resource whose count is being decided.
   bool holdsAllocatableUnit(Operation *op);
 
-  /// The fewest units of \p rsrc the CURRENT schedule needs: the busiest cycle
-  /// of its occupancy windows, or busiest congruence class at a non-zero \p ii.
-  /// Every operation must be scheduled. This is the count `assignUnits` can
-  /// still place, since windows on a line form an interval graph and first fit
-  /// in start order colours one exactly.
-  ///
-  /// The same histogram `verifyOccupancy` compares against a limit, so what a
-  /// resource is checked to fit and what it is decided to need are one count.
+  /// The fewest units of \p rsrc the current schedule needs: the busiest cycle
+  /// of its occupancy windows, or busiest congruence class at non-zero \p ii.
+  /// Every op must be scheduled. The count `assignUnits` can place (windows on
+  /// a line form an interval graph, first fit in start order colours it), and
+  /// the same histogram `verifyOccupancy` checks against a limit.
   unsigned demandFor(ResourceType rsrc, unsigned ii);
 
-  /// Whether \p op contends for anything at all: a capped unit, an allocated
-  /// one, or both. This is what needs a congruence class in a modulo model.
+  /// Whether \p op contends for anything: a capped or allocated unit. Such an
+  /// op needs a congruence class in a modulo model.
   bool contendsForUnit(Operation *op) {
     return holdsLimitedUnit(op) || holdsAllocatableUnit(op);
   }
 
-  /// No two operations assigned to one instance contend for it in the same
-  /// cycle, and no instance index exceeds the count decided. Vacuous where no
-  /// solve set an allocation.
+  /// No two ops on one instance contend for it in the same cycle, and no
+  /// instance index exceeds the decided count. Vacuous where no solve set an
+  /// allocation.
   LogicalResult verifyAllocation(unsigned ii);
 
-  /// No limited resource is oversubscribed in any cycle, i.e. no resource
-  /// demands more than it has. \p ii == 0 checks an acyclic schedule; a
-  /// non-zero \p ii checks the windows modulo the initiation interval. Not an
+  /// No limited resource is oversubscribed in any cycle. \p ii == 0 checks an
+  /// acyclic schedule; non-zero \p ii checks the windows modulo the II. Not an
   /// override: the concrete problems below call it from their `verify`.
   LogicalResult verifyOccupancy(unsigned ii);
 
@@ -247,11 +225,10 @@ public:
   LogicalResult verify() override;
 };
 
-/// A cyclic, resource-constrained, chaining-enabled scheduling problem: the
-/// composition of CIRCT's `ChainingProblem` and `ModuloOccupancyProblem`.
-/// Solving it yields an integer II, integer start times, and per-op sub-cycle
-/// start times that respect a target cycle time, under modulo resource
-/// constraints.
+/// A cyclic, resource-constrained, chaining-enabled problem: CIRCT's
+/// `ChainingProblem` composed with `ModuloOccupancyProblem`. Solving yields an
+/// integer II, integer and sub-cycle start times respecting the target period,
+/// under modulo resource constraints.
 class ChainingModuloProblem : public virtual circt::scheduling::ChainingProblem,
                               public virtual ModuloOccupancyProblem {
 public:
@@ -267,10 +244,9 @@ public:
   LogicalResult verify() override;
 };
 
-/// An acyclic, resource-constrained, chaining-enabled scheduling problem: the
-/// composition of CIRCT's `ChainingProblem` and `OccupancyProblem`. The
-/// straight-line twin of `ChainingModuloProblem`, with no initiation interval
-/// and no inter-iteration distance.
+/// An acyclic, resource-constrained, chaining-enabled problem: CIRCT's
+/// `ChainingProblem` composed with `OccupancyProblem`. The straight-line twin
+/// of `ChainingModuloProblem`, no II and no inter-iteration distance.
 class ChainingSharedOperatorsProblem
     : public virtual circt::scheduling::ChainingProblem,
       public virtual OccupancyProblem {
@@ -331,20 +307,18 @@ LogicalResult computeStartTimesInCycle(circt::scheduling::ChainingProblem &prob,
 //===----------------------------------------------------------------------===//
 
 /// What the SDC heuristic contributes to a solve that is not its own: the II
-/// bound it settles before placing anything, and whether its greedy placement
-/// reached a schedule.
-///
-/// Passing one also makes a PLACEMENT failure advisory: the call still succeeds
-/// with `placed == false`. A failure in the resource-free LP below placement is
-/// not advisory and still fails the call, since that LP is exact: infeasible
-/// there means no schedule exists at any II.
+/// bound it settles before placing, and whether its greedy placement reached a
+/// schedule. Passing one makes a placement failure advisory (the call succeeds
+/// with `placed == false`); a failure in the exact resource-free LP below
+/// placement still fails the call, since infeasible there means no schedule at
+/// any II.
 struct SimplexWarmStart {
-  /// The largest II any bound justifies before resources are placed: the
-  /// resource-min II, a loop-carried recurrence, and the pipeline directive's
-  /// floor, whichever is largest. Where an exact II search has to start.
+  /// Largest II any bound justifies before placement: the max of the
+  /// resource-min II, a loop-carried recurrence, and the pipeline floor. Where
+  /// an exact II search starts.
   unsigned lowerBoundII = 1;
-  /// Whether the greedy placement reached a schedule, i.e. whether the problem
-  /// now carries start times and an initiation interval.
+  /// Whether greedy placement reached a schedule: start times and an II now
+  /// present.
   bool placed = false;
 };
 
@@ -366,18 +340,18 @@ LogicalResult scheduleSimplex(ChainingSharedOperatorsProblem &prob,
 // What a solve is charged: the span objective.
 //===----------------------------------------------------------------------===//
 
-/// One region OUTPUT's contribution to the region's drain: it commits at
+/// One region output's contribution to the drain: it commits at
 /// `start(op) + offset`, plus the linked operator's latency where
-/// `plusLatency`. A value handed onward commits when it lands, and WHICH row
-/// produces it may itself be a solver decision, so its latency is read off the
-/// problem at composition time rather than baked into the offset.
+/// `plusLatency`. Latency is read off the problem at composition time, not
+/// baked into the offset, since which row produces the value may be a solver
+/// decision.
 struct DrainTerm {
   Operation *op;
   int64_t offset;
   bool plusLatency = false;
 };
 
-/// The drain of a SOLVED problem: the cycle its deepest output commits.
+/// The drain of a solved problem: the cycle its deepest output commits.
 inline int64_t drainOf(circt::scheduling::Problem &problem,
                        ArrayRef<DrainTerm> terms) {
   int64_t drain = 0;
@@ -391,27 +365,23 @@ inline int64_t drainOf(circt::scheduling::Problem &problem,
   return drain;
 }
 
-/// One value a region spends a delay register chain on. The chain is as long as
-/// its deepest reader needs, and costs what the device charges for a chain of
-/// that many stages at this width:
+/// One value a region spends a delay register chain on. The chain is as long
+/// as its deepest reader needs and costs the device's price for that many
+/// stages at this width:
 ///
 /// ```
 /// depth(v) = max over reads ( t_read + ii * distance ) - ( t_def + latency )
 /// cost(v)  = chainPrice( stages(v), width )
 /// ```
 ///
-/// No register is shared between two values (`insertRegister` keys one chain
-/// per value and region), which makes this a sum over values that is linear in
-/// the schedule rather than a MAXLIVE coupled to an allocation, and so a term
-/// an objective can carry directly.
-///
-/// `stages(v)` is `depth(v)`, except at II > 1 where the emitter folds the
-/// chain onto the region's phase: one register holds a tap for a whole
-/// interval, so `depth` cycles of delay are built from `ceil(depth / ii)` of
-/// them (`EmitContext::foldedChain`).
-///
-/// `latency` above is the definer's, read live off the model rather than held
-/// here: which row realizes the definer may itself be a solver decision.
+/// No register is shared between values (`insertRegister` keys one chain per
+/// value and region), so the cost is a sum over values linear in the schedule,
+/// not a max-live coupled to an allocation, and an objective can carry it
+/// directly. `stages(v)` is `depth(v)`, except at II > 1 where the emitter
+/// folds the chain onto the phase: `depth` cycles are built from
+/// `ceil(depth / ii)` registers (`EmitContext::foldedChain`). `latency` is the
+/// definer's, read live off the model since which row realizes it may be a
+/// solver decision.
 struct RegisterTerm {
   Operation *def;
   /// Flip-flops one cycle of delay costs.
@@ -421,21 +391,17 @@ struct RegisterTerm {
 };
 
 /// What a region's span is charged, and so what the exact scheduler minimizes:
-/// `(trip - 1) * ii + drain`, the part of `leafSpan` a solve controls, with
-/// the region's area decided in a second solve under the span the first one
-/// settles.
-///
-/// The heuristic ignores this and keeps minimizing the anchor's start time, an
-/// over-constrained proxy for the quantity actually charged.
+/// `(trip - 1) * ii + drain`, the part of `leafSpan` a solve controls; area is
+/// decided in a second solve under the span the first settles. The heuristic
+/// ignores this and minimizes the anchor's start time instead.
 struct SpanObjective {
   /// Read one region's charge off \p problem, which needs its operator types
-  /// but not a solution: what a term costs is a property of the region, and
-  /// only where each term LANDS is a property of the schedule.
-  ///
-  /// \p results are the values escaping the region, \p carried the counted-loop
-  /// body whose block arguments after the induction variable are its iter_args
-  /// (null where there is no such recurrence to price: a straight-line span, a
-  /// `while`), and \p device what the area terms are priced against.
+  /// but not a solution: a term's cost is a property of the region, only where
+  /// it lands a property of the schedule. \p results are the values escaping
+  /// the region, \p carried the counted-loop body whose block arguments after
+  /// the induction variable are its iter_args (null with no such recurrence: a
+  /// straight-line span, a `while`), \p device what the area terms are priced
+  /// against.
   SpanObjective(OccupancyProblem &problem, ValueRange results, Block *carried,
                 std::optional<int64_t> trip, const OperatorLibrary &device);
 
@@ -443,19 +409,16 @@ struct SpanObjective {
   SmallVector<DrainTerm> drain;
   /// The values it spends a delay register on.
   SmallVector<RegisterTerm> regs;
-  /// The region's trip count, when it is a compile-time constant. Empty leaves
-  /// the exact scheduler on the anchor-start objective, which is the right one
-  /// wherever no span composes off this solve (a `while`, a dynamic bound) or
-  /// wherever iterations do not overlap and the trip multiplies the schedule
-  /// DEPTH rather than the drain (`s.pipeline(ii=-1)`).
+  /// Trip count when compile-time constant. Empty leaves the scheduler on the
+  /// anchor-start objective, right wherever no span composes off this solve (a
+  /// `while`, a dynamic bound) or iterations do not overlap and the trip
+  /// multiplies schedule depth not the drain (`s.pipeline(ii=-1)`).
   std::optional<int64_t> trip;
-  /// The device the area terms are priced against. Every one of them costs
-  /// what the part spends on it, so a register, a multiplexer and an operator
-  /// are comparable; without it the objective would be ranking flip-flops
-  /// against DSP slices in a unit neither is measured in.
+  /// The device the area terms are priced against, so a register, a mux and an
+  /// operator are comparable rather than flip-flops ranked against DSP slices.
   const OperatorLibrary &device;
 
-  /// Where this region's deepest output commits in a SOLVED \p problem.
+  /// Where this region's deepest output commits in a solved \p problem.
   int64_t drainOf(circt::scheduling::Problem &problem) const {
     return mlir::allo::drainOf(problem, drain);
   }
@@ -472,12 +435,11 @@ struct SpanObjective {
 enum class SchedulerKind {
   /// The SDC simplex plus greedy modulo / shared-operator placement.
   Heuristic,
-  /// CP-SAT over the same problem: exact under the model. The chain breaks
-  /// stay the pre-pass's, which state the period exactly (see
-  /// `computeChainBreaks`), so only resource placement differs from the
-  /// heuristic. Where a device offers several usable rows for one operation,
-  /// which row realizes it is also this solver's decision; the heuristic keeps
-  /// the library's own pick.
+  /// CP-SAT over the same problem: exact under the model. Chain breaks stay the
+  /// pre-pass's (`computeChainBreaks`), which state the period exactly, so only
+  /// resource placement differs from the heuristic. Where a device offers
+  /// several usable rows for an op, which row realizes it is also this solver's
+  /// decision; the heuristic keeps the library's pick.
   Exact,
 };
 
@@ -490,20 +452,19 @@ inline bool usesExactScheduler(SchedulerKind kind) {
 enum class ScheduleObjective {
   /// Shortest span, with area breaking ties under it.
   Cycles,
-  /// Smallest area under a span leash: no slower than the heuristic's
-  /// schedule, with span slack reclaimed under the settled area.
+  /// Smallest area under a span leash (no slower than the heuristic), span
+  /// slack reclaimed under the settled area.
   Area,
 };
 
 /// Defaults for one solve. The budget is in OR-Tools deterministic time units
-/// (roughly a core-second) and is charged per solve, shared by a solve's span
-/// and area passes, so a cyclic search spends it again at every initiation
-/// interval it probes. Reproducibility comes from
-/// the fixed seed plus the interleaved portfolio `solverParameters` selects
-/// above one worker while `deterministic` holds; a solve that exhausts its
-/// budget can still differ run to run. The worker count is not only a speed
-/// knob: the same deterministic budget buys more search, so a budget-limited
-/// region can settle on a different schedule at a different worker count.
+/// (roughly a core-second), charged per solve and shared by its span and area
+/// passes, so a cyclic search spends it again at every II it probes.
+/// Reproducibility comes from the fixed seed plus the interleaved portfolio
+/// above one worker while `deterministic` holds; a budget-exhausted solve can
+/// still differ run to run. The worker count is not only a speed knob: the same
+/// budget buys more search, so a budget-limited region can settle differently
+/// at a different count.
 inline constexpr double kDefaultSolveBudget = 30.0;
 inline constexpr int kDefaultSolveWorkers = 8;
 inline constexpr int kDefaultSolveSeed = 0;
@@ -514,31 +475,28 @@ struct SchedulerOptions {
   ScheduleObjective objective = ScheduleObjective::Cycles;
   double budget = kDefaultSolveBudget;
   /// Whether to decide how many copies of each operator a region builds
-  /// (`populateOperatorAllocation`) rather than leave every operation its own.
-  /// Only meaningful alongside a binding that folds them: with the trivial
-  /// binding the emitter builds one unit per operation anyway. The heuristic
-  /// ignores it. An operation whose realization the exact solver decides
-  /// (`selectionCandidates`) is composed through a shared class instead: the
-  /// solve puts it in the class of whichever row it decides, straight-line
-  /// and modulo alike.
+  /// (`populateOperatorAllocation`) rather than one per op. Meaningful only
+  /// with a binding that folds them (the trivial binding builds one per op
+  /// anyway); the heuristic ignores it. An op whose realization the exact
+  /// solver decides (`selectionCandidates`) is composed through a shared class,
+  /// straight-line and modulo alike.
   bool allocate = false;
   int workers = kDefaultSolveWorkers;
   int seed = kDefaultSolveSeed;
-  /// Whether the workers advance in a fixed interleaved order, so two identical
+  /// Whether workers advance in a fixed interleaved order, so two identical
   /// compiles emit identical RTL. Off, above one worker, they race, each held
-  /// to the budget's share of wall-clock (budget / workers seconds); which
-  /// optimum a solve then lands on depends on thread timing, so no exact solve
-  /// is reproducible.
+  /// to budget / workers seconds of wall-clock; the optimum then depends on
+  /// thread timing, so no exact solve is reproducible.
   bool deterministic = true;
-  /// The span the area objective may pay beyond its leash, as a fraction of
-  /// the reference span (the heuristic's, or the first solved interval where
-  /// the greedy did not place). Zero ships no slower than the heuristic. It
-  /// buys interval room for unit folds alone: an interval the ungranted leash
-  /// already admits keeps its tight drain bound.
+  /// Span the area objective may pay beyond its leash, as a fraction of the
+  /// reference span (the heuristic's, or the first solved interval the greedy
+  /// did not place). Zero ships no slower than the heuristic. Buys interval
+  /// room for unit folds alone: an interval the ungranted leash already admits
+  /// keeps its tight drain bound.
   double areaSlack = 0.0;
-  /// The fabric's register-to-register floor (ns): the earliest sub-cycle time
-  /// any operation may start at. Combinational rows carry their measured delay
-  /// less the floor, so a cycle pays it once however many operators chain.
+  /// Register-to-register floor (ns): the earliest sub-cycle start any op may
+  /// take. Combinational rows carry their measured delay less the floor, so a
+  /// cycle pays it once however many operators chain.
   float regFloor = 0.0f;
 };
 
@@ -551,12 +509,12 @@ std::optional<SchedulerKind> parseSchedulerKind(StringRef name);
 std::optional<ScheduleObjective> parseScheduleObjective(StringRef name);
 
 /// One region's operator-sharing problem, decided at bind time with the
-/// schedule already fixed: which same-class units to fold onto one instance.
-/// Numeric throughout, so the emitter hands one over without this header
-/// knowing its model. A shared instance grows one select per operand port,
-/// with one arm per member plus each member's re-injected recurrence
-/// identities, so tables are per port and indexed by arms; a select of one
-/// arm is a wire, so indices 0 and 1 are zero.
+/// schedule fixed: which same-class units to fold onto one instance. Numeric
+/// throughout, so the emitter hands it over without this header knowing its
+/// model. A shared instance grows one select per operand port, one arm per
+/// member plus each member's re-injected recurrence identities; tables are per
+/// port, indexed by arms, and a one-arm select is a wire (indices 0 and 1 are
+/// zero).
 struct SharingProblem {
   struct Port {
     /// The select at this port's own width, by arms.
@@ -576,13 +534,13 @@ struct SharingProblem {
     /// Same-cycle combinational producers, as (port, unit): a producer's cone
     /// arrives through the select of the port it drives.
     llvm::SmallVector<std::pair<unsigned, unsigned>, 2> preds;
-    /// Per port: select arms past its own data arm, one per recurrence
-    /// identity the operation re-injects there.
+    /// Per port: select arms past the data arm, one per recurrence identity the
+    /// op re-injects there.
     llvm::SmallVector<unsigned, 2> initArms;
     /// Per port: a nonzero key marks a held operand (a wire at any issue
-    /// cycle), equal keys naming equal values. A port whose members all carry
-    /// one key collapses to that wire and builds no select; 0 marks a
-    /// scheduled or carried operand, which never collapses.
+    /// cycle), equal keys equal values; members all sharing one key collapse to
+    /// that wire and build no select. 0 marks a scheduled or carried operand,
+    /// which never collapses.
     llvm::SmallVector<unsigned, 2> drivers;
   };
   llvm::SmallVector<UnitClass, 0> classes;

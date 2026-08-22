@@ -49,10 +49,9 @@ def _operand(k: int) -> str:
 class _Extern:
     """An instantiated extern operator module: the descriptor plus the realized
     port shape from the manifest. Each port carries its role, so the clock, the
-    optional clock enable and the result are found structurally rather than by
-    name. :meth:`__post_init__` checks the ports against the descriptor, after
-    which every width is read off the descriptor and the manifest supplies only
-    the names."""
+    optional clock enable and the result are found structurally, not by name.
+    Every width is read off the descriptor; the manifest supplies only the
+    names."""
 
     name: str  # the extern module's RTL name
     ports: tuple[tuple[str, int, Operator.Role], ...]  # (name, width, role) in order
@@ -124,14 +123,12 @@ def _plan(interfaces: Interfaces, descs) -> list[_Extern]:
 @dataclass(frozen=True)
 class _Model:
     """How one operator kind computes, one realization per domain. ``sv`` is a
-    SystemVerilog expression over the operand ports, exact at any width and at a
-    result width the operands do not share; ``c`` is a C expression the DPI
-    evaluates. A domain the kind has no meaning in stays ``None``.
-
-    ``sv`` covers both signednesses, since the operand ports carry the dtype's
-    own; ``svu`` overrides it where the unsigned core is a different expression.
-    ``{w}`` expands to the result width, ``{ret}`` to the result's C scalar and
-    ``{cmp}`` to the compare predicate's expression."""
+    SystemVerilog expression over the operand ports, exact at any width; ``c`` is
+    a C expression the DPI evaluates; a domain the kind has no meaning in stays
+    ``None``. ``sv`` covers both signednesses (the ports carry the dtype's own),
+    ``svu`` overriding it where the unsigned core differs. ``{w}`` expands to the
+    result width, ``{ret}`` to the result's C scalar, ``{cmp}`` to the compare
+    predicate's expression."""
 
     sv: str | None = None
     c: str | None = None

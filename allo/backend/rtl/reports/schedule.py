@@ -14,9 +14,7 @@ from .compiler import CompilerReport
 
 
 class RegionKind(str, Enum):
-    """The scheduling regime of a region. A ``str`` mixin keeps
-    ``region.kind == "cyclic"`` working alongside ``region.kind is
-    RegionKind.CYCLIC``."""
+    """The scheduling regime of a region."""
 
     CYCLIC = "cyclic"  # a pipelined loop (dcp.pipeline)
     ACYCLIC = "acyclic"  # a straight-line span (dcp.sequential)
@@ -27,7 +25,7 @@ class RegionKind(str, Enum):
 class ScheduledOp:
     """One scheduled operation inside a region."""
 
-    kind: str  # operator mnemonic (addi/mulf/load/store/...); an open set, so str
+    kind: str  # operator mnemonic (addi/mulf/load/store/...)
     t: int  # start cycle within the region
     impl: str | None = None  # realization (device operator symbol / native)
     z: float | None = None  # SDC z-slack, when carried
@@ -41,10 +39,10 @@ class ScheduledOp:
 class RegionScheduleCost:
     """What composition needs of a region and no reader compares.
 
-    ``drain`` is the TERMINAL cycle: how long after the last issue pulse the
-    deepest output commits, so ``done`` rises a cycle later. A span composes off
-    this and not off ``iteration_latency``, which may carry slack the solver
-    left above the last commit."""
+    ``drain`` is the terminal cycle: cycles after the last issue pulse the
+    deepest output commits, so ``done`` rises one later. A span composes off
+    this, not ``iteration_latency``, which may carry slack above the last
+    commit."""
 
     drain: int | None = None
 
@@ -67,7 +65,7 @@ class RegionSchedule:
     interval: int | None = None
     trip_count: int | None = None  # constant iteration count, when known
     latency: int | None = None  # the whole region's span (cycles)
-    #: the depth of ONE iteration: the cycle by which every op has completed.
+    #: the depth of one iteration: the cycle by which every op has completed.
     iteration_latency: int | None = None
     #: composition quantities, apart from the latencies a reader compares.
     cost: RegionScheduleCost = field(default_factory=RegionScheduleCost)
@@ -164,11 +162,8 @@ class FuncSchedule:
 
 @dataclass(frozen=True)
 class UnhonoredDirective:
-    """A schedule directive the scheduler did not apply, and why.
-
-    Only the REFUSALS are listed: a directive that lands leaves its mark on the
-    region it shaped, while one that does not is otherwise invisible, since the
-    region it named has been decomposed by the time this document is built."""
+    """A schedule directive the scheduler did not apply, and why. Only refusals
+    are listed; a directive that lands leaves its mark on the region it shaped."""
 
     directive: str  # as the user spelled it (`pipeline`)
     where: str  # source anchor of the loop it was attached to
@@ -181,8 +176,7 @@ class UnhonoredDirective:
 
 @dataclass(frozen=True)
 class SweepPoint:
-    """One probed point on the ``(period, span)`` curve a period sweep walks.
-    ``achieved_ns`` is the period after a derate raised the model period."""
+    """One probed point on the ``(period, span)`` curve a period sweep walks."""
 
     cycle_ns: float  # the operating period the probe was asked for
     achieved_ns: float  # the operating period the probe came back holding
@@ -197,12 +191,12 @@ class ScheduleResult:
     funcs: list[FuncSchedule] = field(default_factory=list)
     #: directives the scheduler could not apply, in the order it met them.
     unhonored_directives: list[UnhonoredDirective] = field(default_factory=list)
-    #: the compiler's account of itself: what it was asked for and what that
-    #: cost. Not a property of the design (see :class:`CompilerReport`).
+    #: the compiler's account of itself, not a property of the design (see
+    #: :class:`CompilerReport`).
     compiler: CompilerReport = field(default_factory=CompilerReport)
-    #: the clock period the schedule holds (ns): the target, or the least
-    #: period every device operator fits when the target was unreachable and
-    #: the scheduler lowered the clock. Emission and QoR price against this.
+    #: the clock period the schedule holds (ns): the target, or the least period
+    #: every device operator fits when the target was unreachable. Emission and
+    #: QoR price against this.
     cycle_ns: float | None = None
     #: the ``(period, span)`` curve the period sweep probed before settling on
     #: this schedule, tightest last. Empty outside ``O="freq"`` and ``O="wall"``.

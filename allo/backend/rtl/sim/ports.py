@@ -68,12 +68,11 @@ def bank_elements(shape, axes: tuple[Memory.Axis, ...], bank: int) -> np.ndarray
 
 @dataclass
 class Mem:
-    """One backing array behind an external kernel argument (one *bank* of it
-    when the argument is partitioned), with the manifest's :class:`Memory`
-    interfaces that read from / write to it. A GROUP rather than one interface,
-    so ``arg``/``bank`` are its own identity. ``elements`` is this bank's flat
-    index per in-bank offset, where the host's layout meets the RTL's address
-    arithmetic."""
+    """One backing array behind an external kernel argument (one bank of it when
+    the argument is partitioned), with the manifest's :class:`Memory` interfaces
+    that read from / write to it. A group, not one interface, so ``arg``/``bank``
+    are its identity. ``elements`` is this bank's flat index per in-bank offset,
+    where the host's layout meets the RTL's address arithmetic."""
 
     arg: int
     host: HostType  # element type as it crosses, port width included
@@ -109,11 +108,8 @@ class Mem:
 @dataclass
 class RegFile:
     """A completely-partitioned argument, held at the boundary as one port per
-    element rather than as an addressed memory.
-
-    Simpler than :class:`Mem` rather than a variation on it: no address to serve
-    and no latency to honor, so the read side is a held assignment and the write
-    side commits on the edge its ``we`` is high."""
+    element rather than an addressed memory: the read side is a held assignment,
+    the write side commits on the edge its ``we`` is high."""
 
     port: RegisterFile
     host: HostType

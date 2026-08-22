@@ -12,14 +12,12 @@ from ..options import SchedulerOptions
 
 @dataclass(frozen=True)
 class SolveReport:
-    """What one region's SOLVE cost: a measurement of the compiler, not a fact
+    """What one region's solve cost: a measurement of the compiler, not a fact
     about the hardware.
 
-    Deliberately not joined to a :class:`RegionSchedule`. A solve is keyed by the
-    affine loop that owned the problem, and the regions above are read off the
-    reified ``dcp`` ops, by which point that loop is gone. The two lists do not
-    line up positionally either: a container decomposes into its children and
-    solves nothing of its own, and one solve covers a whole perfect band."""
+    Not joined to a :class:`RegionSchedule`: a solve is keyed by the affine loop
+    that owned the problem, gone by the time the ``dcp`` regions are read, and one
+    solve covers a whole perfect band."""
 
     func: str
     where: str  # source location, as the scheduler's own log names it
@@ -27,20 +25,20 @@ class SolveReport:
     ops: int  # operations in the problem
     limited_ops: int  # of those, holding at least one limited unit
     ms: float  # wall time of the solve
-    #: the interval this solve searched to, and so the depth of the search that
-    #: `ms` measures; `None` for an acyclic span. The interval the region runs
-    #: at is `RegionSchedule.interval`, which the two need not agree on.
+    #: the interval this solve searched to, the depth of the search ``ms``
+    #: measures; None for an acyclic span. The region runs at
+    #: ``RegionSchedule.interval``, which need not agree.
     interval: int | None = None
-    #: `simplex` or `cpsat`; the config below applies to a cpsat solve only.
+    #: `simplex` or `cpsat`; the fields below apply to a cpsat solve only.
     solver: str = ""
     workers: int = 0
     seed: int = 0
     budget_s: float = 0.0
-    #: every deciding CP-SAT status was OPTIMAL, so the shipped schedule is the
-    #: model's optimum.
+    #: every deciding CP-SAT solve proved its optimum; the shipped schedule is
+    #: that optimum.
     proven: bool = False
-    #: some solve hit its time limit, so the shipped schedule may differ
-    #: between runs of the same compile.
+    #: some solve hit its time limit, so the shipped schedule may differ between
+    #: runs of the same compile.
     budget_exhausted: bool = False
     #: the exact solve decided nothing and the heuristic's schedule shipped.
     fallback: bool = False

@@ -17,16 +17,13 @@ from . import ip
 class VivadoCore(NamedTuple):
     """The Vivado build of one operator archetype.
 
-    ``shape`` is the CONFIG fragment the archetype's signature fixes.
-    ``no_dsp`` is the fragment for the DSP-free build, non-empty exactly where
-    the core's default build spends DSPs; an ``IPRow`` whose area carries no
-    ``dsp`` count is built with it. A full configuration applies
-    ``CE_BASE[core]``, then ``shape``, then ``no_dsp`` if the row asks for it,
-    then ``LATENCY[core]``, in that order (see ``LATENCY``).
-
-    ``operation`` is the constant the wrapper drives on the core's operation
-    channel where the shape leaves one, empty otherwise; a compare's constant
-    comes from the predicate instead.
+    ``shape`` is the config fragment the archetype's signature fixes. ``no_dsp``
+    is the DSP-free fragment, non-empty exactly where the default build spends
+    DSPs; a row whose area carries no ``dsp`` count is built with it. A full
+    configuration applies ``CE_BASE[core]``, ``shape``, ``no_dsp`` if asked, then
+    ``LATENCY[core]``, in that order. ``operation`` is the constant driven on the
+    core's operation channel where the shape leaves one; a compare's comes from
+    the predicate instead.
     """
 
     # `create_ip -name`: floating_point / mult_gen / div_gen; or `rtl`, which
@@ -39,7 +36,7 @@ class VivadoCore(NamedTuple):
 
 
 #: The clock-enable half of the emitter's `ce` stall contract, per core family:
-#: no back-pressure, a clock enable, no ready on the result. Applied first.
+#: no back-pressure, a clock enable, no result ready. Applied first.
 CE_BASE = {
     "floating_point": (
         "Flow_Control=NonBlocking,Has_ACLKEN=true,Has_RESULT_TREADY=false"
@@ -48,11 +45,10 @@ CE_BASE = {
     "div_gen": "ACLKEN=true",
 }
 
-#: How each core family pins its pipeline depth. Applied last, because
-#: `set_property -dict` applies in list order and changing `Operation_Type`
-#: resets the latency to the new type's default. `C_Latency` is a disabled
-#: parameter until `Maximum_Latency` is false; left alone, a floating-point
-#: core builds at its own maximum depth.
+#: How each core family pins its pipeline depth, applied last: `set_property
+#: -dict` applies in list order and changing `Operation_Type` resets latency to
+#: the new type's default. `C_Latency` is disabled until `Maximum_Latency` is
+#: false; left alone a floating-point core builds at its maximum depth.
 LATENCY = {
     "floating_point": "Maximum_Latency=false,C_Latency={lat}",
     "mult_gen": "PipeStages={lat}",
@@ -64,9 +60,8 @@ _FP = "floating_point"
 _NO_DSP = "C_Mult_Usage=No_Usage"
 
 # The floating_point core offers Half/Single/Double/Custom and no bfloat16, so
-# bfloat16 is spelled as the custom format it is: 8 exponent bits and 8
-# fraction bits (7 stored plus the hidden one). Single is the core's default
-# and needs no fragment on same-typed operators.
+# bfloat16 is spelled as a custom format: 8 exponent bits and 8 fraction (7
+# stored plus the hidden one). Single is the default and needs no fragment.
 _DOUBLE = (
     "A_Precision_Type=Double,C_A_Exponent_Width=11,C_A_Fraction_Width=53,"
     "Result_Precision_Type=Double,C_Result_Exponent_Width=11,"
@@ -128,9 +123,9 @@ RECIPES: dict[OperatorIP, VivadoCore] = {
 }
 
 
-# The fabric build of a multiply: an adder tree in LUTs instead of DSP columns.
-# It repeats a key the shape already sets; in a `set_property -dict` list the
-# last value for a key wins.
+# The fabric build of a multiply: an adder tree in LUTs, not DSP columns. It
+# repeats a key the shape already sets; in a `set_property -dict` list the last
+# value for a key wins.
 _LUT_MULT = "Multiplier_Construction=Use_LUTs"
 
 
@@ -188,8 +183,8 @@ RECIPES[ip.imulw33] = VivadoCore(
 _RECIPE_BY_NAME = {a.func_name: r for a, r in RECIPES.items()}
 
 # Operation-channel opcodes of the Programmable compare core (PG060). An
-# unordered relation takes its ordered opcode, the same NaN-free contract the
-# cosim behavioral models state.
+# unordered relation takes its ordered opcode, the NaN-free contract the cosim
+# models state.
 _CMP_OPCODE = {
     "uno": 0b00000100,
     "lt": 0b00001100,

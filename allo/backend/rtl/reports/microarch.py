@@ -11,9 +11,7 @@ from enum import Enum
 
 
 class RegRole(str, Enum):
-    """Why a register exists. The emitter knows this where it builds the
-    register; a reader of the emitted Verilog can only guess it from the name,
-    and a counted delay it cannot attribute at all."""
+    """Why a register exists."""
 
     VALUE = "value"  # a value delay chain: a datum carried across cycles
     PULSE = "pulse"  # an activation chain: a region's issue delayed to a stage
@@ -28,11 +26,9 @@ class RegRole(str, Enum):
 class RegClass:
     """``count`` runs of ``depth`` registers in series, ``width`` bits each.
 
-    The run, not the register, is the cost unit: past the synthesizer's
-    shift-register extraction threshold a run stops costing flip-flops per
-    stage, so a model handed only a register total cannot price it. A
-    synchronous reset blocks that extraction and pays fabric per bit; a clock
-    enable is free."""
+    The run is the cost unit: past the synthesizer's shift-register extraction
+    threshold a run stops costing flip-flops per stage. ``reset`` blocks that
+    extraction and pays fabric per bit; ``enable`` is free."""
 
     role: RegRole
     width: int
@@ -59,8 +55,8 @@ class RegClass:
 
 @dataclass(frozen=True)
 class Unit:
-    """One functional-unit instance. ``bound_ops > 1`` is exactly a sharing
-    decision: the trivial binding leaves every operation its own unit."""
+    """One functional-unit instance. ``bound_ops > 1`` marks a sharing decision;
+    the trivial binding gives each operation its own unit."""
 
     identity: str  # the sharing equivalence class
     width: int  # result width in bits
@@ -97,8 +93,8 @@ class Unit:
 class Chain:
     """One value delay chain: a datum carried across cycle boundaries.
 
-    ``range_bits`` is the width of the value range a model-level interval walk
-    proved for the carried datum, ``None`` where it could not."""
+    ``range_bits`` is the value-range width a model-level interval walk proved
+    for the datum, None where it could not."""
 
     region: int  # owning region's order
     width: int  # built carrier bits
@@ -125,9 +121,7 @@ class Chain:
 
 @dataclass(frozen=True)
 class MuxClass:
-    """``count`` multiplexers, each ``fanin`` sources wide at ``width`` bits.
-    Aggregated rather than enumerated: a mux costs a function of exactly those
-    two numbers, and nothing downstream needs to know which ports it feeds."""
+    """``count`` multiplexers, each ``fanin`` sources wide at ``width`` bits."""
 
     fanin: int
     width: int
@@ -140,9 +134,9 @@ class MuxClass:
 
 @dataclass(frozen=True)
 class MuxCone:
-    """``count`` select cones around storage: shared-port address selects,
-    commit sinks and bank/scatter crossbars. Disjoint from :class:`MuxClass`,
-    which holds the allocation's own muxes."""
+    """``count`` select cones around storage: shared-port address selects, commit
+    sinks and bank/scatter crossbars. Disjoint from :class:`MuxClass`, the
+    allocation's own muxes."""
 
     role: str  # "address" / "commit" / "crossbar"
     fanin: int
@@ -160,41 +154,34 @@ class MemoryCost:
     """What the cost model needs of one array and no reader does: the ports it
     was bound with, and who drives them.
 
-    ``call_reads`` / ``call_writes`` count the ports a child drives: several
-    ports of one child are that child's own boundary, several children are
-    concurrent writers, and only the second is a banking problem."""
+    ``call_reads``/``call_writes`` count the ports a child drives; several
+    children are concurrent writers, which is the banking problem."""
 
     call_reads: int
     call_writes: int
-    #: ports one bank is built with, per direction: the distinct ports the
-    #: binding assigned. Accesses share one only where the model proved they
-    #: never issue in the same cycle.
+    #: ports one bank is built with, per direction; accesses share one only where
+    #: the model proved they never issue in the same cycle.
     read_ports: int
     write_ports: int
-    #: ports it is built with altogether, which is not their sum: a port of a
-    #: pooled storage may carry both a read and a write that never issue
-    #: together, and then one address bus carries both.
+    #: ports built altogether, not their sum: a pooled port may carry a read and
+    #: a write that never issue together, on one address bus.
     ports: int
-    #: instances of the storage row each bank is held in, as the compiler
-    #: decided them once the ports were bound. The row's price is multiplied by
-    #: it.
+    #: storage-row instances each bank is held in; the row price is multiplied
+    #: by it.
     instances: int = 1
-    #: instances the schedule reserved against, which ``instances`` above may
-    #: exceed when the binding replicates further for read bandwidth.
+    #: instances the schedule reserved against; ``instances`` may exceed it when
+    #: the binding replicates further for read bandwidth.
     copies_budget: int = 1
-    #: ports one instance of the row provides, 0 for no limit, which
-    #: ``instances`` above is the multiplier of. The device row narrowed by the
-    #: topology the array asked for.
+    #: ports one row instance provides, 0 for no limit; ``instances`` is the
+    #: multiplier of it.
     row_reads: int = 0
     row_writes: int = 0
-    #: a lower bound on what one cycle asks of one bank, per direction; the
-    #: ports above are what was built to serve it. Zero for a ROM or a scattered
-    #: array, neither addressed.
+    #: lower bound on what one cycle asks of one bank, per direction. Zero for a
+    #: ROM or a scattered array, neither addressed.
     read_concurrency: int = 0
     write_concurrency: int = 0
     #: module interface groups this array contributes: one per bound boundary
-    #: port, one per group a child masters on it, or one per element of a
-    #: scattered argument.
+    #: port, per child group mastering it, or per element of a scattered argument.
     boundary_ports: int = 0
 
     @classmethod
@@ -237,14 +224,12 @@ class Memory:
     writes_independent: bool
     rom: bool
     skewed: bool
-    #: what the module built to hold it: ``"boundary"`` (the cells are the
-    #: caller's), ``"rom"``, ``"scatter"`` or ``"ram"``.
+    #: what the module built to hold it: ``"boundary"`` (caller's cells),
+    #: ``"rom"``, ``"scatter"`` or ``"ram"``.
     realization: str
-    #: whether the partition BOUGHT the bandwidth it costs: every access reaches
-    #: one bank. An access the analysis could not fix takes a port on every
-    #: bank, so a partition resolving none of them is N memories at the
-    #: bandwidth of one. True for an unpartitioned array, which resolves
-    #: nothing because it has nothing to resolve.
+    #: whether the partition bought the bandwidth it costs, every access reaching
+    #: one bank; an unresolved access takes a port on every bank. True for an
+    #: unpartitioned array, which has nothing to resolve.
     partition_resolved: bool
 
     @property
@@ -299,8 +284,8 @@ class Call:
     callee: str
     count: int
     spawns: int  # of those, `await` spawns rather than scheduled calls
-    #: How those calls are released, counted: on a predecessor's ``done``, on
-    #: the container's own start, or at a scheduled offset.
+    #: how those calls are released, counted: handshake on a predecessor's
+    #: ``done``, broadcast on the container's start, timed at a scheduled offset.
     handshake: int = 0
     broadcast: int = 0
     timed: int = 0
@@ -321,10 +306,10 @@ class Call:
 
 @dataclass(frozen=True)
 class StrideCost:
-    """One address stride register beside the counter: its width and which
-    update cells it builds (a step adder, a carry adder with its select, a
-    wrap compare with its fix adder and select). ``is_counter`` marks the
-    stride that is the counter itself and so builds no register."""
+    """One address stride register beside the counter: its width and which update
+    cells it builds (``step`` adder, ``carry`` adder with select, ``wrap`` compare
+    with fix adder and select). ``is_counter`` marks the stride that is the
+    counter itself and builds no register."""
 
     width: int
     step: bool
@@ -343,8 +328,7 @@ class StrideCost:
 class RegionCost:
     """What the cost model needs of one region and no reader does.
 
-    ``mux_bits`` is 2:1-equivalent: a k:1 mux costs about (k-1) 2:1 muxes per
-    bit, which is the shape a device prices."""
+    ``mux_bits`` is 2:1-equivalent: a k:1 mux is about (k-1) 2:1 muxes per bit."""
 
     mux_inputs: int
     mux_bits: int
@@ -401,9 +385,9 @@ class RegionUarch:
 
 @dataclass(frozen=True)
 class TimingStep:
-    """One step of a combinational path: what the signal passes through, and
-    what the path spends there in ns. A step is one model cell, so it can be a
-    lump the model prices without decomposing (an address cone, a select)."""
+    """One step of a combinational path: what the signal passes through, and the
+    ns spent there. A step is one model cell, so it may be a lump (an address
+    cone, a select)."""
 
     what: str
     delay: float  # ns
@@ -415,9 +399,9 @@ class TimingStep:
 
 @dataclass(frozen=True)
 class TimingPath:
-    """One combinational path, start point first: a register or port launches
-    it, each step adds its delay, and it is captured at ``endpoint``. ``total``
-    is the sum of the steps by construction."""
+    """One combinational path, start point first: a register or port launches it,
+    each step adds its delay, and it is captured at ``endpoint``. ``total`` is the
+    sum of the steps."""
 
     total: float  # ns
     slack: float  # period - total; negative means it misses the clock
@@ -459,21 +443,20 @@ class FuncUarch:
     read_ports: int
     write_ports: int
     regions: list[RegionUarch] = field(default_factory=list)
-    #: module-wide: a register run belongs to the value it carries, not to a
-    #: region, and the ledger counts it where it is BUILT.
+    #: module-wide; a register run belongs to the value it carries, not a
+    #: region, and is counted where it is built.
     regs: list[RegClass] = field(default_factory=list)
-    #: every value delay chain the model holds, one row each. The ledger's
-    #: value-role classes in ``regs`` also count chains built outside the
-    #: model (read-data alignment, stall holds), so these sum to less.
+    #: every value delay chain the model holds, one row each. The value-role
+    #: classes in ``regs`` also count chains built outside the model (read-data
+    #: alignment, stall holds), so these sum to less.
     chains: list[Chain] = field(default_factory=list)
     #: module-wide, like ``regs``: the select cones built around storage.
     mux_cones: list[MuxCone] = field(default_factory=list)
     mems: list[Memory] = field(default_factory=list)
     streams: list[Stream] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
-    #: this module's worst combinational paths, longest first. Structures with
-    #: no delay model are absent from them, so they are estimates and no
-    #: substitute for place and route.
+    #: this module's worst combinational paths, longest first. Structures with no
+    #: delay model are absent, so these are estimates, not place and route.
     critical_paths: tuple[TimingPath, ...] = ()
 
     @property

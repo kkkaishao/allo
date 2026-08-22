@@ -78,8 +78,7 @@ class Memory:
     class Axis:
         """One partitioned axis of the argument, mirroring
         ``allo::BankLayout::Axis``: the element-space decomposition the RTL
-        addresses with, which ``bank``/``factor`` alone cannot express. ``kind``
-        is "cyclic", "block" or "skew"."""
+        addresses with. ``kind`` is "cyclic", "block" or "skew"."""
 
         dim: int
         factor: int
@@ -124,19 +123,17 @@ class Memory:
 
 @dataclass(frozen=True)
 class RegisterFile:
-    """A completely-partitioned argument array, which crosses the boundary as one
-    port per ELEMENT rather than as an addressed interface. ``elements`` is flat
-    row-major, so element k of the flattened argument drives ``elements[k]``.
-
-    Not a :class:`Memory`: no address, no bank, no access latency."""
+    """A completely-partitioned argument array, crossing the boundary as one port
+    per element rather than an addressed interface. ``elements`` is flat
+    row-major, so element k of the flattened argument drives ``elements[k]``. Not
+    a :class:`Memory`: no address, no bank, no access latency."""
 
     @dataclass(frozen=True)
     class Element:
         """One element's ports: ``in_`` where it arrives, ``out``/``we`` where it
         leaves. A direction the kernel does not use is ``None``, and the names
-        differ by that too (``A_k`` when one direction is live,
-        ``A_k_in``/``A_k_out`` when both are). ``in`` is a Python keyword, hence
-        the trailing underscore."""
+        differ by that (``A_k`` when one direction is live, ``A_k_in``/``A_k_out``
+        when both are)."""
 
         in_: str | None = None
         out: str | None = None
@@ -184,8 +181,8 @@ class Operator:
     operator, and the behavioral model is built from ``ports``."""
 
     class Role(str, Enum):
-        """What a port is FOR, so a consumer classifies structurally instead of
-        matching the name ``clk`` / ``ce`` back out."""
+        """What a port is for, so a consumer classifies structurally rather than
+        matching ``clk`` / ``ce`` by name."""
 
         DATA = "data"
         CLK = "clk"

@@ -21,7 +21,7 @@ Value resolveRoot(Value v);
 /// `resolveRoot`'s disjointness assumption as an `AliasAnalysis`
 /// implementation: memrefs with distinct roots are `NoAlias`. Equal roots and
 /// non-memref pairs come back `MayAlias` and fall through to the next
-/// implementation, so this only ever ADDS an answer.
+/// implementation, so this only ever adds an answer.
 struct DistinctRootAliasAnalysis {
   AliasResult alias(Value lhs, Value rhs);
   /// Nothing to add: this analysis is about storage identity, not effects.

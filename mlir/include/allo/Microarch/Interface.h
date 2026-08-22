@@ -23,7 +23,7 @@ namespace mlir::allo::iface {
 struct FIFO {
   int arg;        // kernel block-argument index (-1 if not an argument)
   bool isInput;   // get (input) vs put (output)
-  int depth;      // FIFO depth
+  int depth;
   unsigned width; // payload bit width
   std::string base, data, valid, ready;
 };
@@ -44,11 +44,11 @@ struct Memory {
   };
   int arg;
   bool write;
-  /// This module's write interfaces on \p arg never collide: two may be
-  /// enabled in one cycle, but only where the scheduler proved they address
-  /// different words. A caller backing the argument may then give each its own
-  /// `always` block and infer a true dual port; without it every write shares
-  /// one block and the array becomes a register file. Always false on a read.
+  /// This module's write interfaces on \p arg never collide: two may be enabled
+  /// in one cycle, but only where the scheduler proved they address different
+  /// words. A caller may then give each its own `always` block and infer a true
+  /// dual port; without it every write shares one block and the array becomes a
+  /// register file. Always false on a read.
   bool independent;
   int bank, factor; // the bank this interface serves / total physical banks
   unsigned width;   // element bit width
@@ -60,7 +60,7 @@ struct Memory {
 };
 
 /// A completely-partitioned argument array, crossing the boundary as one port
-/// per ELEMENT rather than as an addressed interface (`MemUnit::scattered`).
+/// per element rather than as an addressed interface (`MemUnit::scattered`).
 /// `elements` holds the port names flat in row-major order, so the host drives
 /// element k of the flattened argument onto `elements[k]`.
 struct RegisterFile {
@@ -94,7 +94,7 @@ struct Result {
 /// module from this entry and joins to the device operator on `impl` +
 /// `predicate`.
 struct Operator {
-  /// What a port is FOR, so a consumer classifies structurally rather than by
+  /// What a port is for, so a consumer classifies structurally rather than by
   /// name. `Ce` decides whether the behavioral model gates on a clock enable.
   enum class Role { Data, Clk, Ce, Out };
   struct Port {
@@ -114,8 +114,8 @@ struct Operator {
 /// data-dependent access spans every bank).
 struct ModuleInterface {
   // The emitted RTL module name and the MLIR symbol it came from; they differ
-  // when the symbol needed legalizing (`top.child` -> `top_child`), and the
-  // simulator only knows the former.
+  // when the symbol needed legalizing (`top.child` -> `top_child`), and only
+  // the former reaches the simulator.
   std::string module, symbol;
   /// This module's start->done contract, republished from the `dcp.module`:
   /// `latency` in cycles, absent when the span is data-dependent;

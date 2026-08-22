@@ -17,37 +17,32 @@ namespace mlir::allo::uarch {
 
 struct Datapath;
 
-/// What the microarchitecture stage DECIDED, as data. A projection of the
+/// What the microarchitecture stage decided, as data: a projection of the
 /// `Datapath` taken once per emitted module, read back through JSON by Python.
-///
-/// Nothing here is re-derivable from the IR a consumer is handed, and nothing
-/// duplicates the schedule report: op start cycles, region trip counts and
-/// realizations are published there and joined on (func, region order). What is
-/// only here is the BINDING and everything downstream of it, which is to say
-/// what the emitter built rather than what the scheduler decided.
-///
-/// Write-only from the compiler's side. No pass may read it back; the moment
-/// one does it is a second model of the datapath, and there is already one.
+/// Nothing here duplicates the schedule report, which publishes op start cycles,
+/// region trip counts and realizations joined on (func, region order); only the
+/// binding and what the emitter built downstream of it live here. Write-only: no
+/// pass reads it back.
 
-/// One functional-unit instance. `boundOps > 1` is exactly a sharing decision:
-/// the trivial binding leaves every operation its own unit.
+/// One functional-unit instance. `boundOps > 1` is a sharing decision; the
+/// trivial binding leaves every operation its own unit.
 struct UnitReport {
-  std::string identity; // `OperatorIdentity::key()`, the sharing equivalence
+  std::string identity; // `OperatorIdentity::key()`; sharing equivalence class
   std::string impl;     // the `dcp.operator` symbol; empty for a native unit
   std::string module;   // `operatorModuleName`; empty for a native unit
   unsigned width = 0;   // result width in bits
   unsigned latency = 0;
   unsigned boundOps = 1;
-  bool comb = false; // native combinational, against an IP instance
+  bool comb = false; // native combinational vs an IP instance
   bool pipelined = true;
-  // A standalone apply unit's cone, the operator counts of `applyExprOf`, so
-  // the estimator can price the map; all zero for every other unit.
+  // A standalone apply unit's cone (operator counts from `applyExprOf`) so the
+  // estimator can price the map; zero for every other unit.
   unsigned adders = 0, multipliers = 0, dividers = 0;
 };
 
-/// One value delay chain, a `uarch::Register` projected: what it carries, how
-/// deep it runs, and who drives it. `rangeBits` is the width of the value
-/// range a model-level interval walk proved, absent when it could not.
+/// One value delay chain, a `uarch::Register` projected. `rangeBits` is the
+/// width of the value range a model-level interval walk proved, absent when
+/// unproven.
 struct ChainReport {
   int64_t region = 0;  // owning region's order (`RegionUarch::order`)
   unsigned width = 0;  // built carrier bits
@@ -60,9 +55,7 @@ struct ChainReport {
 };
 
 /// A class of multiplexer: `count` of them, each `fanin` sources wide at
-/// `width` bits. Aggregated rather than enumerated because the cost of a mux is
-/// a function of exactly those two numbers, and nothing downstream needs to
-/// know WHICH ports a given mux feeds.
+/// `width` bits.
 struct MuxClass {
   unsigned fanin = 0, width = 0, count = 0;
 };
@@ -70,24 +63,24 @@ struct MuxClass {
 /// What the cost model needs of one array and no reader does: the ports it was
 /// bound with, and who drives them.
 struct MemCost {
-  // Ports a child drives. Several ports of one child are that child's own
-  // boundary; several children writing is what makes a banking problem.
+  // Ports a child drives into this array; several children writing makes a
+  // banking problem.
   unsigned callReads = 0, callWrites = 0;
-  // Ports one bank is built with (`MemUnit::readPortsBuilt` and its twins).
-  // `ports` is not their sum: a port of a pooled storage may carry both a read
-  // and a write that never issue together.
+  // Ports one bank is built with (`MemUnit::readPortsBuilt` and twins). `ports`
+  // is not their sum: a pooled port may carry a read and a write that never
+  // issue together.
   unsigned readPorts = 0, writePorts = 0, ports = 0;
-  // Instances of the storage row each bank is held in (`MemUnit::instances`),
-  // decided once the ports are bound. The cost model multiplies by this.
+  // Storage-row instances each bank is held in (`MemUnit::instances`); the cost
+  // model multiplies by this.
   unsigned instances = 1;
-  // Instances the schedule reserved against (`StoragePorts::copies`), which
-  // `instances` above may exceed when the binding replicates further.
+  // Instances the schedule reserved against (`StoragePorts::copies`);
+  // `instances` may exceed it when the binding replicates further.
   unsigned copiesBudget = 1;
-  // Read and write ports one instance of the row provides, 0 for no limit;
-  // `instances` beside it is the multiplier.
+  // Read/write ports one row instance provides, 0 for no limit; multiplied by
+  // `instances`.
   unsigned rowReads = 0, rowWrites = 0;
-  // A lower bound on what one cycle asks of this bank, per direction
-  // (`MemUnit::readConcurrency`). Zero for a ROM or a scattered array, neither
+  // Lower bound on what one cycle asks of this bank, per direction
+  // (`MemUnit::readConcurrency`). Zero for a ROM or scattered array, neither
   // addressed.
   unsigned readConcurrency = 0, writeConcurrency = 0;
   // Module interface groups this array contributes (`MemUnit::boundaryPorts`).
@@ -111,10 +104,10 @@ struct MemReport {
   /// What the module built to hold it (`MemUnit::Realization`, spelled
   /// "boundary" / "rom" / "scatter" / "ram").
   std::string realization;
-  /// Whether the partition BOUGHT the bandwidth it costs: every access reaches
-  /// one bank. An access the analysis could not fix takes a port on every bank,
-  /// so a partition resolving none of them is N memories at the bandwidth of
-  /// one. True for an unpartitioned array, which has nothing to resolve.
+  /// Whether the partition bought the bandwidth it costs: every access reaches
+  /// one bank. An unresolved access takes a port on every bank, so a partition
+  /// resolving none is N memories at the bandwidth of one. True for an
+  /// unpartitioned array, which has nothing to resolve.
   bool partitionResolved = true;
 };
 
@@ -137,9 +130,9 @@ struct CallReport {
 };
 
 /// One address stride register beside the counter: its width and which update
-/// cells it builds (a step adder, a carry adder with its select, a wrap
-/// compare with its fix adder and select). `isCounter` names the stride that
-/// is the counter itself, which builds no register at all.
+/// cells it builds (step adder; carry adder with its select; wrap compare with
+/// its fix adder and select). `isCounter` names the stride that is the counter
+/// itself, which builds no register.
 struct StrideCost {
   unsigned width = 0;
   bool step = false, carry = false, wrap = false, isCounter = false;
@@ -148,12 +141,11 @@ struct StrideCost {
 /// What the cost model needs of one region and no reader does. Grouped apart
 /// for the same reason as `MemCost`.
 struct RegionCost {
-  // Mux totals as the allocation charges them: inputs across every mux, and
-  // 2:1-equivalent bits, since a k:1 mux costs about (k-1) 2:1 muxes per bit.
+  // Mux totals the allocation charges: inputs across every mux, and
+  // 2:1-equivalent bits (a k:1 mux costs about (k-1) 2:1 muxes per bit).
   unsigned muxInputs = 0, muxBits = 0;
-  // The region's control plane: the iteration counter's width, the phase
-  // counter's (a pipelined leaf at II>1), and the address strides riding
-  // beside them.
+  // Control plane: iteration-counter width, phase-counter width (a pipelined
+  // leaf at II>1), and the address strides beside them.
   unsigned counterWidth = 0, phaseWidth = 0, addrStrides = 0;
   std::vector<StrideCost> strides;
 };
@@ -195,15 +187,15 @@ struct FuncUarch {
   std::string module; // the emitted `hw.module` name; joins to `Interfaces`
   bool top = false;
   std::vector<RegionUarch> regions;
-  // Module-wide: a register run belongs to the value it carries, not to a
-  // region, and the ledger counts it where it is BUILT.
+  // Module-wide register runs: a run belongs to the value it carries, not a
+  // region, counted where it is built.
   std::vector<RegClass> regs;
   // Every value delay chain the model holds (`dp.regs`), one row each. The
-  // ledger's value-role classes above also count chains built OUTSIDE the
-  // model (read-data alignment, stall holds), so these sum to less.
+  // ledger's value-role classes also count chains built outside the model
+  // (read-data alignment, stall holds), so these sum to less.
   std::vector<ChainReport> chains;
-  // Module-wide: the select cones the emission built around storage, disjoint
-  // from each region's allocation muxes.
+  // The select cones the emission built around storage, disjoint from each
+  // region's allocation muxes.
   std::vector<MuxCone> muxCones;
   std::vector<MemReport> mems;
   std::vector<StreamReport> streams;
@@ -229,18 +221,17 @@ struct FuncUarch {
 
 /// One emission: every module it built, in emit order (callees before callers).
 struct MicroarchReport {
-  /// Bumped on a breaking rename. Its one purpose is that a baseline persisted
-  /// to disk by a comparison tool is REFUSED rather than silently compared
-  /// against a later schema; in-process the producer and consumer are the same
-  /// build.
+  /// Schema version, bumped on a breaking rename: a baseline persisted to disk
+  /// by a comparison tool is refused rather than silently compared against a
+  /// later schema. In-process the producer and consumer share a build.
   static constexpr unsigned kVersion = 1;
 
   std::string binding; // the sharing policy this emission ran under
-  float cycleTime = 0; // ns, the period the schedule was cut to
+  float cycleTime = 0; // ns; the period the schedule was cut to
   std::vector<FuncUarch> funcs;
 
   /// The report as the JSON document Python parses. Absent optionals are
-  /// OMITTED rather than null, as in the schedule report and the interface
+  /// omitted rather than null, as in the schedule report and interface
   /// manifest, so a consumer tests for the field it needs.
   std::string toJSON() const;
 };

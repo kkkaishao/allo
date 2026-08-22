@@ -37,9 +37,8 @@ bool whileHasIdentityForwarding(scf::WhileOp w);
 /// Whether an `scf.while`'s continue-condition settles the cycle the loop
 /// issues, so the while can flushing-pipeline. False when the before region
 /// holds a multi-cycle op per \p lib (a memory read, a latency IP) or a
-/// sub-kernel call, whose length is its callee's schedule and so is no row \p
-/// lib can answer for. Either routes the while to the sequential CHECK/RUN
-/// controller instead.
+/// sub-kernel call, whose length is its callee's schedule and no row \p lib can
+/// answer for. Either routes the while to the sequential check/run controller.
 bool conditionIsCombinational(scf::WhileOp w, const DeviceModel &dev);
 
 /// Whether \p w takes the flushing-pipeline schedule rather than decomposing

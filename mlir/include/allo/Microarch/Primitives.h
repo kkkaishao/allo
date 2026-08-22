@@ -165,27 +165,26 @@ struct ShiftChain {
 // StallShell (H): the elasticity derivation's one output object. It stretches a
 // rigid region's time base, so a stalled cycle advances nothing and taps align.
 //
-// Both fields null is a RIGID shell, the identity every primitive below reduces
+// Both fields null is a rigid shell, the identity every primitive below reduces
 // to. `DatapathEmitter::deriveStallShell` builds it from the region's stream
-// handshakes, and a caller takes it from the region that OWNS the cell
+// handshakes, and a caller takes it from the region that owns the cell
 // (`shellFor`), not necessarily the region currently emitting.
 //===----------------------------------------------------------------------===//
 struct StallShell {
-  // F's half: every shift stage, held read address and clock-enabled IP's `ce`
+  // F's half: every shift stage, held read address and clock-enabled IP `ce`
   // advances only while high, so the datapath freezes together.
   Value chainEnable; // F consumes; null => rigid
-  // G's half: the controller issues only while high and DEFERS the denied pass
-  // rather than dropping it. Implies `chainEnable` and is strictly stronger
-  // wherever the region may drain a deferred pass away, leaving a bubble.
+  // G's half: the controller issues only while high and defers the denied pass
+  // rather than dropping it. Implies `chainEnable`, strictly stronger wherever
+  // the region may drain a deferred pass away, leaving a bubble.
   Value issueEnable; // G consumes; null => rigid (issue ungated)
-  // The owning region, stamped by `shellFor`: the region whose pass discipline
-  // the delayed pulses obey. Names the delay cells; unset on a bare rigid
-  // shell.
+  // Owning region, stamped by `shellFor`: whose pass discipline the delayed
+  // pulses obey. Names the delay cells; unset on a bare rigid shell.
   std::optional<unsigned> region;
   // Whether the owner has at most one pass in flight
-  // (`RegionBlock::singlePass`), which is what lets `delayValid` time a long
-  // delay with a counter: a pipelined region's chain taps each hold a distinct
-  // in-flight iteration, so a counter would drop every pulse but the first.
+  // (`RegionBlock::singlePass`), which lets `delayValid` time a long delay with
+  // a counter: a pipelined region's chain taps each hold a distinct in-flight
+  // iteration, so a counter would drop every pulse but the first.
   bool singlePass = false;
   /// Whether this region is latency-insensitive at all (has a stall shell).
   explicit operator bool() const { return chainEnable != Value(); }
@@ -209,35 +208,34 @@ struct EmitContext {
   Value rst;
   Value zero32, one32, f1, t1; // set by initLiterals()
 
-  // The region being emitted, as a naming prefix (`r3`). Naming only, with no
-  // semantics attached: a delay cell is named after the shell that owns it, and
-  // this is the fallback for a shell carrying no region.
+  // Region being emitted, as a naming prefix (`r3`). Naming only: a delay cell
+  // is named after the shell that owns it, and this is the fallback for a shell
+  // carrying no region.
   std::string regionTag;
 
-  // The pulse-delay depth from which `delayValid` builds a counter instead of
-  // extending a chain, stamped from `Datapath::countedDelayCycles`. An
-  // unstamped context never counts.
+  // Pulse-delay depth at which `delayValid` builds a counter instead of
+  // extending a chain, from `Datapath::countedDelayCycles`. Unstamped never
+  // counts.
   unsigned countedDelayCycles = std::numeric_limits<unsigned>::max();
 
   // Every register this module's emission builds, by run. `reg` below is the
-  // one `seq.compreg` creation in the backend, so this is a count of the
-  // emitted design rather than a model of it; `checkRegLedger` holds the two
-  // together on every emission.
+  // one `seq.compreg` creation, so this counts the emitted design rather than
+  // modelling it; `checkRegLedger` holds the two together on every emission.
   RegLedger ledger;
   // Every select cone built around storage after the binding (shared-port
-  // selects, commit sinks, crossbars), charged where it is built. The
-  // allocation's own mux cells are priced from the model, not here.
+  // selects, commit sinks, crossbars), charged where built. The allocation's
+  // own mux cells are priced from the model, not here.
   MuxLedger muxLedger;
   // Set while a chain builder runs: it charges the whole run at once, so its
   // stages must not each charge one of their own.
   bool inChainRun = false;
-  // Power-on immutables by constant, shared across every reset-free register
-  // of the module.
+  // Power-on immutables by constant, shared across every reset-free register of
+  // the module.
   llvm::DenseMap<Attribute, Value> initials;
   // Pulse-delay memos: one chain per (source, chain enable) extended to the
-  // deepest requested stage and tapped, and one counter per exact
-  // (source, depth, enable), so consumers share stages instead of each
-  // building a private chain the ledger would count again.
+  // deepest requested stage and tapped, one counter per exact
+  // (source, depth, enable), so consumers share stages instead of each building
+  // a private chain the ledger would recount.
   llvm::DenseMap<std::pair<Value, Value>, ShiftChain> pulseChains;
   llvm::DenseMap<std::tuple<Value, unsigned, Value>, Value> countedPulses;
 
@@ -254,16 +252,14 @@ struct EmitContext {
   /// constant, so a 64-stage chain builds one initial region.
   Value initialFor(Value rstVal);
 
-  /// Registered (1-cycle): out[t+1] = in[t], sampled unconditionally on every
-  /// clock. A control-state role resets to `rstVal` (`seq.compreg` with a
-  /// synchronous reset); a Value or Pulse role instead powers on to it and
-  /// carries no reset, the reset being what blocks shift-register extraction on
-  /// the fabric.
+  /// Registered (1-cycle): out[t+1] = in[t], sampled unconditionally. A control
+  /// role resets to `rstVal` (`seq.compreg` with a synchronous reset); a Value
+  /// or Pulse role powers on to it and carries no reset, since a reset blocks
+  /// shift-register extraction on the fabric.
   ///
-  /// The one place a register is built (with `enabledReg` below), which is
-  /// what makes `ledger` exact. \p role is what the register is for, charged
-  /// as a run of one unless a chain builder is already charging the whole run
-  /// it belongs to.
+  /// The one place a register is built (with `enabledReg`), which makes `ledger`
+  /// exact. \p role is charged as a run of one unless a chain builder is already
+  /// charging the whole run it belongs to.
   Value reg(Value in, Value rstVal, RegRole role = RegRole::Control);
   /// Clock-enabled register (1-cycle when enabled): out[t+1] = ce[t] ? in[t] :
   /// out[t], built as `seq.compreg.ce` so identical runs stay CSE-able. Reset
@@ -276,10 +272,10 @@ struct EmitContext {
   Value shellReg(Value in, Value rstVal, const StallShell &sh, RegRole role);
   /// Stall-hold: transparent (combinational passthrough) while \p sh's
   /// `chainEnable` is high, holds its last enabled value while low. out = ce ?
-  /// in : held; held[t+1] = out[t]. Unlike `enabledReg` it adds NO latency when
-  /// enabled, so a read address stays == the counter in steady state but
-  /// freezes on back-pressure, keeping the in-flight read alive. A no-op
-  /// (returns `in`) under a rigid shell.
+  /// in : held; held[t+1] = out[t]. Unlike `enabledReg` it adds no latency when
+  /// enabled, so a read address stays == the counter in steady state but freezes
+  /// on back-pressure, keeping the in-flight read alive. A no-op (returns `in`)
+  /// under a rigid shell.
   Value stallHold(Value in, const StallShell &sh);
   /// A while iter-arg's frozen result register: out[t+1] = load ? init :
   /// (advance ? next : out[t]). Frozen once the loop exits, so it holds the
@@ -369,7 +365,7 @@ struct EmitContext {
   Value risingEdge(Value level);
   /// The start pulse of a schedulable node: its region-entry `regionStart` when
   /// it has no predecessors, else the rising edge of its predecessors' joined
-  /// `done` (the node waits for ALL predecessors).
+  /// `done` (the node waits for all predecessors).
   Value startFor(Value regionStart, ArrayRef<Value> predDones);
   /// A completion-latch level: set to 1 by \p setPulse, cleared to 0 by
   /// \p start (so a retriggered region re-edges each pass). out[t+1] = start ?

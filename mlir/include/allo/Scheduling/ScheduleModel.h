@@ -25,63 +25,57 @@ namespace mlir::allo {
 struct OpSchedule {
   /// Start cycle, relative to the region's own start.
   int64_t start = 0;
-  /// Sub-cycle start (ns within the cycle), from a chaining solve. Empty when
-  /// the region was solved without one.
+  /// Sub-cycle start (ns within the cycle) from a chaining solve; empty without
+  /// one.
   std::optional<float> startInCycle;
   /// Which allocated instance runs it: an index into
   /// `ScheduleModel::allocatedUnits`. Empty unless an exact solve allocated.
   std::optional<unsigned> unit;
-  /// The `dcp.operator` row an exact solve selected for it, empty where the
-  /// library's own selection stands. The reify realizes the op on this row,
-  /// the same one the schedule priced.
+  /// The `dcp.operator` row an exact solve selected, empty where the library's
+  /// pick stands. The reify realizes the op on this row, the one the schedule
+  /// priced.
   std::string selectedImpl;
 };
 
-/// The solved schedule of ONE region: what the solver DECIDED, and nothing the
-/// IR already says. A trip count, a lower bound and a step are re-derived from
-/// the loop; only a trip an ASSUMPTION bounded is here, because reification
-/// keeps the loop's runtime bound operand and drops the assumption that bounded
-/// it.
+/// The solved schedule of one region: what the solver decided, nothing the IR
+/// already says. Trip count, lower bound and step are re-derived from the loop;
+/// only a trip an assumption bounded is here, since reification keeps the
+/// loop's runtime bound operand and drops the assumption.
 struct RegionSolution {
   /// Initiation interval. Empty for a straight-line span, which issues once.
   std::optional<int64_t> ii;
-  /// Schedule DEPTH, the cycle by which every op has completed. A REPORT only:
-  /// a span composes from `drain` instead, since the solver may leave slack
-  /// above the last commit.
+  /// Schedule depth, the cycle by which every op has completed. Report only: a
+  /// span composes from `drain` instead, since the solver may leave slack above
+  /// the last commit.
   int64_t length = 0;
-  /// The region's TERMINAL cycle: how long after its last issue pulse the
-  /// deepest output commits, so its `done` rises `drain + 1` cycles after that
-  /// pulse. What `leafSpan` composes.
+  /// The region's terminal cycle: `done` rises `drain + 1` cycles after the
+  /// last issue pulse. What `leafSpan` composes.
   int64_t drain = 0;
-  /// The region's own iteration count, one invocation of it. Empty for a
-  /// straight-line span and for a data-dependent trip nothing bounds. A TRIP,
-  /// not a latency: every field here is per-invocation, so a span is composed
-  /// where it is used (`composeSpan`) rather than stored.
+  /// The region's iteration count for one invocation. Empty for a straight-line
+  /// span and for an unbounded data-dependent trip. Per-invocation, so a span
+  /// is composed where used (`composeSpan`) not stored.
   std::optional<int64_t> trip;
-  /// The trip above is a worst case derived from an `allo.assume.ssa` range
-  /// rather than a compile-time constant, so every span composed from it is a
-  /// bound.
+  /// The trip is a worst case from an `allo.assume.ssa` range, not a
+  /// compile-time constant, so any span composed from it is a bound.
   bool tripIsBound = false;
 };
 
-/// One scheduled op as the REPORT names it: read off the reified op, but named
-/// the way its source op was rather than by the dcp op standing for it.
+/// One scheduled op as the report names it: read off the reified op but named
+/// after its source op, not the dcp op standing for it.
 struct ScheduledOpReport {
   /// An arith/affine-style mnemonic: `addi`, `mulf`, `load`, `stream.get`.
   std::string kind;
   /// Start cycle, relative to the region's own start.
   int64_t start = 0;
   /// The `dcp.operator` symbol realizing it, empty for a combinational or
-  /// memory op, which no IP realizes. The emitted module name derives from it
-  /// (`operatorModuleName`).
+  /// memory op. The emitted module name derives from it (`operatorModuleName`).
   std::string impl;
   /// Sub-cycle start (ns within the cycle), from a chaining solve.
   std::optional<float> z;
 };
 
 /// One scheduling region as the report names it, with the ops it issues
-/// DIRECTLY. A nested region's own ops are reported under that region, so an
-/// op appears once.
+/// directly. A nested region's ops are reported under it, so an op appears once.
 struct RegionReport {
   /// `cyclic` for a pipeline, `acyclic` for a straight-line span, `guard` for a
   /// select, which carries no compute of its own.
@@ -89,39 +83,35 @@ struct RegionReport {
   /// Program order among its func's regions, and nesting depth among dcp
   /// regions (0 = outermost).
   int64_t order = 0, depth = 0;
-  /// Whether a region nests inside it, which is what makes it a wrapper rather
-  /// than a leaf, and whether its execution is predicated (a while pipeline or
-  /// a guard).
+  /// Whether a region nests inside it (making it a wrapper not a leaf), and
+  /// whether its execution is predicated (a while pipeline or a guard).
   bool container = false, conditional = false;
-  /// Vitis vocabulary: `interval` is the initiation interval, `latency` the
-  /// whole region's span, `iterationLatency` the schedule DEPTH of one
-  /// iteration. `drain` is the TERMINAL cycle its `done` composes off, which is
-  /// a composition quantity rather than a latency a reader compares: a solver
-  /// may leave slack between it and `iterationLatency`, and only `drain` is
-  /// charged.
+  /// Vitis vocabulary: `interval` the II, `latency` the whole region's span,
+  /// `iterationLatency` one iteration's schedule depth. `drain` is the terminal
+  /// cycle `done` composes off, a composition quantity not a latency a reader
+  /// compares: a solver may leave slack between it and `iterationLatency`, and
+  /// only `drain` is charged.
   std::optional<int64_t> interval, tripCount, iterationLatency, drain, latency;
   /// The latency above is an upper bound, not an exact count.
   bool latencyBound = false;
-  /// The mnemonic of the region's determinacy class, the controller family that
-  /// paces it. Empty only when the attribute is absent.
+  /// Mnemonic of the region's determinacy class, the controller family pacing
+  /// it. Empty only when the attribute is absent.
   std::string determinacy;
   std::vector<ScheduledOpReport> ops;
 };
 
-/// What ONE region's solve COST: a measurement of the compiler, not the
-/// hardware, so it is never stamped as an IR attribute the emitter could read.
-///
-/// Kept separate from `RegionReport`: a solve is keyed by the affine loop that
-/// owned the problem, which no longer exists once the report is built off the
-/// reified `dcp` ops. Both lists are in program order per func.
+/// What one region's solve cost: a measurement of the compiler, not the
+/// hardware, so never stamped as an IR attribute. Kept separate from
+/// `RegionReport`: a solve is keyed by the affine loop that owned the problem,
+/// gone once the report is built off the reified `dcp` ops. Both lists are in
+/// program order per func.
 struct SolveReport {
   /// The func it belongs to, and where its region is, as the log names it.
   std::string func, where;
   /// `cyclic` for a counted loop, `while` for a flushing while, `acyclic` for a
   /// straight-line span.
   std::string kind;
-  /// Problem size: operations registered, and how many of those hold at least
-  /// one limited unit.
+  /// Problem size: ops registered, and how many hold at least one limited unit.
   int64_t ops = 0, limitedOps = 0;
   /// The initiation interval settled, absent for an acyclic span.
   std::optional<int64_t> interval;
@@ -134,8 +124,8 @@ struct SolveReport {
   /// The solver's own verdict; see `SolveTelemetry`.
   bool proven = false, budgetExhausted = false, fallback = false;
   std::optional<int64_t> exhaustedAtII;
-  /// Whether re-running the compile reproduces this solve's schedule: the
-  /// workers were interleaved and the budget held.
+  /// Whether re-running the compile reproduces this schedule: workers
+  /// interleaved and budget held.
   bool deterministic = true;
 };
 
@@ -144,18 +134,15 @@ struct FuncReport {
   std::string name;
   std::optional<int64_t> latency;
   bool latencyBound = false;
-  /// The mnemonic of the kernel's determinacy class, the composition contract a
+  /// Mnemonic of the kernel's determinacy class, the composition contract a
   /// caller holds its `latency` to. Empty only when the attribute is absent.
   std::string determinacy;
   std::vector<RegionReport> regions;
 };
 
-/// A schedule directive the scheduler did not apply, and what it did instead.
-///
-/// Only the REFUSALS are listed: a directive that lands leaves its mark on the
-/// region it shaped, while one that does not is otherwise invisible, since the
-/// region it named has been decomposed by the time any report is built. This is
-/// the fact behind a warning that would otherwise have nowhere to live.
+/// A schedule directive the scheduler did not apply. Only refusals are listed:
+/// a directive that lands marks the region it shaped, one that does not is
+/// otherwise invisible, its region decomposed by report time.
 struct UnhonoredDirective {
   /// The directive as the user spelled it (`pipeline`).
   std::string directive;
@@ -165,19 +152,17 @@ struct UnhonoredDirective {
   std::string reason;
 };
 
-/// What the scheduling pipeline knows, in the two forms its two phases need:
-/// the SOLUTION hands `runSDCScheduler`'s start times and region solutions to
-/// `runPostScheduleConversion`, and the REPORT is what the reify builds from
-/// the module it has just written, read back by Python through `toJSON`.
-///
-/// The two are valid at disjoint times: the solution between the phases, the
-/// report only after, since by then `forget` has dropped every op the reify
-/// erased. Keyed by `Operation *`, which stays valid across the two phases,
-/// running back to back with no pass between them to fold or rebuild an op.
+/// What the scheduling pipeline knows, in the two forms its phases need: the
+/// solution hands `runSDCScheduler`'s start times and region solutions to
+/// `runPostScheduleConversion`; the report is what the reify builds from the
+/// written module, read back by Python via `toJSON`. Valid at disjoint times:
+/// the solution between the phases, the report only after (by then `forget`
+/// dropped every erased op). Keyed by `Operation *`, valid across both phases,
+/// which run back to back with no pass between to fold or rebuild an op.
 class ScheduleModel {
 public:
-  /// Record \p op's solved start. An op is scheduled ONCE, by the solver or by
-  /// the reify for a cone the solver never saw, never by both.
+  /// Record \p op's solved start. An op is scheduled once, by the solver or by
+  /// the reify for a cone the solver never saw, never both.
   void setStart(Operation *op, int64_t start) {
     bool inserted =
         ops.try_emplace(op, OpSchedule{start, std::nullopt, std::nullopt, {}})
@@ -186,8 +171,8 @@ public:
     (void)inserted;
   }
 
-  /// Record \p op's sub-cycle start. Only meaningful alongside a start, and
-  /// only ever read alongside one.
+  /// Record \p op's sub-cycle start; meaningful and read only alongside a
+  /// start.
   void setStartInCycle(Operation *op, float z) {
     auto it = ops.find(op);
     assert(it != ops.end() && "a sub-cycle start belongs to a scheduled op");
@@ -195,16 +180,14 @@ public:
   }
 
   /// One functional-unit instance an allocation decided to build. The reify
-  /// declares a `dcp.unit` per entry and points the operations running on it at
-  /// that symbol.
+  /// declares a `dcp.unit` per entry and points its ops at that symbol.
   struct AllocatedUnit {
     std::string name;   // the `dcp.unit` symbol, unique across the module
     std::string opType; // the `dcp.operator` it realizes
   };
 
-  /// Declare \p count instances of \p opType and return the index of the first.
-  /// Names are minted here, the one object spanning a whole module's
-  /// scheduling, so a `dcp.unit` symbol is unique across it.
+  /// Declare \p count instances of \p opType and return the first's index.
+  /// Names are minted here, so a `dcp.unit` symbol is unique module-wide.
   unsigned addUnits(llvm::StringRef opType, unsigned count) {
     unsigned base = units.size();
     for (unsigned k = 0; k < count; ++k)
@@ -220,8 +203,8 @@ public:
     it->second.unit = index;
   }
 
-  /// Record that an exact solve realized \p op on the row \p symbol rather
-  /// than the one the library selects on its own.
+  /// Record that an exact solve realized \p op on row \p symbol rather than the
+  /// library's pick.
   void setSelectedImpl(Operation *op, llvm::StringRef symbol) {
     auto it = ops.find(op);
     assert(it != ops.end() && "a realization belongs to a scheduled op");
@@ -238,9 +221,9 @@ public:
     return it == ops.end() ? nullptr : &it->second;
   }
 
-  /// Open the solution OWNED by \p owner: the innermost loop of a counted band,
-  /// a flushing `scf.while`, or a straight-line span's first op. That is the op
-  /// both descents land on, hence the key.
+  /// Open the solution owned by \p owner: the innermost loop of a counted band,
+  /// a flushing `scf.while`, or a straight-line span's first op. The op both
+  /// descents land on, hence the key.
   RegionSolution &addRegion(Operation *owner) {
     auto [it, inserted] = regions.try_emplace(owner);
     assert(inserted && "a region is solved once");
@@ -255,9 +238,9 @@ public:
     return it == regions.end() ? nullptr : &it->second;
   }
 
-  /// Record that the solved schedule satisfies the RAW dependence from
-  /// \p store to \p load only through store->load forwarding: the two may
-  /// issue in one cycle, and the reify stamps the pair onto the dcp accesses.
+  /// Record that the schedule satisfies the RAW dependence from \p store to
+  /// \p load only through store->load forwarding: the two may issue in one
+  /// cycle, and the reify stamps the pair onto the dcp accesses.
   void addForward(Operation *load, Operation *store) {
     forwards[load].push_back(store);
   }
@@ -267,8 +250,8 @@ public:
     return forwards;
   }
 
-  /// Record that an `allo.assume.ssa` range bounds \p loop's iteration count at
-  /// \p trip, for a loop whose exact count is not compile-time.
+  /// Record that an `allo.assume.ssa` range bounds \p loop's trip at \p trip,
+  /// when its exact count is not compile-time.
   void setTripBound(Operation *loop, int64_t trip) { tripBounds[loop] = trip; }
   /// The assumption-derived worst-case trip of \p loop, or empty when its trip
   /// is compile-time or nothing bounds it.
@@ -277,10 +260,9 @@ public:
     return it == tripBounds.end() ? std::nullopt : std::optional(it->second);
   }
 
-  /// Drop everything recorded about \p op, which every erase of a scheduled op
-  /// owes the model. MLIR frees an erased op and the next `create` may be
-  /// handed that same address, so a stale entry would answer for an op no
-  /// phase ever scheduled.
+  /// Drop everything recorded about \p op; every erase of a scheduled op owes
+  /// the model this. MLIR reuses a freed op's address, so a stale entry would
+  /// answer for an op no phase scheduled.
   void forget(Operation *op) {
     ops.erase(op);
     regions.erase(op);
@@ -289,33 +271,33 @@ public:
   }
 
   /// Read \p module's reified `allo.dcp.*` ops into `report`, and the prep
-  /// passes' stamped decisions into `prep`. Called once, at the tail of the
-  /// reify: before it there are no dcp ops, and after it the pipeline is gone.
+  /// passes' stamped decisions into `prep`. Called once at the tail of the
+  /// reify: before it no dcp ops exist, after it the pipeline is gone.
   void record(ModuleOp module);
 
-  /// The report as the JSON document Python parses. Optional fields are
-  /// OMITTED rather than null, as in the interface manifest, so a consumer
-  /// tests for the field it needs instead of for a sentinel.
+  /// The report as the JSON document Python parses. Optional fields are omitted
+  /// rather than null, as in the interface manifest, so a consumer tests for a
+  /// field not a sentinel.
   std::string toJSON() const;
 
   /// The reified schedule, whole-module. Plain data: the reify fills it and the
   /// CAPI serializes it.
   std::vector<FuncReport> report;
 
-  /// What each solve cost, in the order the scheduler solved: funcs
-  /// callees-first, and within a func its solving regions in program order. Not
-  /// one entry per `report` region, since a container solves nothing of its own
-  /// and one solve covers a whole perfect band. Filled by the SOLVER, so unlike
-  /// `report` it survives whether or not the reify runs.
+  /// What each solve cost, in solve order: funcs callees-first, regions in
+  /// program order within a func. Not one entry per `report` region (a
+  /// container solves nothing of its own, one solve covers a perfect band).
+  /// Filled by the solver, so unlike `report` it survives whether or not the
+  /// reify runs.
   std::vector<SolveReport> solves;
 
-  /// Directives the scheduler could not apply, in the order it met them.
-  /// Filled by the SOLVER, like `solves`.
+  /// Directives the scheduler could not apply, in encounter order. Filled by
+  /// the solver, like `solves`.
   std::vector<UnhonoredDirective> unhonored;
 
-  /// The clock period the schedule holds, in ns: the target, or the least
-  /// period every device row fits when the target is unreachable
-  /// (`runSDCScheduler` derates it). What emission prices and checks against.
+  /// The clock period the schedule holds (ns): the target, or the least period
+  /// every device row fits when the target is unreachable (`runSDCScheduler`
+  /// derates it). What emission prices and checks against.
   float cycleTimeNs = 0.0f;
 
 private:

@@ -17,9 +17,8 @@ from .sim.ip_models import OpDesc, Ty
 
 
 class Realization(NamedTuple):
-    """Device-supplied project content beyond the emitted RTL: source and
-    build files keyed by file name, plus the extern modules it cannot build.
-    File names and contents are opaque here."""
+    """Device-supplied project content beyond the emitted RTL: source and build
+    files keyed by name, plus the extern modules it cannot build."""
 
     files: dict[str, str]
     missing: tuple[str, ...] = ()
@@ -27,13 +26,11 @@ class Realization(NamedTuple):
 
 @dataclass(frozen=True)
 class Resource:
-    """A device resource: a counter with a capacity, and nothing else.
+    """A device resource: a named counter with a capacity.
 
-    The vocabulary is the DEVICE's, so a part with different primitives declares
-    different names and the compiler, which only adds and multiplies these, does
-    not care. ``capacity`` is a price input rather than a constraint: regions are
-    scheduled independently, so a whole-device budget is not a quantity any one
-    solve can enforce. ``weight`` scales the derived scarcity price.
+    Resource names are the device's own vocabulary; the compiler only adds and
+    multiplies them. ``capacity`` is a price input, not a constraint (regions
+    schedule independently). ``weight`` scales the derived scarcity price.
     """
 
     name: str
@@ -43,12 +40,12 @@ class Resource:
 
 @dataclass(frozen=True)
 class Cost:
-    """What one realization spends of one resource, as a function of ONE of that
-    realization's parameters (an operand width, a multiplexer's fan-in).
+    """What one realization spends of one resource, as a function of one of the
+    realization's parameters (an operand width, a mux's fan-in).
 
-    Build these through :func:`Const` and friends rather than directly. The
-    SHAPE comes from hardware structure and only the coefficients are measured;
-    a shape that is not structural belongs in a :func:`Table`.
+    Build these through :func:`Const` and friends. The shape is structural and
+    only the coefficients are measured; a non-structural shape belongs in a
+    :func:`Table`.
     """
 
     form: str
@@ -132,8 +129,8 @@ def Piecewise(bp: float, below: Cost, above: Cost) -> Cost:
 
 
 #: What one realization spends: ``(resource name, one cost factor per parameter
-#: of its kind)`` pairs, which is what ``#allo.res_use`` carries. One pair is
-#: one product TERM, and a resource that names several is spent their sum.
+#: of its kind)`` pairs, as ``#allo.res_use`` carries. One pair is one product
+#: term; a resource that names several is spent their sum.
 Spend = tuple[tuple[str, tuple[Cost, ...]], ...]
 
 
@@ -148,13 +145,11 @@ def _terms(cost: Cost | Sequence) -> tuple[tuple[Cost, ...], ...]:
     return tuple(tuple(term) for term in seq)
 
 
-#: Every `uses` attribute built so far, keyed by the declaration it came from:
-#: pricing one design asks for the same handful of rows tens of thousands of
-#: times.
+#: Cache of built `uses` attributes, keyed by the declaration they came from.
 _COST_ATTRS: dict[Spend, object] = {}
 
-#: The same, for the single costs a `dcp.comb` row's delay is, which are not a
-#: `Spend` and so cannot share the table above.
+#: The same for single delay costs (a `dcp.comb` row's delay), which are not a
+#: `Spend` and cannot share the cache above.
 _DELAY_ATTRS: dict[Cost, object] = {}
 
 
@@ -242,16 +237,11 @@ def Tiled(bits_per_tile: int) -> Cost:
 class Storage:  # pylint: disable=too-many-instance-attributes
     """A storage realization: one buildable structure an array can live in.
 
-    NOT a resource. A resource is a counter (``@lut``, ``@bram36``); this is
-    something the device can BUILD out of them, with timing and ports of its
-    own, and its ``uses`` names what it spends. That split is why the vocabulary
-    is open: a part whose primitives are not Xilinx's declares different names
-    and nothing in the compiler switches on the list.
-
-    ``allo.bind.storage impl=`` names one of these. An array with no explicit
-    choice takes :meth:`Device.set_default_storage` where the device sets one,
-    and otherwise the cheapest row on this part that the compiler can pin it
-    to, among those at the least access latency.
+    Not a resource but something the device builds out of resources, with its
+    own timing and ports; ``uses`` names what it spends. ``allo.bind.storage
+    impl=`` names one. An array with no explicit choice takes
+    :meth:`Device.set_default_storage`, else the cheapest pinnable row at the
+    least access latency.
     """
 
     name: str
@@ -259,48 +249,44 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     write_latency: int
     read_delay_ns: float
     write_delay_ns: float
-    # The row that is NOT a memory: one cell per element, no address, no port
-    # limit. A completely partitioned array resolves here whatever it would
-    # otherwise have taken, and a device declares at most one.
+    # The non-memory row: one cell per element, no address, no port limit. A
+    # completely partitioned array resolves here; a device declares at most one.
     is_scatter: bool = False
     # A constant lookup built out of logic: no address bus, no port limit. Only
-    # a read-only array declared with contents resolves here, and a device
-    # declares at most one.
+    # a read-only array declared with contents resolves here; a device declares
+    # at most one.
     is_table: bool = False
-    # Ports of each direction one instance of the structure has, `None` for no
-    # limit. The limit is per instance, not per array: the compiler decides how
-    # many instances hold an array, every copy taking every write.
+    # Ports of each direction per instance, `None` for no limit. Per instance,
+    # not per array: the compiler decides how many instances hold an array,
+    # every copy taking every write.
     inst_reads: int | None = None
     inst_writes: int | None = None
-    # Ports one instance has altogether, each serving a read or a write in a
-    # cycle, never below either direction's limit. `None` where the directions
-    # are independent structures, as a LUT RAM's single write port and its one
-    # addressed read are.
+    # Ports per instance shared across directions, each serving one read or
+    # write per cycle. `None` where the directions are independent structures,
+    # as a LUT RAM's write port and its one addressed read are.
     inst_ports: int | None = None
-    # The vendor attribute that pins an array to this structure, stamped on the
-    # emitted array declaration (Xilinx spells it `ram_style = "block"`).
-    # `None` leaves the choice to the synthesizer.
+    # Vendor attribute pinning an array to this structure, stamped on the emitted
+    # declaration (Xilinx `ram_style = "block"`). `None` leaves the choice to
+    # the synthesizer.
     ram_style: str | None = None
-    # Whether the structure can come up holding contents. False for one that
-    # powers up undefined, as an UltraRAM does: an array declared with
-    # compile-time contents cannot be held there.
+    # Whether the structure powers up holding contents. False for one that powers
+    # up undefined (an UltraRAM); a compile-time-initialized array cannot bind
+    # there.
     can_init: bool = True
-    # What it spends. Storage carries two parameters, `(depth, width)`, so each
-    # entry is two cost factors or one `Tiled`.
+    # What it spends, over `(depth, width)`: each term is two cost factors or
+    # one `Tiled`.
     uses: Spend = ()
-    # Read delay (ns) as a function of the array's depth, and the factor its
-    # width scales it by, for a row whose cone grows with the array (a constant
-    # table's does, an addressed row's does not). Where they are given,
-    # `read_delay_ns` is the same curve at the row's reference shape.
+    # Read delay (ns) over the array's depth, and the factor its width scales it
+    # by, for a row whose cone grows with the array (a constant table's does, an
+    # addressed row's does not). `read_delay_ns` is this curve at the reference
+    # shape.
     read_delay_depth: Cost | None = None
     read_delay_width: Cost | None = None
 
 
 @dataclass(frozen=True)
 class StreamTiming:
-    """Get/put timing of a stream channel. A stream is a FIFO, not array
-    storage: nothing chooses its implementation and nothing binds its ports, so
-    it is one row on the device rather than a :class:`Storage`."""
+    """Get/put timing of a stream channel (a FIFO, not bound array storage)."""
 
     read_latency: int
     write_latency: int
@@ -317,9 +303,8 @@ class CombKind(Enum):
     DIV = "div"
     REM = "rem"
     NEG = "neg"  # `arith.negf` only: a float sign flip, not an integer negate
-    # `arith.minsi`/`minui`/`maxsi`/`maxui`, realized as a compare feeding a
-    # multiplexer. A fabric that declares no row for these prices them at the
-    # default of 0.1 ns and free.
+    # `arith.minsi`/`minui`/`maxsi`/`maxui`, a compare feeding a multiplexer. A
+    # fabric with no row prices them at the default 0.1 ns and free.
     MIN = "min"
     MAX = "max"
     CMP = "cmp"
@@ -338,9 +323,9 @@ class CombKind(Enum):
 # vocabulary rather than any coupling between them.
 # pylint: disable=too-many-instance-attributes
 class Device:
-    """A hardware platform: what it HAS (resources), what it can REALIZE
+    """A hardware platform: what it has (resources) and what it can realize
     (storage structures, native operator kinds, operator IPs, multiplexers,
-    delay chains) and a default synthesis frequency. Built fluently through
+    delay chains), plus a default synthesis frequency. Built fluently through
     ``add_resource`` / ``add_storage`` / ``set_comb_delay`` / ``add_operator``
     and the ``set_*_uses`` declarations."""
 
@@ -353,8 +338,7 @@ class Device:
         grade: str = "",
     ):
         self.name = name
-        # Identity, for a reader and for a sibling backend that targets the same
-        # silicon by part number. Nothing in the compiler switches on these.
+        # Identity only; nothing in the compiler switches on these.
         self.part = part
         self.fabric = fabric
         self.grade = grade
@@ -362,31 +346,27 @@ class Device:
         self.comb: dict[str, Cost] = {}
         # What a register-to-register path with no operator in it costs (ns).
         self.reg_delay_ns: float = 0.0
-        # Separate from `comb`: a delay is a timing fact and an area is a
-        # resource fact, read by different consumers.
         self.resources: dict[str, Resource] = {}
         self.comb_uses: dict[str, Spend] = {}  # comb kind -> what it spends
         self.operator_uses: dict[str, Spend] = {}  # IP symbol -> what it spends
-        # The three structures the emitter builds that nothing chooses between,
-        # so they are one row each rather than a named realization.
+        # What a multiplexer spends. This and the chain rows are unnamed
+        # structures the emitter builds, one row each.
         self.mux_uses: Spend = ()
         # Routed marginal delay (ns) of a one-hot select over its fan-in at a
-        # 32-bit reference width, and the unitless factor its actual width
-        # scales it by. None on an uncharacterized device, which the compiler
-        # prices by a conservative formula instead.
+        # 32-bit reference width, and the unitless factor its width scales it by.
+        # None on an uncharacterized device, priced by a conservative formula.
         self.mux_delay: Cost | None = None
         self.mux_delay_width: Cost | None = None
         self.chain_uses: Spend = ()
-        # A chain with no reset, which is what lets the fabric extract a shift
-        # register; the ledger's `reset` flag picks between the two rows.
+        # A reset-free chain, extractable as a shift register; the ledger's
+        # `reset` flag picks between the two rows.
         self.chain_uses_norst: Spend = ()
         self.storage: dict[str, Storage] = {}
-        # Routed logic sites per modeled LUT. Area rows count LUT instances and
-        # post-route LUT combining packs several of them into one site, so an
-        # estimate quoted against a utilization report scales by this.
+        # Routed logic sites per modeled LUT. Area rows count LUT instances;
+        # post-route combining packs several into one site, so an estimate
+        # quoted against a utilization report scales by this.
         self.lut_packing: float = 1.0
-        # The default is a NAME, not a handle: redeclaring a row (a copied
-        # device retuned) must not leave it pointing at the replaced one.
+        # A name, not a handle, so redeclaring a row keeps the default valid.
         self.default_storage: str | None = None
         self.stream_timing: StreamTiming | None = None
         # Built-in and user `@operator_ip` cores. `operator_uses` above is keyed

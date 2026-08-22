@@ -17,9 +17,9 @@ from .reports.compile import CompileReport
 
 #: The device kind that prices a native combinational unit, keyed by the
 #: realization mnemonic its identity carries. The device characterizes "an
-#: integer add", not ``addi`` against ``subi``, so several mnemonics share a row.
-#: A row of ``None`` is FREE and not unpriced: a resize is a rename of bits and a
-#: float negate a sign flip, so neither reaches a cell the part charges for.
+#: integer add", not ``addi`` against ``subi``, so several mnemonics share a
+#: row. A ``None`` row is free, not unpriced: a resize renames bits and a float
+#: negate flips a sign, so neither reaches a charged cell.
 COMB_KIND = {
     "addi": CombKind.ADD,
     "subi": CombKind.SUB,
@@ -45,8 +45,8 @@ COMB_KIND = {
 }
 
 #: An identity's operand list, and the integer widths in it. A unit's cost width
-#: comes from there and not from the result the report carries: a compare returns
-#: one bit, and pricing it at one bit prices it at nothing.
+#: comes from there, not the result: a compare returns one bit, and pricing it
+#: at one bit prices it at nothing.
 _ARGS = re.compile(r"^[^(]*\(([^)]*)\)")
 _INT_WIDTH = re.compile(r"\bi(\d+)\b")
 
@@ -55,15 +55,15 @@ _INT_WIDTH = re.compile(r"\bi(\d+)\b")
 class Utilization:
     """Primitive counts in the device's own vocabulary.
 
-    Built from what :meth:`Device.price` returns, so a part that declares other
-    resources adds other rows and nothing here switches on the list; the fields
-    are the ``xcu55c`` names spelled out for a reader."""
+    Built from :meth:`Device.price`, so a part declaring other resources adds
+    other rows and nothing here switches on the list; the fields are the
+    ``xcu55c`` names spelled out for a reader."""
 
     lut: int = 0  # every LUT site, state-holding ones included
     logic_lut: int = 0  # of those, the ones not holding state
-    #: LUT sites holding state (`slicem_lut`): a shift register or a distributed
-    #: RAM. Vivado reports the two uses apart ("LUT as Shift Register" against
-    #: "LUT as Distributed RAM").
+    #: LUT sites holding state (`slicem_lut`): a shift register or distributed
+    #: RAM. Vivado reports the two apart ("LUT as Shift Register" vs "LUT as
+    #: Distributed RAM").
     srl: int = 0
     ff: int = 0
     dsp: int = 0
@@ -117,28 +117,27 @@ _FIELDS = tuple(Utilization.__dataclass_fields__)
 class QoR:  # pylint: disable=too-many-instance-attributes
     """What a compile is worth: how long it runs, and what it occupies.
 
-    The throughput half comes from the schedule result and the area half from the
-    microarchitecture report. Nothing here is a substitute for synthesis, which
-    is the only authority on either; a `Synthesis` is a sibling of this and never
-    a variant of it, and the two meet only in a calibration."""
+    The throughput half comes from the schedule result, the area half from the
+    microarchitecture report. Never a substitute for synthesis; a `Synthesis`
+    is a sibling of this, not a variant, and the two meet only in a calibration.
+    """
 
-    #: the top kernel's span. ``latency`` is the EXACT one and is present only
-    #: where the kernel publishes a static contract; ``latency_max`` carries the
-    #: BOUND a bounded kernel publishes instead and ``latency_min`` the FLOOR a
-    #: concurrent one does, so a variant with no exact span still carries the
-    #: figure it does have, marked as what it is.
+    #: the top kernel's span. ``latency`` is the exact span, present only where
+    #: the kernel publishes a static contract; ``latency_max`` is the bound a
+    #: bounded kernel publishes and ``latency_min`` the floor a concurrent one
+    #: does, so a variant with no exact span still carries the figure it has.
     latency: int | None
     latency_max: int | None
     latency_min: int | None
     #: what each region's solve decided, keyed ``"<func>#<order>"``.
     interval: dict[str, int]
     #: MHz the design's longest accountable combinational path holds. Estimated
-    #: from summed device rows, with no placement or routing in it, so not a
-    #: substitute for the part's own timing report.
+    #: from summed device rows, no placement or routing, so not a substitute for
+    #: the part's timing report.
     fmax: float
     fmax_target: float  # MHz, the period the schedule was cut to
     #: MHz the design is clocked at, absent where the compile options are not
-    #: attached. Differs from ``fmax_target`` where a clock margin or a derate
+    #: attached. Differs from ``fmax_target`` where a clock margin or derate
     #: moved the model period the chains were cut to.
     clock_mhz: float | None
     #: the paths behind ``fmax``, longest first across every module, each
@@ -146,25 +145,24 @@ class QoR:  # pylint: disable=too-many-instance-attributes
     critical_paths: tuple[TimingPath, ...]
     area: Utilization
     #: the fabric total split by what spends it: units / muxes / regs / memories
-    #: / control. The axis an allocation change trades along, since a fold drops
-    #: a unit and grows the muxes feeding the one it folded onto.
+    #: / control. A fold trades along this axis, dropping a unit and growing the
+    #: muxes feeding the one it folded onto.
     by_kind: dict[str, Utilization]
     by_func: dict[str, Utilization]  # per emitted module
-    #: resources whose figure is a COUNT rather than a model of one. A QoR that
-    #: cannot tell the two apart gets quoted as a utilization figure, which the
-    #: estimated half is not.
+    #: resources whose figure is a count rather than a model of one, so it may
+    #: be quoted as a utilization figure where the estimated half may not.
     counted: frozenset[str]
     #: structures with no cost row, by kind. Reported, never dropped: a silently
     #: unpriced structure reads as a cheaper design.
     unmodelled: dict[str, int]
     mem_bits: int  # stored bits, every instance counted, apart from the fabric totals
-    #: flip-flops the emitted design DECLARES, from the register ledger, and so a
+    #: flip-flops the emitted design declares, from the register ledger, so a
     #: count. ``area.ff`` is the modelled figure beside it: what the part holds
-    #: once the deep chains are extracted into SRLs.
+    #: once deep chains are extracted into SRLs.
     reg_bits: int
-    #: what fraction of each declared resource ``area`` occupies, keyed by the
-    #: device's own resource names. A resource the part does not declare is
-    #: absent rather than zero.
+    #: fraction of each declared resource ``area`` occupies, keyed by the
+    #: device's resource names. A resource the part does not declare is absent,
+    #: not zero.
     utilization: dict[str, float]
 
     @property

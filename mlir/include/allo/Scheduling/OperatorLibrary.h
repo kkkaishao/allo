@@ -46,7 +46,6 @@ namespace mlir::allo {
 /// latter returning nullopt for an advanced mnemonic such as `sqrt`.
 using OpKind = OpKindEnum;
 
-/// Classify \p op into its abstract kind.
 OpKind classify(Operation *op);
 
 /// The abstract kind a combinational realization is priced under, for a caller
@@ -70,28 +69,28 @@ std::optional<CombOpKindEnum> combKindOf(Operation *op);
 /// flip. An IP row matches by `kind` + an exact operand/result element-type
 /// list; an advanced row additionally by `mlirOp`.
 struct OperatorEntry {
-  OpKind kind = OpKind::Unknown; // abstract kind (Unknown on an advanced row).
-  std::string mlirOp;            // advanced: raw MLIR op name (else empty).
-  bool comb = false;             // a synthesized combinational row.
-  llvm::SmallVector<Type> argTypes; // IP/advanced: exact operand element types.
-  llvm::SmallVector<Type> resTypes; // IP/advanced: exact result element types.
+  OpKind kind = OpKind::Unknown; // Unknown on an advanced row
+  std::string mlirOp;            // advanced: raw MLIR op name, else empty
+  bool comb = false;
+  llvm::SmallVector<Type> argTypes; // IP/advanced: exact operand element types
+  llvm::SmallVector<Type> resTypes; // IP/advanced: exact result element types
 
   uint32_t latency = 0;  // cycles
   bool pipelined = true; // accepts a new input every cycle
-  double inDelay = 0.0;  // ns, IP rows: the signature pins the width
+  double inDelay = 0.0;  // ns; IP rows: signature pins the width
   double outDelay = 0.0;
-  /// The least clock period the row's internal stages are warranted at (ns).
-  /// Zero claims nothing; the boundary cones are the only gate then.
+  /// Least clock period the row's internal stages are warranted at (ns); zero
+  /// claims nothing, leaving the boundary cones the only gate.
   double minPeriod = 0.0;
-  /// Nonzero on a row measured with its inputs extensions of this many
-  /// significant bits: a candidate only for operations proven that narrow.
+  /// Nonzero when the row was measured with inputs extended from this many
+  /// significant bits; a candidate only for operations proven that narrow.
   unsigned fedWidth = 0;
-  /// Comb rows: the delay as a function of the operand width. Null on an IP
-  /// row, whose signature fixes one width and so one delay.
+  /// Comb rows: delay as a function of operand width. Null on an IP row, whose
+  /// signature fixes one width and so one delay.
   CostAttr delay;
-  std::string symbol; // the injected `dcp.operator` sym_name (IP rows only).
-  ArrayAttr uses;     // what one instance spends, null where the device is
-                      // silent (see `OperatorLibrary::priceOf`).
+  std::string symbol; // injected `dcp.operator` sym_name, IP rows only
+  ArrayAttr uses;     // what one instance spends; null where the device is
+                      // silent (`priceOf`)
 };
 
 /// The width one operator row is characterized at for \p op: its widest integer
@@ -109,20 +108,20 @@ int64_t combParamWidth(Operation *op);
 /// slack, ask this, so they cannot disagree about what the schedule left.
 bool isZeroDelay(Operation *op);
 
-/// What a scheduling problem registers for ONE node: the operator type it runs
-/// under, and the timing that type carries. The shape the three kinds of node
-/// agree on, whatever answered for them (`populateOperatorTypes`): a device
-/// operator row, a callee's own schedule, or a storage port.
+/// What a scheduling problem registers for one node: the operator type it runs
+/// under and the timing that type carries. Common to the three kinds of node
+/// (`populateOperatorTypes`): a device operator row, a callee's own schedule,
+/// or a storage port.
 ///
-/// `typeName` is the KEY, so two nodes registered under one name must carry
-/// the same timing, and anything that makes a node cost differently has to
-/// reach the name too (an access's address cone does).
+/// `typeName` is the key, so two nodes under one name must carry the same
+/// timing; anything that makes a node cost differently has to reach the name
+/// too (an access's address cone does).
 struct NodeTiming {
   std::string typeName;
   uint32_t latency = 0;
   double inDelay = 0.0;  // ns, from an operand to this node
   double outDelay = 0.0; // ns, from this node to its consumer
-  double minPeriod = 0.0; // ns, the least period the unit behind it holds
+  double minPeriod = 0.0; // ns, least period the unit behind it holds
 };
 
 /// The least period one row or node needs for a cycle of its own.
@@ -133,20 +132,18 @@ inline float periodNeed(float regFloor, double inDelay, double outDelay,
 }
 
 /// What a lookup resolves for one operation: the timing row it is scheduled
-/// under, and what the library additionally knows about the unit behind it.
-/// Two separate keys: the scheduling problem prices `timing.typeName`, while
-/// an allocation limit, the binder's share test and the emitted module name
-/// all key on `identity`.
+/// under, and what the library knows about the unit behind it. Two keys: the
+/// scheduling problem prices `timing.typeName`, while an allocation limit, the
+/// binder's share test and the emitted module name all key on `identity`.
 struct OperatorChar {
-  NodeTiming timing; // stable: one Problem::OperatorType per matched entry
+  NodeTiming timing; // one Problem::OperatorType per matched entry
   /// Whether one instance accepts a new input every cycle. False bounds a
-  /// cyclic region's interval (`populateOperatorOccupancy`) and keeps the
-  /// operator out of a cyclic allocation (`populateOperatorAllocation`).
+  /// cyclic region's interval (`populateOperatorOccupancy`) and bars the
+  /// operator from a cyclic allocation (`populateOperatorAllocation`).
   bool pipelined = true;
-  /// What ONE instance of the matched row costs in the device's currency
-  /// (`OperatorLibrary::priceOf`), at this operation's own width. Zero where
-  /// the device prices the row at nothing and where it prices it not at all,
-  /// which are the same thing to an objective.
+  /// What one instance of the matched row costs in the device's currency
+  /// (`priceOf`), at this operation's width. Zero both where the device prices
+  /// the row at nothing and where it prices it not at all.
   int64_t price = 0;
   OperatorIdentity identity; // empty for an op no functional unit is built for
 };
@@ -176,25 +173,22 @@ public:
 
   /// Every IP row that could realize \p op at the selection period, each as the
   /// characterization `lookup` would resolve had selection picked it: the
-  /// non-comb rows of `matchEntries` that fit the period and are measured at
-  /// \p op's width, in declaration order. The row `lookup` resolves is always
-  /// among them when it is an IP: selection ranks fit rows first, and a derate
-  /// raises the period until one fits. \p withComb appends the combinational
-  /// row too, where it is measured at the width and its chain fits the period.
+  /// non-comb `matchEntries` rows that fit the period and are measured at \p
+  /// op's width, in declaration order. The row `lookup` resolves is among them
+  /// whenever it is an IP. \p withComb also appends the combinational row where
+  /// it is measured at the width and its chain fits the period.
   SmallVector<OperatorChar, 2> candidateChars(Operation *op,
                                               bool withComb = false) const;
 
-  /// The clock period (ns) selection ranks IP rows against: a row that fits it
-  /// outranks one that does not. Set when the module's period resolves and
-  /// before any problem is built, and set again on a derate, so every lookup a
-  /// schedule registers ranks against the period it is scheduled at. Unset
-  /// ranks as if the period were unbounded.
+  /// The clock period (ns) selection ranks IP rows against: a fitting row
+  /// outranks a non-fitting one. Set when the module period resolves and again
+  /// on a derate, so every lookup ranks against the period it schedules at.
+  /// Unset ranks as if the period were unbounded.
   void setSelectionPeriod(float ns) { selectionPeriodNs = ns; }
 
-  /// The symbol of every IP row that could realize \p op, whichever of them
-  /// the period makes `selectImplementation` pick. What the pre-schedule stall
-  /// contract check has to hold, since selection is settled only once the
-  /// period is.
+  /// The symbol of every IP row that could realize \p op, whichever one the
+  /// period makes `selectImplementation` pick. Held by the pre-schedule stall
+  /// contract check, since selection settles only once the period does.
   SmallVector<StringRef, 2> candidateIPs(Operation *op) const;
 
   /// Whether \p op needs an IP realization (a float or advanced compute op) but
@@ -290,9 +284,8 @@ public:
   /// wire and not a chain.
   int64_t chainPrice(int64_t depth, int64_t width) const;
 
-  /// What ONE cycle of an activation pulse chain costs: one more stage of a
-  /// one-bit chain, which is a flip-flop wherever the device says so without
-  /// this layer having to know the symbol it says it under.
+  /// What one cycle of an activation pulse chain costs: one more stage of a
+  /// one-bit chain, a flip-flop wherever the device says so.
   int64_t pulsePrice() const;
 
   /// The measured `dcp.mux` delay row over fan-in and its unitless width
@@ -358,11 +351,11 @@ inline constexpr double kMuxDelayMargin = 1.4;
 /// conservative direction. Zero for a single source, which is a wire.
 double muxCone(const OperatorLibrary &lib, unsigned sources, unsigned width);
 
-/// The device as the compiler reads it: what it can COMPUTE and what it can
-/// STORE IN. Two peer models of one `dcp.device`, neither part of the other,
-/// travelling together because everything that schedules or emits a region
-/// needs both: an operation is timed by an operator row, an access by its
-/// storage, and an access's ADDRESS is arithmetic timed by an operator row.
+/// The device as the compiler reads it: what it can compute and what it can
+/// store in. Two peer models of one `dcp.device`, neither part of the other,
+/// carried together because scheduling or emitting a region needs both: an
+/// operation is timed by an operator row, an access by its storage, and an
+/// access's address is arithmetic timed by an operator row.
 struct DeviceModel {
   OperatorLibrary operators;
   MemoryLibrary memory;
@@ -405,44 +398,42 @@ scheduledCallLatency(Operation *op) {
 /// not an `OperatorChar`: an access builds no functional unit, so there is no
 /// identity to name, nothing to price and nothing to share.
 ///
-/// Both libraries answer for it. Its length and port delay are the storage's
-/// (\p memLib); the address cone feeding that port is ARITHMETIC, priced
-/// against \p opLib's combinational rows. The two meet here rather than inside
-/// either library, because a scheduling problem is the only thing that needs
-/// them added up.
+/// Both libraries answer for it: its length and port delay are the storage's
+/// (\p memLib); the address cone feeding that port is arithmetic, priced
+/// against \p opLib's combinational rows. They meet here because a scheduling
+/// problem is the only thing that adds them up.
 NodeTiming accessCharacterization(Operation *op, const OperatorLibrary &opLib,
                                   const MemoryLibrary &memLib);
 
-/// The rows an exact solve may choose among for \p op, the library's own pick
-/// among them: at least two fit, measured candidates that differ somewhere
-/// a schedule can see (latency, a delay, a price). Empty where the
-/// realization is not a solver decision: a default realization, a
-/// zero-delay rename, a single usable candidate, a zero-latency row with
-/// unequal delays (`checkDelays` rejects it), or under \p cyclic a pick the
-/// pipelined-only limit drops (an occupancy window that varied with the
-/// decision would move the interval bound the search starts from).
+/// The rows an exact solve may choose among for \p op, plus the library's own
+/// pick: at least two measured candidates that fit and differ somewhere a
+/// schedule can see (latency, a delay, a price). Empty where the realization
+/// is not a solver decision: a default realization, a zero-delay rename, a
+/// single usable candidate, a zero-latency row with unequal delays
+/// (`checkDelays` rejects it), or under \p cyclic a pick the pipelined-only
+/// limit drops (an occupancy window varying with the decision would move the
+/// interval bound the search starts from).
 ///
 /// \p withComb admits the combinational row beside the IPs, letting a resource
 /// weight steer an operation between fabrics. Only the area objective passes
-/// it: the cycles order would take the zero-latency comb row on span wherever
-/// its chain fits.
+/// it: the cycles order would take the zero-latency comb row wherever its chain
+/// fits.
 ///
-/// An operation with choices joins no STATIC class:
-/// `populateOperatorAllocation` skips it, and the exact solve folds it into
-/// the class of the row it decides (a shared class), straight-line and
-/// modulo alike.
+/// An operation with choices joins no static class:
+/// `populateOperatorAllocation` skips it, and the exact solve folds it into the
+/// class of the row it decides (a shared class), straight-line and modulo
+/// alike.
 SmallVector<OperatorChar, 2> selectionCandidates(Operation *op,
                                                  const OperatorLibrary &lib,
                                                  bool cyclic, bool withComb);
 
 /// Assign an operator type (latency + chaining delays) to every operation
-/// \p problem holds. Three sources, because a problem holds three kinds of
-/// node: an operator row for a compute op, the callee's own schedule for a
-/// sync call, and the storage plus its address cone for an access.
+/// \p problem holds. Three sources for the three kinds of node: an operator row
+/// for a compute op, the callee's own schedule for a sync call, and the storage
+/// plus its address cone for an access.
 ///
-/// Over the problem's OWN operations and not a second walk of the IR: each
-/// builder registers every op it walks, and nothing runs between a build and
-/// this to change that set, so the problem is what holds the list.
+/// Over the problem's own operations, not a second walk of the IR: each builder
+/// registers every op it walks and nothing changes that set in between.
 template <class ProblemT>
 void populateOperatorTypes(ProblemT &problem, const OperatorLibrary &lib,
                            const MemoryLibrary &memLib) {
@@ -474,13 +465,13 @@ void populateOperatorTypes(ProblemT &problem, const OperatorLibrary &lib,
 }
 
 /// Reserve a limit-1 resource, held for `latency + 1` cycles, for every sync
-/// sub-kernel call in a counted loop body: it is one child instance re-fired
-/// per iteration, not a pipelined operator, and the loop controller starts the
-/// next invocation on the previous one's `done` plus the cycle it takes to
-/// re-arm. Keyed per callsite, since distinct calls are distinct instances.
+/// sub-kernel call in a counted loop body: one child instance re-fired per
+/// iteration, not a pipelined operator, with the loop controller starting the
+/// next invocation on the previous one's `done` plus a cycle to re-arm. Keyed
+/// per callsite, since distinct calls are distinct instances.
 ///
-/// A straight-line region needs none: each of its callsites issues once, so
-/// there is no second invocation for an occupancy window to hold off.
+/// A straight-line region needs none: each callsite issues once, so there is no
+/// second invocation for an occupancy window to hold off.
 inline void populateCallOccupancy(ChainingModuloProblem &problem) {
   using P = circt::scheduling::Problem;
   unsigned idx = 0;
@@ -498,25 +489,24 @@ inline void populateCallOccupancy(ChainingModuloProblem &problem) {
   }
 }
 
-/// Reserve a PRIVATE limit-1 resource, held for the operator's whole latency,
-/// for every operation on a NON-PIPELINED operator. Such a unit takes one input
-/// per latency window, so a modulo schedule that re-issues the same operation
-/// every II cycles needs `II >= latency`. Without this the model lets a
-/// non-pipelined IP run at II=1 and the emitter builds a datapath that feeds it
-/// faster than it can accept.
+/// Reserve a private limit-1 resource, held for the operator's whole latency,
+/// for every operation on a non-pipelined operator. Such a unit takes one input
+/// per latency window, so a modulo schedule re-issuing the operation every II
+/// cycles needs `II >= latency`. Without it the model lets a non-pipelined IP
+/// run at II=1 and the emitter feeds it faster than it can accept.
 ///
 /// The window is the latency itself, the span `reservationOf` marks the unit
-/// busy for, so what bounds the interval here and what the binder checks a unit
-/// against are ONE number.
+/// busy for, so the interval bound here and the binder's unit check are one
+/// number.
 ///
-/// Private per operation, because this prices an operation against ITSELF one
-/// iteration on, which holds however many units the region builds. What a unit
-/// SHARED between two operations costs is `populateOperatorAllocation`'s, and
-/// it declines a non-pipelined operator in a cyclic region for want of a
+/// Private per operation, since this prices an operation against itself one
+/// iteration on, holding for however many units the region builds. A unit
+/// shared between two operations is `populateOperatorAllocation`'s, which
+/// declines a non-pipelined operator in a cyclic region for want of a
 /// circular-arc colouring, leaving every such operation the unit this bounds.
 ///
-/// Only an IP row can be non-pipelined: a comb row and the default row are
-/// zero-latency and pipelined, and a memory access is timed by its storage.
+/// Only an IP row can be non-pipelined: comb and default rows are zero-latency
+/// and pipelined, and a memory access is timed by its storage.
 ///
 /// A straight-line region needs none: it issues each operation once, so there
 /// is no second issue for a window to hold off.
@@ -556,34 +546,30 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
 // operator can host two operations.
 //===----------------------------------------------------------------------===//
 
-/// Declare one allocatable resource per operator identity this region could
-/// build fewer copies of than it has operations. Scope:
+/// Which operations `populateOperatorAllocation` folds onto shared units. It
+/// declares one allocatable resource per operator identity a region could build
+/// fewer copies of than it has operations, under these limits:
 ///
 ///   * IP identities only. Folding a combinational operator pays for a
 ///     multiplexer nearly as wide as the operator itself (a 32-bit adder is
 ///     ~32 LUTs against ~64 of mux).
 ///   * At least two operations, or there is nothing to fold.
 ///   * In a cyclic region, a one-cycle occupancy. Past one cycle the
-///     reservation window wraps the initiation interval and a count per
-///     congruence class no longer implies that many units suffice
-///     (circular-arc colouring). Acyclic windows form an interval graph, where
-///     the count is exactly the chromatic number, so any occupancy is fine.
+///     reservation window wraps the II and a count per congruence class no
+///     longer implies that many units suffice (circular-arc colouring). Acyclic
+///     windows form an interval graph, where the count is the chromatic number,
+///     so any occupancy is fine.
 ///
-/// What `n` instances cost is what the DEVICE charges for `n` of them, in the
-/// currency the rest of the objective is in: `n` copies of the measured core,
-/// plus the multiplexer that many puts in front of every operand port. An
-/// UPPER bound on the multiplexer, since two operations sharing a driver need
-/// no select between them and the emitter builds one only where the drivers
-/// differ.
+/// `n` instances cost what the device charges for `n`: `n` copies of the
+/// measured core plus the multiplexer that many put in front of every operand
+/// port, an upper bound since operations sharing a driver need no select and
+/// the emitter builds one only where drivers differ.
 ///
-/// Which operations join a class. `All` declares every operation at the
-/// library's own pick. `Static` skips an operation with selection candidates,
-/// since a class groups one static identity and the solve may move the
-/// operation off it; the exact model re-composes such operations into the
-/// class of whichever row they decide, merging with the static members this
-/// declares. `Selecting` takes only those skipped operations, grouped at the
-/// library's own pick, which is what a solve that decided nothing realizes
-/// them as.
+/// `All` declares every operation at the library's own pick. `Static` skips an
+/// operation with selection candidates, since the solve may move it off its
+/// static identity; the exact model re-composes it into the class of the row it
+/// decides, merging with the static members. `Selecting` takes only those
+/// skipped operations, at the library's own pick.
 enum class AllocationScope { All, Static, Selecting };
 
 template <class ProblemT>

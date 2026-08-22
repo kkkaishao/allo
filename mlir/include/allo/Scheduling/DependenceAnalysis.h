@@ -24,24 +24,23 @@ struct AssumedRange {
   std::optional<int64_t> ub;
 };
 
-/// What one counted loop runs, as everything downstream of the analysis needs
-/// it. A returned pair rather than a count plus a `bool &`, since a caller
-/// composing a tree of these has to combine both halves.
+/// What one counted loop runs: an iteration count plus whether that count is
+/// only an upper bound.
 struct LoopTrip {
   /// Iterations, or empty when nothing bounds them.
   std::optional<int64_t> count;
-  /// `count` is a WORST CASE derived from an `allo.assume.ssa` range rather
-  /// than a compile-time constant, so every span composed from it is a bound
-  /// and not an exact number of cycles.
+  /// `count` is a worst case from an `allo.assume.ssa` range, not a compile-time
+  /// constant, so every span composed from it is a bound, not an exact cycle
+  /// count.
   bool bounded = false;
 };
 
 /// The dependence distance carried by the counted loop at 1-based nesting depth
 /// \p level among a dependence's shared enclosing loops, projected from its
-/// components (outermost -> innermost). Sets \p drop when an OUTER loop carries
-/// the dependence, whose sequential execution already satisfies it. Sets \p
-/// valid = false when \p level is deeper than the shared loop nest. A
-/// loop-independent dependence has no components and maps to distance 0.
+/// components (outermost -> innermost). Sets \p drop when an outer loop already
+/// satisfies the dependence by its sequential execution. Sets \p valid = false
+/// when \p level is deeper than the shared loop nest. A loop-independent
+/// dependence has no components and maps to distance 0.
 int64_t
 carriedDistanceAtLevel(llvm::ArrayRef<affine::DependenceComponent> comps,
                        unsigned level, bool &drop, bool &valid);
@@ -77,16 +76,8 @@ public:
   }
 
   /// What \p loop (an `affine.for` or `scf.for`) runs: its exact count where
-  /// that is compile-time, else the worst case the `allo.assume.ssa` ranges of
-  /// its symbolic bounds admit, else empty.
-  ///
-  /// It lives here because the assumption ranges do: a symbolic trip is bounded
-  /// by the same facts this analysis distilled, and the scheduler, its span
-  /// composer and the trip-bound record all ask for one loop's trip.
-  ///
-  /// Memoized: the boundary expansion, the solve, the span composition and the
-  /// trip-bound record each ask for the same loop, and the answer is a function
-  /// of IR this analysis is only valid over anyway.
+  /// that is compile-time, else the worst case its symbolic bounds admit under
+  /// the `allo.assume.ssa` ranges, else empty. Memoized.
   LoopTrip tripOf(Operation *loop) const;
 
 private:
@@ -99,10 +90,9 @@ private:
 
 /// Whether \p op carries a memory effect this analysis does not model
 /// (`memref.copy`, `atomic_rmw`, `dma_*`). Such an op joins no access list, so
-/// its dependences would be DROPPED and anything scheduled around it may race;
-/// `verify-rtl-legality` rejects one before scheduling. The list here is the
-/// complement of the access kinds the constructor's walk collects, so the two
-/// must be edited together.
+/// its dependences would be dropped and anything scheduled around it may race;
+/// `verify-rtl-legality` rejects one before scheduling. The complement of the
+/// access kinds the constructor's walk collects, so edit the two together.
 bool isUnmodeledMemoryAccess(Operation *op);
 
 } // namespace mlir::allo

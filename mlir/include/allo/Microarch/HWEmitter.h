@@ -4,7 +4,7 @@
  */
 
 //===----------------------------------------------------------------------===//
-// PER-REGION emission, split by role along the control/datapath (F/G) seam.
+// Per-region emission, split by role along the control/datapath (F/G) seam.
 // ControlEmitter is control (G), DatapathEmitter is datapath (F), HWEmitter the
 // orchestrator. Elasticity (H) is derived per region by `deriveStallShell` and
 // handed to each side: G takes `issueEnable`, F takes `chainEnable`.
@@ -64,8 +64,7 @@ struct Terminator {
     return kind == Kind::Conditional ? c.notBit(cond) : ge(c, ivStep, ub);
   }
   /// The region is empty (issues nothing): lb >= ub. A while is never empty
-  /// here; its zero-iteration case is the condition false on iteration 0,
-  /// handled by the normal exit pulse.
+  /// here; its zero-iteration case is the condition false on iteration 0.
   Value isEmpty(EmitContext &c) const {
     return kind == Kind::Conditional ? c.f1 : ge(c, lb, ub);
   }
@@ -86,7 +85,7 @@ struct RegionControl {
                // shell's enable)
   Value
       counter; // iteration index (Source::Counter); null for an acyclic region
-  Value wantIssue; // the UNgated issue desire (issue before `& enable`): the
+  Value wantIssue; // the ungated issue desire (issue before `& enable`): the
                    // stall shell hazards a stage-0 stream access on this, not
                    // the gated issue, to stay combinationally acyclic
   Value running;   // the region is executing: the counter reloads its lower
@@ -99,8 +98,7 @@ struct RegionControl {
   /// Null unless a schedule-paced controller runs at II > 1.
   Value phase;
   /// One register per `RegionBlock::addrStrides` entry, holding that multiple
-  /// of `counter`. Updated by the same expression as the counter, so the two
-  /// cannot fall out of step.
+  /// of `counter`, updated by the same expression as the counter.
   llvm::SmallVector<Value> scaledCounters;
 };
 
@@ -122,10 +120,10 @@ struct DatapathFeedback {
 };
 
 //===----------------------------------------------------------------------===//
-// IterationControl: the output of a DONE-DRIVEN controller, one whose
-// iterations are paced by the body COMPLETING rather than by the schedule's own
+// IterationControl: the output of a done-driven controller, one whose
+// iterations are paced by the body completing rather than by the schedule's own
 // cadence. `rc.issue` is the body-launch pulse; `done` is latched here rather
-// than by `emitDone`, a done-driven region having no drain to count.
+// than by `emitDone`.
 //===----------------------------------------------------------------------===//
 struct IterationControl {
   RegionControl rc;
@@ -149,7 +147,7 @@ struct ControlEmitter {
                                     const Terminator &term, Value start,
                                     const StallShell &sh) const;
   /// The scaled counters of \p rb: one register per `addrStrides` entry, each
-  /// at its OWN width (`AddrStride::width`) rather than the counter's. \p
+  /// at its own width (`AddrStride::width`) rather than the counter's. \p
   /// update is the counter's next-value expression with `lb` and `step` scaled,
   /// supplied by the caller since the two controller families disagree about
   /// it. \p bypassStart mirrors a done-driven counter's start-cycle bypass. A
@@ -172,7 +170,7 @@ struct ControlEmitter {
                               const Terminator &term, Value start,
                               const StallShell &sh) const;
   /// The straight-line control skeleton: one pass, no counter. The pass is
-  /// DEFERRED while `sh.issueEnable` is low rather than dropped, which lets a
+  /// deferred while `sh.issueEnable` is low rather than dropped, letting a
   /// stage-0 stream access wait for its handshake. A rigid shell issues
   /// unconditionally and builds no state at all.
   RegionControl emitAcyclic(unsigned region, Value start,
@@ -237,14 +235,14 @@ struct DatapathEmitter {
   // A region's controller outputs, the G->F seam. `counter` is null for an
   // acyclic region; `wantIssue` is null when the region has no stall shell.
   DenseMap<unsigned, RegionControl> controlOf;
-  // Each region's counter widened to `kIndexWidth`. The counter REGISTER is
+  // Each region's counter widened to `kIndexWidth`. The counter register is
   // only as wide as its own induction range needs (`RegionBlock::counterType`);
-  // a datapath READ of it is an ordinary index, so this is the second, wider
+  // a datapath read of it is an ordinary index, so this is the second, wider
   // wire.
   DenseMap<unsigned, Value> counterIndex;
   // H's output per region. An access or a shared-unit mux is timed against the
-  // shell of the region that OWNS it, which need not be the one currently
-  // emitting. An unregistered region is RIGID (the default `StallShell`).
+  // shell of the region that owns it, which need not be the one currently
+  // emitting. An unregistered region is rigid (the default `StallShell`).
   DenseMap<unsigned, StallShell> shellOf;
   DenseMap<uint64_t, Value> streamReadData; // (channel id, access idx) -> the
                                             // input-stream data port value
@@ -347,10 +345,8 @@ struct DatapathEmitter {
   void finalizeForwards();
 
   /// One store to an internal array, held back so the stores coloured onto the
-  /// same write port can be muxed onto one `seq.write`. A port per static write
-  /// defeats block-RAM inference and drops the array into a register file; the
-  /// colouring spreads the stores over at most two ports, which infer a true
-  /// dual port.
+  /// same write port can be muxed onto one `seq.write`. The colouring spreads
+  /// the stores over at most two ports so block-RAM inference holds.
   struct SharedWrite {
     unsigned bank; // the bank this store commits to (0 when unbanked)
     unsigned port; // the write port it was coloured onto
@@ -376,16 +372,15 @@ struct DatapathEmitter {
     /// contribution time being still a promise.
     std::optional<unsigned> ownerRegion;
   };
-  /// A MapVector, not a DenseMap: the finalize iterates it to drive the ports,
-  /// and the emitted module must not depend on a hash order.
+  /// A MapVector so the finalize's port-driving order is stable, not
+  /// hash-ordered.
   llvm::MapVector<std::tuple<unsigned, unsigned, unsigned>, SharedReadPort>
       sharedReads;
 
   /// Stores to an external array's port group, keyed by the group's base name
   /// (a StringRef into the model's `portBase`/`topBase`) so a child mastering
-  /// the same (bank, port) colour joins the accesses' arms. A MapVector, not a
-  /// DenseMap: `finalizeBoundaryWritePorts` iterates it to drive the ports, and
-  /// the emitted module must not depend on a hash order.
+  /// the same (bank, port) colour joins the accesses' arms. A MapVector for a
+  /// stable port-driving order.
   llvm::MapVector<llvm::StringRef, SmallVector<SinkArm, 2>> boundaryWrites;
 
   /// The same for a boundary read port group's address output. A group several
@@ -404,12 +399,11 @@ struct DatapathEmitter {
   };
   DenseMap<unsigned, StreamWires> streamWires; // internal channels only
 
-  /// Body wires of a channel whose ends are CHILD PORTS (`callEnds`): the
-  /// producer end's `ready` and, per CONSUMER end, its `{data, valid}`. Both
-  /// halves are backedges because the child's input ports must exist before the
-  /// FIFO that will drive them, and the FIFO needs the child's outputs. One
-  /// entry per consumer: several readers are a FAN-OUT, each owning its own
-  /// FIFO so per-consumer buffering decouples them.
+  /// Body wires of a channel whose ends are child ports (`callEnds`): the
+  /// producer end's `ready` and, per consumer end, its `{data, valid}`. Both
+  /// halves are backedges, the child's input ports existing before the FIFO
+  /// that drives them and the FIFO needing the child's outputs. One entry per
+  /// consumer: several readers fan out, each owning its own FIFO.
   struct ComposedWires {
     circt::Backedge prodReady;
     llvm::SmallVector<circt::Backedge, 1> sinkData, sinkValid;
@@ -515,7 +509,7 @@ struct DatapathEmitter {
     survivorOf[accKey(region, port)] = v;
   }
   /// Register region \p region's stall shell, the H seam. The orchestrator
-  /// registers a PROMISE (two backedges) before F and G emit against it, then
+  /// registers a promise (two backedges) before F and G emit against it, then
   /// re-registers the derived shell once `deriveStallShell` resolves them.
   void setShell(unsigned region, const StallShell &sh) { shellOf[region] = sh; }
   /// Region \p region's stall shell; rigid for an unregistered region. Stamped
@@ -578,9 +572,9 @@ struct DatapathEmitter {
   /// on the n-th iteration; a container's own units carry none
   /// (`assertModelInvariants`).
   void emitUnits(const uarch::RegionBlock &rb);
-  /// Emit a sequential (CHECK/RUN) while's condition cone: the container's OWN
+  /// Emit a sequential (check/run) while's condition cone: the container's own
   /// condition memory reads plus its compute. Returns the settled condition
-  /// with its ready latency `t_cond`, the cycles after CHECK-start at which it
+  /// with its ready latency `t_cond`, the cycles after check-start at which it
   /// is valid (0 for a combinational condition). The read address is the frozen
   /// iter-arg survivor, so the loaded value is a stable wire across the CHECK
   /// window; the caller samples it at `delayValid(checkStart, t_cond)`.
@@ -602,7 +596,7 @@ struct DatapathEmitter {
                       llvm::function_ref<Value()> commit, const StallShell &sh);
 
   /// Instantiate each CallUnit (dcp.instance) in region \p rb as a child
-  /// `hw.instance` and fold the child's `done` into \p fb.callDone. Runs BEFORE
+  /// `hw.instance` and fold the child's `done` into \p fb.callDone. Runs before
   /// the region's own register heads and accesses, since a call's scalar result
   /// is an ordinary datapath Source a register chain or a store may read.
   void emitCalls(const uarch::RegionBlock &rb, Value issue,
@@ -780,7 +774,7 @@ struct HWEmitter {
   /// issue pulse itself for an acyclic region. The pulse `emitDone` and
   /// `captureResults` both key off.
   Value lastIssuePulse(const RegionControl &rc, const Terminator &term);
-  /// Capture LEAF region \p rb's results into the survivor registers a sibling
+  /// Capture leaf region \p rb's results into the survivor registers a sibling
   /// reads, each at its own ready cycle relative to \p captureOn; returns the
   /// region's result-drain stage. \p captureOn is the last iteration's issue
   /// pulse for a counted loop and each continuing iteration's for a while.
