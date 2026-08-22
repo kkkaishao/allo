@@ -816,8 +816,8 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
   if (ii)
     s.interval = (int64_t)*ii;
   s.millis = std::chrono::duration<double, std::milli>(now() - since).count();
-  // Config from the options, outcome from the solver's own telemetry, so a
-  // reader can judge a result (optimal? reproducible?) without re-solving.
+  // Config from the options, outcome from the solver's telemetry, so a reader
+  // can judge the result without re-solving.
   if (usesExactScheduler(opts.kind)) {
     s.solver = "cpsat";
     s.workers = opts.workers;
@@ -828,7 +828,7 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
     s.fallback = problem.telemetry.fallback;
     s.exhaustedAtII = problem.telemetry.exhaustedAtII;
     // One worker has nobody to race, so it stays reproducible under a held
-    // budget whatever the knob says.
+    // budget regardless of the knob.
     s.deterministic = (opts.deterministic || opts.workers == 1) &&
                       !problem.telemetry.budgetExhausted;
   } else {

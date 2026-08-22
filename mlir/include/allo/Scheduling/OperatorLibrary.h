@@ -422,10 +422,10 @@ NodeTiming accessCharacterization(Operation *op, const OperatorLibrary &opLib,
 /// pipelined-only limit drops (an occupancy window that varied with the
 /// decision would move the interval bound the search starts from).
 ///
-/// \p withComb admits the combinational row beside the IPs, which is what
-/// lets a resource weight steer an operation between fabrics. Only the area
-/// objective passes it: the cycles order would take the zero-latency comb row
-/// on span wherever its chain fits, a flip no price can veto.
+/// \p withComb admits the combinational row beside the IPs, letting a resource
+/// weight steer an operation between fabrics. Only the area objective passes
+/// it: the cycles order would take the zero-latency comb row on span wherever
+/// its chain fits.
 ///
 /// An operation with choices joins no STATIC class:
 /// `populateOperatorAllocation` skips it, and the exact solve folds it into

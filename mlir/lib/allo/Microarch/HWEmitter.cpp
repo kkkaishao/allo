@@ -269,7 +269,7 @@ unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
 // drains (the first on `start`); returns the last region's drain pulse. A
 // `handoffSafe` predecessor hands its successor its completion pulse directly,
 // a cycle ahead of the latched done, since its state has already settled.
-// Nothing here reads a done LEVEL, so no region along the chain builds one.
+// Nothing here reads a done level, so no region along the chain builds one.
 Value HWEmitter::sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
                           bool retrig, bool tailOnPulse) {
   Value drain;

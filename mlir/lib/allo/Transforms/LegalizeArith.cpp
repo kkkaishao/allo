@@ -965,10 +965,9 @@ struct FuseMulAdd : OpRewritePattern<arith::AddIOp> {
   FuseMulAdd(MLIRContext *ctx, OperatorLibrary &lib, bool areaGate)
       : OpRewritePattern(ctx), lib(lib), areaGate(areaGate) {}
   OperatorLibrary &lib;
-  /// Under the area objective the fusion must pay for itself: the fused core
-  /// is refused where it prices above the multiply's cheapest row plus the
-  /// combinational add it replaces. The cycles order fuses unconditionally,
-  /// since the span win is what it optimizes.
+  /// Under the area objective the fusion must pay for itself: refused where the
+  /// fused core prices above the multiply's cheapest row plus the combinational
+  /// add it replaces. The cycles order fuses unconditionally.
   bool areaGate;
 
   /// The cheapest priced realization of \p op, comb rows included; nullopt

@@ -494,12 +494,12 @@ def test_an_address_that_follows_the_counters_is_carried_in_a_register():
     mod = _to_rtl(stencil)
     m = mod.mlir
     assert "comb.mul" not in m, "a constant stride survived on the address path"
-    # One scaled counter per NON-UNIT level: the outer two multiply their
-    # counter (400, 20) so they ride their own registers, at the outermost also
-    # a second one whose reset value carries `out`'s constant 421 off the memory
+    # One scaled counter per non-unit level: the outer two multiply their
+    # counter (400, 20) and ride their own registers, at the outermost also a
+    # second one whose reset value carries `out`'s constant 421 off the memory
     # port's setup. The innermost term is the bare counter `k` for both accesses
-    # -- `out`'s `k+1` puts the 1 in the base, not the stride -- so it reads the
-    # `k` register directly rather than duplicating it into an `r2_addr0`.
+    # (`out`'s `k+1` puts the 1 in the base, not the stride), so it reads the `k`
+    # register directly rather than duplicating it into an `r2_addr0`.
     assert sorted(set(re.findall(r"r\d+_addr\d+", m))) == [
         "r0_addr0",
         "r0_addr1",
@@ -520,11 +520,9 @@ def test_an_address_that_follows_the_counters_is_carried_in_a_register():
 
 
 def test_a_unit_stride_address_reads_the_counter_and_builds_no_register():
-    # The end of strength reduction: a term that is `1 * counter + 0` is the
-    # counter, so the register the reduction would build holds a bit-for-bit
-    # copy of it, advanced by the same adder on the same enable. The access
-    # reads the counter directly and no `r0_addr` register is built. `B[i]`'s
-    # write and `A[i]`'s read share the one counter.
+    # A term that is `1 * counter + 0` is the counter, so the reduction builds
+    # no register for it: the access reads the counter directly and no `r0_addr`
+    # is built. `B[i]`'s write and `A[i]`'s read share the one counter.
     @kernel
     def copy(A: i32[64], B: i32[64]):
         for i in range(64):
@@ -533,8 +531,8 @@ def test_a_unit_stride_address_reads_the_counter_and_builds_no_register():
     mod = _to_rtl(copy)
     m = mod.mlir
     assert not re.findall(r"r\d+_addr\d+", m), "a unit-stride address kept a register"
-    # The report agrees with the emitter: the counter-aliased stride counts as
-    # no register riding beside the counter, and is flagged so.
+    # The report agrees: a counter-aliased stride counts as no register and is
+    # flagged is_counter.
     region = mod.microarch.funcs[0].regions[0]
     assert region.cost.addr_strides == 0, region.cost.addr_strides
     assert any(s.is_counter for s in region.cost.strides), region.cost.strides
@@ -681,9 +679,8 @@ def test_a_chain_report_carries_the_proven_range():
     from_counter = [c for c in f.chains if c.source == "counter"]
     assert from_counter, f"no counter-fed chain in {f.chains}"
     for c in from_counter:
-        # i runs [0, 16); the hull includes the one-past value 16, which needs 5
-        # unsigned bits, and the non-negative counter is built unsigned, so the
-        # reported range never exceeds the chain's own width.
+        # i runs [0, 16); the one-past value 16 needs 5 unsigned bits, and the
+        # non-negative counter is built unsigned, so range never exceeds width.
         assert c.range_bits == 5 and c.width >= c.range_bits
     # Chains are a subset of the value-role ledger: read-data alignment delays
     # are charged there but built outside the model.

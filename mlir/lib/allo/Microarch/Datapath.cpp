@@ -346,9 +346,8 @@ unitSlack(const FuncUnit &u, const OperatorLibrary &lib, float cycleTime,
   for (const FuncUnit::BoundOp &bo : u.boundOps) {
     if (!bo.z)
       return std::nullopt;
-    // A cone added in front of this unit also delays whatever this op's result
-    // reaches in the same cycle, so a non-unit sink downstream takes its
-    // committed delay out of the room the same way the unit's own does.
+    // A same-cycle non-unit sink downstream takes its committed delay out of
+    // this unit's slack, the same as the unit's own inDelay.
     double tail = sinkTails ? sinkTails->lookup(bo.op) : 0.0;
     slack = std::min(slack, cycleTime - *bo.z - u.inDelay - tail);
   }
@@ -366,9 +365,9 @@ unitSlack(const FuncUnit &u, const OperatorLibrary &lib, float cycleTime,
 
 llvm::DenseMap<Operation *, double> sinkTails(const Datapath &dp) {
   llvm::DenseMap<Operation *, double> out;
-  // Only a unit's own result carries a binding cone into the sink: any other
-  // producer (a constant, a counter, a register tap) is settled when the cycle
-  // starts, and a producer issuing in an earlier cycle hands off in a register.
+  // Only a unit's own result carries a binding cone into the sink: other
+  // producers are settled at cycle start, and an earlier-cycle producer hands
+  // off through a register.
   auto credit = [&](Value v, Operation *sink, double d) {
     Operation *def = v.getDefiningOp();
     if (!def || d <= 0.0 || !dp.opToUnit.contains(def))
@@ -383,9 +382,9 @@ llvm::DenseMap<Operation *, double> sinkTails(const Datapath &dp) {
       if (acc.isWrite)
         credit(cast<dcp::DCPathStoreOp>(acc.op).getValue(), acc.op,
                acc.portDelay);
-      // An address landing in a delay register launches the port path from
-      // that register, out of reach of any unit cone. Unset before
-      // `resolveEdges` decides it, so the pre-binding read is conservative.
+      // An address in a delay register launches the port path from that
+      // register, past any unit cone. addrDelay is unset until `resolveEdges`,
+      // so this pre-binding read is conservative.
       if (acc.addrDelay == 0) {
         auto indices = acc.isWrite
                            ? cast<dcp::DCPathStoreOp>(acc.op).getIndices()

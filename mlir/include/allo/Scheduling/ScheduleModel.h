@@ -131,8 +131,7 @@ struct SolveReport {
   std::string solver;
   int64_t workers = 0, seed = 0;
   double budgetSeconds = 0.0;
-  /// The solver's own verdict; see `SolveTelemetry`. A budget-exhausted solve
-  /// may ship a different schedule on the next run of the same compile.
+  /// The solver's own verdict; see `SolveTelemetry`.
   bool proven = false, budgetExhausted = false, fallback = false;
   std::optional<int64_t> exhaustedAtII;
   /// Whether re-running the compile reproduces this solve's schedule: the

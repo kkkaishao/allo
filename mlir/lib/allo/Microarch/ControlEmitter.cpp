@@ -56,7 +56,7 @@ llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
   // signal exists by the time it is read.
   llvm::SmallVector<Value> wrapped(rb.addrStrides.size());
   for (auto [slot, s] : llvm::enumerate(rb.addrStrides)) {
-    // The stride that IS the counter reads the counter register: same value,
+    // The stride that is the counter reads the counter register: same value,
     // same start-cycle bypass, one register for both. It never carries a digit
     // above it (no wrap), so `wrapped[slot]` stays unset with no consumer.
     if (s.isCounter) {

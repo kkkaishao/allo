@@ -331,11 +331,11 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ip.f2i: IPRow(3, {"lut": 183, "ff": 127, "carry8": 6}),  # 678
     ip.fcvt: IPRow(2, {"lut": 50, "ff": 99, "carry8": 1}),  # 1032
     ip.bf2f: IPRow(2, {"lut": 34, "ff": 53, "carry8": 1}),  # 1181
-    # Each multiply also has a `mullut` row: the same core built out of the
-    # fabric instead of DSP columns, declared at the depth of the DSP row it
-    # competes with. Selection ranks depth before price, so a shorter fabric row
-    # would take every multiply; at one depth the two differ only in what they
-    # spend, which is what a `dsp` resource weight steers between.
+    # Each multiply also carries a `mullut` row: the same core built in fabric
+    # instead of DSP columns, declared at the depth of the DSP row it competes
+    # with. Selection ranks depth before price, so a shorter fabric row would
+    # take every multiply; at equal depth a `dsp` resource weight picks between
+    # them by what each spends.
     ip.imul16: (
         IPRow(3, {"dsp": 1}),  # 1073
         IPRow(1, {"dsp": 1}),  # 544

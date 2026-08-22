@@ -36,10 +36,9 @@ class OperatorLibrary;
 /// A limited operation may also have zero latency here (CIRCT requires
 /// non-zero): a combinational access still occupies its port for the cycle it
 /// issues in and contends like any other.
-/// How one region's solve ran, so a reader can judge the result without
-/// re-running it: `proven` means every deciding status was OPTIMAL, and a
-/// `budgetExhausted` solve may ship a different schedule on the next run of
-/// the same compile.
+/// How one region's solve ran: `proven` means every deciding status was
+/// OPTIMAL, and a `budgetExhausted` solve may ship a different schedule on the
+/// next run of the same compile.
 struct SolveTelemetry {
   bool proven = false;
   bool budgetExhausted = false;
@@ -525,13 +524,11 @@ struct SchedulerOptions {
   bool allocate = false;
   int workers = kDefaultSolveWorkers;
   int seed = kDefaultSolveSeed;
-  /// Whether the workers advance in a fixed interleaved order under the
-  /// deterministic budget, so two identical compiles emit identical RTL. Off,
-  /// above one worker, they race, each held to the budget's share of
-  /// wall-clock (budget / workers seconds): about the budget in core-seconds
-  /// for a fraction of the wall, but which of the equal-cost optima a solve
-  /// lands on, proven or not, depends on thread timing, so no exact solve is
-  /// then reproducible.
+  /// Whether the workers advance in a fixed interleaved order, so two identical
+  /// compiles emit identical RTL. Off, above one worker, they race, each held
+  /// to the budget's share of wall-clock (budget / workers seconds); which
+  /// optimum a solve then lands on depends on thread timing, so no exact solve
+  /// is reproducible.
   bool deterministic = true;
   /// The span the area objective may pay beyond its leash, as a fraction of
   /// the reference span (the heuristic's, or the first solved interval where

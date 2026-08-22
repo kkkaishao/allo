@@ -836,8 +836,7 @@ static std::optional<ValueHull> hullOfValue(Value v, unsigned fuel) {
     return h->lo;
   };
   // A widening cast bounds its result by the source type even where the source
-  // value has no hull of its own, which is how the `extui` of a comparison in a
-  // lowered floor division is bounded.
+  // value has no hull of its own.
   auto typeHull = [](Value v, bool isSigned) -> std::optional<ValueHull> {
     auto ty = dyn_cast<IntegerType>(v.getType());
     if (!ty || ty.getWidth() > 62)
@@ -1602,10 +1601,10 @@ void DatapathBuilder::planAddressGenerators() {
       }
     }
   }
-  // A plain scaled counter whose init and step ARE the region's counter is that
-  // counter, holding the same value cycle for cycle. The emitter reads
-  // `rc.counter` for it rather than building a second register and adder; here
-  // is the one place both the emitter and the report learn of the fold.
+  // A scaled counter whose init and step equal the region's counter holds the
+  // same value each cycle, so the emitter reads `rc.counter` for it rather than
+  // building a second register and adder. Both the emitter and the report read
+  // this fold flag.
   for (RegionBlock &rb : dp.regions) {
     std::optional<int64_t> lb = dp.constantOf(rb.lbSource);
     std::optional<int64_t> step = dp.constantOf(rb.stepSource);

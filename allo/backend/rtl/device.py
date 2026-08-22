@@ -33,8 +33,7 @@ class Resource:
     different names and the compiler, which only adds and multiplies these, does
     not care. ``capacity`` is a price input rather than a constraint: regions are
     scheduled independently, so a whole-device budget is not a quantity any one
-    solve can enforce. ``weight`` scales the derived scarcity price, expressing
-    a preference the capacity alone cannot.
+    solve can enforce. ``weight`` scales the derived scarcity price.
     """
 
     name: str

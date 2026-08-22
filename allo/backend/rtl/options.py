@@ -93,18 +93,14 @@ class SchedulerOptions:
         seed: the exact solver's random seed. Shifts which optimum of equal cost
             a solve lands on.
         deterministic: whether the workers advance in a fixed interleaved
-            order under the budget, so two identical compiles emit identical
-            RTL. Off, above one worker, they race, each held to the budget's
-            share of wall-clock (``budget / workers`` seconds): about the
-            budget in core-seconds for a fraction of the wall, but which
-            optimum of equal cost a solve lands on, proven or not, depends on
-            thread timing, so no exact solve is then reproducible and the
-            report says so.
+            order, so two identical compiles emit identical RTL. Off, above one
+            worker, they race, each held to ``budget / workers`` seconds of
+            wall-clock; the optimum a solve lands on then depends on thread
+            timing, so exact solves are not reproducible and the report says so.
         resource_weights: multipliers on the per-resource scarcity prices, by
-            resource name (``{"dsp": 0.25}`` makes DSPs a quarter of their
-            derived price, steering every area decision toward them). Composes
-            multiplicatively with the weight a device declares on the resource
-            itself; unnamed resources keep weight 1.0.
+            resource name (``{"dsp": 0.25}`` prices DSPs at a quarter of their
+            derived cost). Composes multiplicatively with the weight a device
+            declares on the resource; unnamed resources keep weight 1.0.
     """
 
     scheduler: str = "heuristic"

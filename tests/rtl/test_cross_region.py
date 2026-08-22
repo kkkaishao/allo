@@ -431,12 +431,9 @@ def test_multiregion_latency_matches_cosim():
     assert np.array_equal(out, (A16 + 1) * 2 + 3)
 
 
-# A region's completion is already a pulse; latching it into a level only to
-# have the successor rebuild the pulse with a rising-edge detector spends two
-# registers where one does, since the registered pulse is high in the very cycle
-# the level would have risen in. So a sequenced region latches no level: it
-# hands its successor an `r<N>_drain` register. Only the container keeps a
-# `done`, whose level the module's own port reads.
+# A sequenced region latches no level: its completion is already a pulse, so it
+# hands its successor an `r<N>_drain` register instead of a rebuilt one. Only
+# the container keeps a `done`, whose level the module's own port reads.
 def test_a_sequenced_region_hands_over_a_registered_pulse():
     @kernel
     def k(A: i32[16, 16], B: i32[16], C: i32[16]):

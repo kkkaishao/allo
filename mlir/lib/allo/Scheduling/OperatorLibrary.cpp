@@ -311,8 +311,7 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
 
     // The currency: the most plentiful resource sets the scale, so a price is
     // how scarce a resource is relative to the one the part has most of. A
-    // declared weight scales the scarcity, expressing preference the capacity
-    // alone cannot.
+    // declared weight scales that price further.
     int64_t widest = 1;
     for (auto r : device.getBody().getOps<dcp::DCPathResourceOp>())
       widest = std::max<int64_t>(widest, r.getCapacity());
@@ -801,8 +800,7 @@ OperatorChar OperatorLibrary::characterize(Operation *op,
 OperatorChar OperatorLibrary::lookup(Operation *op, StringRef symbol) const {
   int64_t width = combParamWidth(op);
   // A comb row has no symbol of its own; a decided comb realization travels
-  // as its characterization's type name, matched on the last row of the kind
-  // (the one every comb read resolves).
+  // as its characterization's type name, matched on the kind's last comb row.
   const OperatorEntry *comb = nullptr;
   for (const OperatorEntry *e : matchEntries(advancedEntries, entries, op)) {
     if (e->comb)
@@ -825,7 +823,7 @@ OperatorLibrary::candidateChars(Operation *op, bool withComb) const {
   const OperatorEntry *comb = nullptr;
   for (const OperatorEntry *e : matchEntries(advancedEntries, entries, op)) {
     if (e->comb) {
-      comb = e; // the last comb row of a kind wins, as every comb read reads
+      comb = e; // the last comb row of a kind wins
       continue;
     }
     // The same float fit test `selectImplementation` ranks by, so the set here
@@ -905,10 +903,9 @@ mlir::allo::selectionCandidates(Operation *op, const OperatorLibrary &lib,
     return (cyclic && !c.pipelined) ||
            (c.timing.latency == 0 && c.timing.inDelay != c.timing.outDelay);
   });
-  // Latency, the two cones and the price are everything a schedule can tell
-  // apart, so a row another candidate beats or matches on all four is never
-  // the answer and only costs a selection variable. Ties break on the name, or
-  // two rows equal on every field would drop each other.
+  // Latency, the two cones and the price are all a schedule can tell apart, so
+  // a row another candidate matches or beats on all four only costs a selection
+  // variable. Ties break on the name so two equal rows do not drop each other.
   auto asGood = [](const OperatorChar &d, const OperatorChar &c) {
     return d.timing.latency == c.timing.latency &&
            d.timing.inDelay <= c.timing.inDelay &&

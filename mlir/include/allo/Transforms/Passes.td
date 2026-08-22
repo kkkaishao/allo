@@ -655,8 +655,7 @@ def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
                  Option<"areaFuseGate", "area-fuse-gate", "bool", "false",
                         "Fuse a multiply-add only where the fused core prices "
                         "no higher than the multiply plus the combinational "
-                        "add it replaces; the area objective sets this, since "
-                        "the fusion's span win is free only there">];
+                        "add it replaces; the area objective sets this">];
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 

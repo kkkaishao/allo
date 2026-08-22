@@ -574,9 +574,8 @@ def DCPathResourceOp : DCPath_Op<"dcp.resource", [Symbol]> {
     enforce; what capacity is for is deriving a price (a resource the device has
     less of costs more) and reporting utilization.
 
-    `weight` scales the derived price multiplicatively: preference the scarcity
-    currency cannot express (a design that must keep its DSPs free, a part
-    whose DSPs would otherwise sit idle). Absent means 1.0.
+    `weight` scales the derived price multiplicatively, expressing a preference
+    the scarcity currency cannot (keeping a part's DSPs free). Absent means 1.0.
   }];
   let arguments = (ins SymbolNameAttr:$sym_name, I64Attr:$capacity,
                        OptionalAttr<F32Attr>:$weight);

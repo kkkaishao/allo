@@ -919,9 +919,9 @@ def test_assume_bounded_trip_narrows_the_counter():
     assert Dcp(rtl).attrs("allo.dcp.pipeline", "trip_bound") == [100]
     hinted = widths(rtl.mlir)
     assert hinted.keys() == plain.keys()
-    # A trip up to 100 puts the one-past value at 100, which needs 7 unsigned
-    # bits; the non-negative counter is built unsigned, so it drops the sign bit
-    # the signed hull would have carried. Every address off it stays in range.
+    # A trip up to 100 puts the one-past value at 100, needing 7 unsigned bits;
+    # the non-negative counter is built unsigned and drops the sign bit. Every
+    # address off it stays in range.
     assert hinted["i"] == 7
     assert all(w <= 7 for w in hinted.values()), hinted
 
@@ -935,10 +935,9 @@ def test_assume_bounded_trip_narrows_the_counter():
     assert np.array_equal(B, exp)
 
 
-# Unrolling a triangular loop divides its bound, and by the time the counter is
-# sized that division is a compare/negate/shift cone rather than an affine
-# expression. The counter's hull is read off that cone, so it is still the
-# loop's own range that sizes the register and the strides riding it.
+# Unrolling a triangular loop turns its bound into a compare/negate/shift cone
+# by the time the counter is sized; the hull read off that cone still sizes the
+# register from the loop's own range.
 def test_an_unrolled_triangular_bound_narrows_the_counter():
     @kernel
     def k(A: i32[32, 32], B: i32[32]):
@@ -965,11 +964,10 @@ def test_an_unrolled_triangular_bound_narrows_the_counter():
     assert np.array_equal(B, [A[i, :i].sum() for i in range(32)])
 
 
-# A counter that never goes negative is built unsigned: it drops the sign bit
-# the signed hull would carry, and its bound test is unsigned. The delayed copy
-# of the counter that a later-stage store reads must then zero-extend, since its
-# top bit is a magnitude bit -- sign-extending a value like 19 in i5 (0b10011)
-# would index far out of the array.
+# A non-negative counter is built unsigned, dropping the sign bit and testing
+# its bound unsigned. A delayed copy read by a later-stage store must then
+# zero-extend, since its top bit is a magnitude bit; sign-extending 19 in i5
+# (0b10011) would index far out of the array.
 def test_a_non_negative_counter_is_unsigned_and_zero_extends_when_delayed():
     N = 20
 

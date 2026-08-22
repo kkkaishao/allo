@@ -349,12 +349,12 @@ struct EmitContext {
   /// Combinational (0-cycle) equality of two same-width values (a runtime
   /// compare, e.g. a counter against a data-dependent trip bound).
   Value icmpEqV(Value lhs, Value rhs);
-  /// Combinational (0-cycle) SIGNED `lhs >= rhs` of two same-width values (the
+  /// Combinational (0-cycle) signed `lhs >= rhs` of two same-width values (the
   /// induction bound test `iv+step >= ub`): signed so a negative compile-time
   /// lower bound (`affine.for %i = -4 to 4`) compares correctly. Identical to
   /// the unsigned test for a non-negative counter.
   Value icmpSgeV(Value lhs, Value rhs);
-  /// Combinational (0-cycle) UNSIGNED `lhs >= rhs`, the bound test of a counter
+  /// Combinational (0-cycle) unsigned `lhs >= rhs`, the bound test of a counter
   /// built at an unsigned width, whose top bit is a magnitude bit not a sign.
   Value icmpUgeV(Value lhs, Value rhs);
   /// Combinational (0-cycle) logical NOT of an i1 (`v XOR 1`).

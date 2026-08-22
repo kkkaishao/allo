@@ -72,10 +72,9 @@ def test_heuristic_ignores_the_objective():
 
 
 def test_racing_workers_are_reported_as_not_reproducible():
-    # deterministic=False lets the workers race: the design still computes,
-    # but every cpsat solve, proven or not, reports that a re-run may not
-    # reproduce its schedule; interleaved and within budget, the same solves
-    # report that it does.
+    # deterministic=False lets the workers race: every cpsat solve, proven or
+    # not, reports its schedule may not reproduce; interleaved within budget
+    # they report it does.
     steady = _to_rtl(_mixed_kernel()).set_scheduler_opt(scheduler="exact")
     assert steady.schedule().compiler.deterministic
     rtl = _to_rtl(_mixed_kernel()).set_scheduler_opt(

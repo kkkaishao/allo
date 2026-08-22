@@ -2694,9 +2694,8 @@ def test_a_multiply_feeding_one_add_fuses_onto_the_device_row():
         assert "muladd" not in kern.schedule().export("rtl").mlir
 
 
-# A resource weight scales the derived scarcity price, so it decides which
-# fabric realizes an operation. Two cores with one timing and different spends
-# make the price the only difference, which the static rank already reads.
+# A resource weight scales the scarcity price, so it decides which fabric
+# realizes an operation when two cores share timing and differ only in spend.
 def test_resource_weights_steer_a_realization_between_fabrics():
 
     @operator_ip(
@@ -2724,22 +2723,21 @@ def test_resource_weights_steer_a_realization_between_fabrics():
         return _impls(rtl.schedule())
 
     # One DSP (2311) undercuts 200 LUTs (3200); at eight times the price the
-    # LUT core wins instead, and undercuts the device's own fabric row too.
+    # LUT core wins instead.
     assert mul_on_lut.symbol not in chosen()
     assert mul_on_lut.symbol in chosen(dsp=8.0)
 
 
-# The combinational row joins the candidates under the area objective, so a
-# weight can move an operation off its IP and onto the fabric, and the comb
-# decision reaches the emitted design whole.
+# Under the area objective the combinational row joins the candidates, so a
+# weight can move a multiply off its IP onto the fabric.
 def test_a_weight_moves_a_multiply_onto_the_comb_row():
     @kernel
     def mulk(x: i16[8], y: i16[8], out: i16[8]):
         for i in range(8):
             out[i] = x[i] * y[i]
 
-    # Retune the comb multiply into pure fabric: 300 LUTs (4800) against the
-    # builtin DSP cores, which an eightfold DSP price ranks past.
+    # 300 LUTs (4800) for the comb multiply, which an eightfold DSP price ranks
+    # past the builtin DSP cores.
     dev = default_device.copy()
     dev.set_comb_delay(CombKind.MUL, 2.0, uses={dev.resources["lut"]: Const(300.0)})
 
@@ -2761,9 +2759,9 @@ def test_a_weight_moves_a_multiply_onto_the_comb_row():
     assert np.array_equal(out, (x.astype(np.int32) * y).astype(np.int16))
 
 
-# Under the area objective the fusion pays for itself or does not happen: the
-# fused core prices above the multiply plus the combinational add it replaces
-# on this device, so the pair stays apart there and fuses under cycles.
+# The area objective takes the muladd fusion only when it prices below the
+# multiply plus the add it replaces; on this device it does not, so the pair
+# fuses under cycles and stays apart under area.
 def test_the_area_objective_gates_the_muladd_fusion_by_price():
     @kernel
     def mac(A: i32[16], B: i32[16], C: i32[16], out: i32[16]):
@@ -2782,9 +2780,9 @@ def test_the_area_objective_gates_the_muladd_fusion_by_price():
     assert rtl.dcp.count(row) == 1
 
 
-# The device declares each multiply twice, as DSP columns and as fabric, at one
-# depth: the rows differ only in what they spend, so a DSP weight moves the
-# design onto LUTs and leaves its schedule where it was.
+# Each multiply is declared twice at one depth, as DSP and as fabric; the rows
+# differ only in spend, so a DSP weight moves the design onto LUTs without
+# changing its schedule.
 def test_a_dsp_weight_moves_a_multiply_onto_the_fabric_row():
     @kernel
     def mulk(x: i32[8], y: i32[8], out: i32[8]):
@@ -2797,9 +2795,8 @@ def test_a_dsp_weight_moves_a_multiply_onto_the_fabric_row():
         res = rtl.schedule()
         return rtl, _impls(res), [r.latency for r in res.regions()]
 
-    # Both scheduler paths read the same prices: the static rank ranks the two
-    # rows, and the exact solve drops the dearer of a same-timing pair before it
-    # ever becomes a selection variable.
+    # Both scheduler paths read the same prices: the heuristic ranks the rows,
+    # the exact solve drops the dearer of a same-timing pair before selection.
     for scheduler in ("heuristic", "exact"):
         _, dsp, dsp_lat = built(scheduler)
         rtl, lut, lut_lat = built(scheduler, dsp=8.0)
@@ -2815,10 +2812,8 @@ def test_a_dsp_weight_moves_a_multiply_onto_the_fabric_row():
     assert np.array_equal(out, (x.astype(np.int64) * y).astype(np.int32))
 
 
-# The i16 pair differs in cone as well as in spend: the fabric product is
-# combinational up to its consumer's register, so taking it costs the chain
-# around it a cycle. That leaves a trade a schedule can see, where the i32
-# pair leaves none.
+# The i16 fabric product is combinational up to its consumer's register, so
+# taking it over the DSP row costs the chain one cycle; the i32 pair costs none.
 def test_the_fabric_i16_row_pays_a_cycle_for_the_dsp_it_saves():
     @kernel
     def mulk(x: i16[8], y: i16[8], out: i16[8]):

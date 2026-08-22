@@ -44,22 +44,19 @@ using namespace operations_research::sat;
 
 namespace {
 
-/// Solver configuration for one solve. The time limit is deterministic rather
-/// than wall-clock, which with an interleaved portfolio is what lets two
-/// identical compiles emit identical RTL. A solve that exhausts the limit can
-/// still differ run to run.
+/// Solver configuration for one solve. A deterministic time limit under an
+/// interleaved portfolio lets two identical compiles emit identical RTL; a
+/// solve that exhausts the limit can still differ run to run.
 SatParameters solverParameters(const SchedulerOptions &opts) {
   SatParameters params;
   params.set_num_workers(opts.workers);
   params.set_random_seed(opts.seed);
   params.set_max_deterministic_time(opts.budget);
   // Interleaved, the portfolio advances in a fixed order under the
-  // deterministic limit, a batch at a time; racing workers share bounds and
-  // incumbents as they find them, so the schedule the budget stops on, and
-  // which optimum a proof returns, depend on thread timing. A racing worker
-  // reports its deterministic time only when it returns, so the limit alone
-  // lets each run the whole budget; the wall-clock cap holds the race to the
-  // budget's worth of core-seconds.
+  // deterministic limit, so the schedule and the proven optimum are
+  // reproducible. Racing workers depend on thread timing, and each reports its
+  // deterministic time only on return, so a wall-clock cap holds the race to
+  // the budget's worth of core-seconds.
   if (opts.workers > 1 && opts.deterministic)
     params.set_interleave_search(true);
   else if (opts.workers > 1)
@@ -74,14 +71,12 @@ SatParameters solverParameters(const SchedulerOptions &opts) {
 }
 
 /// Solve \p model under \p params. Below this variable count a single worker
-/// runs: such a model is solved before a portfolio has loaded. Above it the
-/// portfolio is what proves an area model; a lone worker burns the budget on
-/// models of a few dozen variables.
+/// runs, since such a model is solved before a portfolio loads; above it the
+/// portfolio proves an area model that a lone worker would burn the budget on.
 constexpr int kPortfolioFloorVars = 32;
 CpSolverResponse solveBuilt(CpModelBuilder &model, SatParameters params) {
-  // `ClearHints` leaves an empty hint behind, which the interleaved workers
-  // still take the hinted path for; a model meant to carry no hint carries
-  // none.
+  // An empty solution hint still routes the interleaved workers down the
+  // hinted path, so drop it outright when the model carries no hint.
   if (model.Proto().solution_hint().vars().empty())
     model.MutableProto()->clear_solution_hint();
   const CpModelProto &proto = model.Build();
@@ -415,8 +410,8 @@ SharedClasses collectSharedClasses(ProblemT &prob, const OperatorLibrary &lib,
     if (auto it = choiceOf.find(op); it != choiceOf.end()) {
       bool carried = readsCarried(op);
       for (auto [m, cand] : llvm::enumerate(choices[it->second].cands)) {
-        // A comb candidate builds no allocatable instance: choosing it means
-        // joining no class, and its price rides the selection term alone.
+        // A comb candidate builds no allocatable instance, so it joins no
+        // class and is priced through the selection term alone.
         if (cand.identity.comb)
           continue;
         SharedClassVar &cls = byIdentity[cand.identity.key()];
@@ -822,9 +817,9 @@ allocationVars(CpModelBuilder &model, ProblemT &prob, unsigned ii, bool hint,
 /// select cone its decided count implies: `z + inDelay + headroom(N) <=
 /// period`. A count then only shrinks where its multiplexer fits the slack the
 /// same solve leaves, which is what lets a `planned` binding realize the
-/// allocation as built. The same cone reaches whatever a combinational member
-/// feeds within its cycle, so each same-cycle def-use consumer is held to the
-/// period alongside, against its own incoming delay.
+/// allocation as built. A combinational member's cone also reaches its
+/// same-cycle consumers, so each is held to the period against its own
+/// incoming delay.
 ///
 /// \p sharedInCycle is the sub-cycle system a selection model already built,
 /// reused so one model never carries two; null creates one on demand. The
@@ -860,10 +855,9 @@ void addAllocationHeadroom(CpModelBuilder &model, ProblemT &prob,
       model.AddLessOrEqual(inCycle.at(op) + *alloc.headroom, period - in);
     }
   }
-  // The consumer half: a combinational producer hands its select cone on, and
-  // covering the consumer is what covers a non-unit sink (a store's port and
-  // address setup, a stream port), which uses no allocatable operator of its
-  // own.
+  // The consumer half: covering a combinational producer's same-cycle consumer
+  // covers a non-unit sink (a store's port and address setup, a stream port)
+  // that uses no allocatable operator of its own.
   for (Operation *op : prob.getOperations()) {
     llvm::SmallDenseSet<Operation *, 4> seen;
     for (auto &dep : prob.getDependences(op)) {
@@ -1169,9 +1163,9 @@ void pinStructure(CpModelBuilder &model, const CpSolverResponse &from,
 }
 
 /// Share of the budget the cycles order's area tie-break gets where a span
-/// composes: the fold re-solve at the winning interval carries the area on a
-/// fresh budget there, and an uncapped tie-break on a jumbo region burns its
-/// whole remainder without proving anything the fold does not redo.
+/// composes: the fold re-solve at the winning interval redoes the area on a
+/// fresh budget, so an uncapped tie-break would spend the remainder without
+/// proving anything the fold does not.
 constexpr double kAreaTieBreakShare = 0.3;
 
 /// What \p decided costs the device: every resource, at the price of the count
@@ -1486,8 +1480,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   // Which row realizes each multi-candidate operation is this solve's
   // decision too, made alongside the start times. Only the area objective
-  // admits the comb row: the cycles order would take its zero latency on span
-  // wherever the chain fits, a flip no price can veto.
+  // admits the comb row: the cycles order would always take its zero latency
+  // on span, which no price can veto.
   bool combSel = opts.objective == ScheduleObjective::Area;
   SmallVector<SelectionChoice, 0> choices =
       selectionChoices(prob, span.device, combSel);
@@ -1799,16 +1793,16 @@ struct ModuloAttempt {
 /// otherwise need a variable modulus.
 ///
 /// \p hint is only valid when the greedy placement itself reached this II; at
-/// any other II its start times are not a schedule. It is dropped whole where
-/// \p drainBound cuts below the greedy schedule's own drain: the hint then
-/// violates the model, which the interleaved portfolio check-fails on.
+/// any other II its start times are not a schedule. It is dropped where
+/// \p drainBound cuts below the greedy schedule's own drain, since the hint
+/// then violates the model and the interleaved portfolio check-fails on it.
 ///
 /// Two solves on one model, span then area, sharing one budget (see the
-/// acyclic entry). Where a span composes
-/// (\p span.trip) the area solve is held to `kAreaTieBreakShare` of it: the
-/// caller folds the winning interval in the area order on a fresh budget, so
-/// the area solve here only breaks the interval tie and seeds that fold.
-/// `out.spanProven` and `out.areaProven` are each solve's
+/// acyclic entry). Where a span composes (\p span.trip) the area solve is held
+/// to `kAreaTieBreakShare` of it, since the caller folds the winning interval
+/// in the area order on a fresh budget; the area solve here only breaks the
+/// interval tie and seeds that fold. `out.spanProven` and `out.areaProven` are
+/// each solve's
 /// OPTIMAL against FEASIBLE, which the II search cannot otherwise tell apart,
 /// and an unproven placement's drain is still what the region's span gets
 /// charged.
@@ -2001,11 +1995,11 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     model.AddGreaterOrEqual(*drainVar, floorDrain);
   }
   IntVar primary = drainVar.value_or(orderedStarts[anchorIndex]);
-  // A hint reaches the portfolio only on a model it satisfies: the
-  // interleaved workers check-fail (or-tools 9.15, `ConfigureSearchHeuristics`)
-  // on a hinted model that is infeasible at load, which a probe bounded by the
-  // incumbent can be. An unhinted probe keeps none of the per-variable
-  // defaults the builders above left (selection, shared counts).
+  // A hint reaches the portfolio only on a model it satisfies: the interleaved
+  // workers check-fail (or-tools 9.15, `ConfigureSearchHeuristics`) on a hinted
+  // model infeasible at load, which a probe bounded by the incumbent can be. An
+  // unhinted probe keeps none of the per-variable defaults the builders left
+  // (selection, shared counts).
   if (!hint)
     model.ClearHints();
 
@@ -2040,12 +2034,11 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     // The full-area solve. INFEASIBLE under \p areaBound means nothing here
     // beats the incumbent; a proven structural minimum already past the bound
     // says so without a solve, the full area being the structure plus
-    // nonnegative chain and pulse terms. A run out of budget ships the
-    // bootstrap, whose chain terms hold feasible but unminimized values, so
-    // the area recorded for it overstates. The bootstrap minimized structure
-    // alone, so its full area can exceed the bound added below; the model
-    // then carries no hint at all (see the portfolio note above), since a
-    // hint violating it is what the interleaved workers check-fail on.
+    // nonnegative chain and pulse terms. A budget-exhausted solve ships the
+    // bootstrap, whose chain terms hold feasible but unminimized values, so its
+    // recorded area overstates and its full area can exceed the bound added
+    // below; the model then carries no hint, since a hint violating it
+    // check-fails the portfolio.
     if (areaBound && boot.status() == CpSolverStatus::OPTIMAL &&
         SolutionIntegerValue(boot, structural) > *areaBound)
       return ModuloOutcome::Infeasible;
@@ -2440,17 +2433,15 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   }
 
   // Cycles order settled the span, but its per-interval area tie-break runs on
-  // a capped share of the budget (kAreaTieBreakShare) and cannot fold a jumbo
-  // region: where it did not prove the area minimal, a proven span ships the
-  // datapath at the span solve's accidental allocation. Re-solve once at the
-  // winning interval in the area order, leashed to the proven span and seeded
-  // from its own schedule, on a fresh budget, so the same cycles hold on the
-  // fewest units. The area order never exceeds its drain leash, but a fold
-  // whose own area solve runs out ships its bootstrap, chains unminimized, so
-  // it is adopted only where its modeled area beats what the tie-break found
-  // (or the tie-break found nothing), a tie going to the shorter drain. Where
-  // the tie-break already proved the area minimal the fold is skipped and the
-  // region is left untouched.
+  // a capped share of the budget (kAreaTieBreakShare) and may not prove the
+  // area minimal: a proven span then ships the datapath at the span solve's
+  // incidental allocation. Re-solve once at the winning interval in the area
+  // order, leashed to the proven span and seeded from its own schedule, on a
+  // fresh budget, so the same cycles hold on the fewest units. A fold whose own
+  // area solve runs out of budget ships an unminimized bootstrap, so it is
+  // adopted only where its modeled area beats the tie-break's (or the tie-break
+  // found none), a tie going to the shorter drain. Where the tie-break already
+  // proved the area minimal the fold is skipped.
   bool foldedArea = false;
   if (bySpan && !areaMode && !bestAttempt.areaProven &&
       (allocates || !choices.empty() || !span.regs.empty() ||

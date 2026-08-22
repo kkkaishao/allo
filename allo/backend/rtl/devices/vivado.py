@@ -129,8 +129,8 @@ RECIPES: dict[OperatorIP, VivadoCore] = {
 
 
 # The fabric build of a multiply: an adder tree in LUTs instead of DSP columns.
-# It repeats a key the shape already sets; the last value in a
-# `set_property -dict` list is the one that takes.
+# It repeats a key the shape already sets; in a `set_property -dict` list the
+# last value for a key wins.
 _LUT_MULT = "Multiplier_Construction=Use_LUTs"
 
 

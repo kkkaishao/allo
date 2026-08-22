@@ -176,8 +176,8 @@ def test_generate_builds_the_row_the_area_measured():
 
 def test_generate_builds_the_fabric_multiply_out_of_luts():
     # The multiply's fabric row spends no DSPs, so it rebuilds with the recipe's
-    # DSP-free fragment. That fragment repeats a key the shape already sets and
-    # has to land after it, which is what a `set_property -dict` list resolves.
+    # DSP-free fragment, which repeats a key the shape sets and must land after
+    # it; a `set_property -dict` list resolves the order.
     @kernel
     def mk(x: i32[8], y: i32[8], out: i32[8]):
         for i in range(8):
