@@ -45,18 +45,25 @@ using namespace operations_research::sat;
 namespace {
 
 /// Solver configuration for one solve. The time limit is deterministic rather
-/// than wall-clock, which is what lets two identical compiles emit identical
-/// RTL. A solve that exhausts the limit can still differ run to run.
+/// than wall-clock, which with an interleaved portfolio is what lets two
+/// identical compiles emit identical RTL. A solve that exhausts the limit can
+/// still differ run to run.
 SatParameters solverParameters(const SchedulerOptions &opts) {
   SatParameters params;
   params.set_num_workers(opts.workers);
   params.set_random_seed(opts.seed);
   params.set_max_deterministic_time(opts.budget);
   // Interleaved, the portfolio advances in a fixed order under the
-  // deterministic limit; racing workers would make the incumbent the budget
-  // stops on depend on thread timing.
-  if (opts.workers > 1)
+  // deterministic limit, a batch at a time; racing workers share bounds and
+  // incumbents as they find them, so the schedule the budget stops on, and
+  // which optimum a proof returns, depend on thread timing. A racing worker
+  // reports its deterministic time only when it returns, so the limit alone
+  // lets each run the whole budget; the wall-clock cap holds the race to the
+  // budget's worth of core-seconds.
+  if (opts.workers > 1 && opts.deterministic)
     params.set_interleave_search(true);
+  else if (opts.workers > 1)
+    params.set_max_time_in_seconds(opts.budget / opts.workers);
   // Solver progress log, for diagnosing where a budget goes on a model that
   // returns nothing.
   if (getenv("ALLO_CPSAT_LOG")) {

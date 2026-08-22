@@ -827,6 +827,10 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
     s.budgetExhausted = problem.telemetry.budgetExhausted;
     s.fallback = problem.telemetry.fallback;
     s.exhaustedAtII = problem.telemetry.exhaustedAtII;
+    // One worker has nobody to race, so it stays reproducible under a held
+    // budget whatever the knob says.
+    s.deterministic = (opts.deterministic || opts.workers == 1) &&
+                      !problem.telemetry.budgetExhausted;
   } else {
     s.solver = "simplex";
   }
@@ -1712,7 +1716,8 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
     info(Stage::Sched, module)
         << "Exact scheduler: " << opts.workers << " workers, seed "
         << opts.seed << ", budget " << format("%g", opts.budget)
-        << " deterministic units per region";
+        << " deterministic units per region"
+        << (opts.deterministic || opts.workers == 1 ? "" : ", workers racing");
 
   DenseMap<Operation *, int64_t> grants;
   if (opts.objective == ScheduleObjective::Area &&

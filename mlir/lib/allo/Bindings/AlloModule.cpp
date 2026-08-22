@@ -119,13 +119,14 @@ NB_MODULE(_allo, m) {
       [](MlirModule module, const std::string &top, float cycleTime,
          const std::string &scheduler, const std::string &objective,
          double budget, bool allocate, int workers, int seed,
-         double areaSlack) -> std::optional<std::string> {
+         bool deterministic, double areaSlack) -> std::optional<std::string> {
         std::string out;
         if (mlirLogicalResultIsFailure(alloRunSDCSchedulingPipeline(
                 module, mlirStringRefCreate(top.data(), top.size()), cycleTime,
                 mlirStringRefCreate(scheduler.data(), scheduler.size()),
                 mlirStringRefCreate(objective.data(), objective.size()), budget,
-                allocate, workers, seed, areaSlack, appendToString, &out)))
+                allocate, workers, seed, deterministic, areaSlack,
+                appendToString, &out)))
           return std::nullopt;
         return out;
       },
@@ -133,7 +134,7 @@ NB_MODULE(_allo, m) {
       nb::arg("scheduler") = "heuristic", nb::arg("objective") = "cycles",
       nb::arg("budget") = 0.0, nb::arg("allocate") = false,
       nb::arg("workers") = 0, nb::arg("seed") = 0,
-      nb::arg("area_slack") = 0.0);
+      nb::arg("deterministic") = true, nb::arg("area_slack") = 0.0);
 
   //===--------------------------------------------------------------------===//
   // schedule

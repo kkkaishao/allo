@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scheduler objective knobs: the ``O`` direction and the clock margin."""
+"""Scheduler knobs: the ``O`` direction, the clock margin and the search loop."""
 
 import os
 import shutil
@@ -68,6 +68,23 @@ def test_heuristic_ignores_the_objective():
     # The heuristic solves spans only; O passes through without effect.
     rtl = _to_rtl(_mixed_kernel()).set_scheduler_opt(O="area")
     assert rtl.schedule().compiler.options.O == "area"
+    _run(rtl)
+
+
+def test_racing_workers_are_reported_as_not_reproducible():
+    # deterministic=False lets the workers race: the design still computes,
+    # but every cpsat solve, proven or not, reports that a re-run may not
+    # reproduce its schedule; interleaved and within budget, the same solves
+    # report that it does.
+    steady = _to_rtl(_mixed_kernel()).set_scheduler_opt(scheduler="exact")
+    assert steady.schedule().compiler.deterministic
+    rtl = _to_rtl(_mixed_kernel()).set_scheduler_opt(
+        scheduler="exact", deterministic=False
+    )
+    report = rtl.schedule().compiler
+    cpsat = [s for s in report.solves if s.solver == "cpsat"]
+    assert cpsat and not any(s.deterministic for s in cpsat)
+    assert not report.deterministic
     _run(rtl)
 
 

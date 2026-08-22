@@ -74,6 +74,7 @@ class Knobs:
     freq: float | None
     budget: float | None
     workers: int | None
+    deterministic: bool
     area_slack: float
 
 
@@ -215,7 +216,8 @@ def measure_one(item, knobs: Knobs) -> dict:
     ``freq`` overrides the device's default clock (MHz), i.e. the period the
     chaining half of every problem is cut against. ``budget`` overrides what one
     exact solve may spend, in deterministic time units. ``workers`` overrides how
-    many search workers one exact solve runs. ``binding`` is ``"trivial"`` (one
+    many search workers one exact solve runs; ``deterministic`` off lets them
+    race. ``binding`` is ``"trivial"`` (one
     unit per op) or ``"auto"``, the binding the scheduler implies; the recorded
     row carries the resolved name. ``objective`` is the exact solver's
     optimization direction (the ``O`` knob); the heuristic ignores it.
@@ -231,6 +233,7 @@ def measure_one(item, knobs: Knobs) -> dict:
         "freq_mhz": knobs.freq,
         "budget": knobs.budget,
         "workers": knobs.workers,
+        "deterministic": knobs.deterministic,
         "binding": knobs.binding,
         "objective": knobs.objective,
         "area_slack": knobs.area_slack,
@@ -255,6 +258,7 @@ def measure_one(item, knobs: Knobs) -> dict:
             "scheduler": scheduler,
             "O": knobs.objective,
             "area_slack": knobs.area_slack,
+            "deterministic": knobs.deterministic,
         }
         if knobs.budget is not None:
             solver["budget"] = knobs.budget
@@ -380,6 +384,8 @@ def _run_child(item, knobs: Knobs, timeout: int) -> dict:
         argv += ["--budget", str(knobs.budget)]
     if knobs.workers is not None:
         argv += ["--workers", str(knobs.workers)]
+    if not knobs.deterministic:
+        argv += ["--nondeterministic"]
     if knobs.area_slack:
         argv += ["--area-slack", str(knobs.area_slack)]
     t0 = time.time()
@@ -726,6 +732,14 @@ def main():
         "deterministic search; the axis a parallel-solve change is swept over",
     )
     ap.add_argument(
+        "--nondeterministic",
+        action="store_true",
+        help="let the exact solve's workers race instead of interleaving (the "
+        "deterministic knob off), each under budget/workers wall seconds: the "
+        "budget's core-seconds in a fraction of the wall, but no exact solve "
+        "is reproducible, so verilog_sha stops being an oracle",
+    )
+    ap.add_argument(
         "-O",
         "--objective",
         default="cycles",
@@ -764,6 +778,7 @@ def main():
         freq=args.freq,
         budget=args.budget,
         workers=args.workers,
+        deterministic=not args.nondeterministic,
         area_slack=args.area_slack,
     )
 
@@ -794,11 +809,12 @@ def main():
     clock = f", freq={args.freq}MHz" if args.freq else ""
     pool_size = f", budget={args.budget}" if args.budget else ""
     nproc = f", workers={args.workers}" if args.workers else ""
+    loop = ", nondeterministic" if args.nondeterministic else ""
     direction = f", O={args.objective}" if args.objective != "cycles" else ""
     slack = f", area_slack={args.area_slack}" if args.area_slack else ""
     print(
         f"{len(work)} runs, {args.jobs} jobs, stage={args.stage}"
-        f", binding={args.binding}{clock}{pool_size}{nproc}{direction}{slack}",
+        f", binding={args.binding}{clock}{pool_size}{nproc}{loop}{direction}{slack}",
         flush=True,
     )
 

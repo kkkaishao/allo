@@ -501,10 +501,10 @@ enum class ScheduleObjective {
 /// and area passes, so a cyclic search spends it again at every initiation
 /// interval it probes. Reproducibility comes from
 /// the fixed seed plus the interleaved portfolio `solverParameters` selects
-/// above one worker; a solve that exhausts its budget can still differ run to
-/// run. The worker count is not only a speed knob: the same deterministic
-/// budget buys more search, so a budget-limited region can settle on a
-/// different schedule at a different worker count.
+/// above one worker while `deterministic` holds; a solve that exhausts its
+/// budget can still differ run to run. The worker count is not only a speed
+/// knob: the same deterministic budget buys more search, so a budget-limited
+/// region can settle on a different schedule at a different worker count.
 inline constexpr double kDefaultSolveBudget = 30.0;
 inline constexpr int kDefaultSolveWorkers = 8;
 inline constexpr int kDefaultSolveSeed = 0;
@@ -525,6 +525,14 @@ struct SchedulerOptions {
   bool allocate = false;
   int workers = kDefaultSolveWorkers;
   int seed = kDefaultSolveSeed;
+  /// Whether the workers advance in a fixed interleaved order under the
+  /// deterministic budget, so two identical compiles emit identical RTL. Off,
+  /// above one worker, they race, each held to the budget's share of
+  /// wall-clock (budget / workers seconds): about the budget in core-seconds
+  /// for a fraction of the wall, but which of the equal-cost optima a solve
+  /// lands on, proven or not, depends on thread timing, so no exact solve is
+  /// then reproducible.
+  bool deterministic = true;
   /// The span the area objective may pay beyond its leash, as a fraction of
   /// the reference span (the heuristic's, or the first solved interval where
   /// the greedy did not place). Zero ships no slower than the heuristic. It

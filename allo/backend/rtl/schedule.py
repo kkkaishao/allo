@@ -96,6 +96,7 @@ def run_schedule(
             allocate,
             options.workers,
             options.seed,
+            options.deterministic,
             options.area_slack,
         )
     finally:

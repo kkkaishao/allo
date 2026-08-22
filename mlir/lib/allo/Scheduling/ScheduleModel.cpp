@@ -224,6 +224,7 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
       entry["proven"] = s.proven;
       entry["budget_exhausted"] = s.budgetExhausted;
       entry["fallback"] = s.fallback;
+      entry["deterministic"] = s.deterministic;
       if (s.exhaustedAtII)
         entry["exhausted_at_ii"] = *s.exhaustedAtII;
     }

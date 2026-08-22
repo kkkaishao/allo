@@ -46,12 +46,10 @@ class SolveReport:
     fallback: bool = False
     #: the interval whose solve exhausted the budget, ending the cyclic search.
     exhausted_at_ii: int | None = None
-
-    @property
-    def deterministic(self) -> bool:
-        """Whether re-running this compile reproduces the same schedule: a
-        simplex solve always does, a cpsat one unless its budget ran out."""
-        return not self.budget_exhausted
+    #: whether re-running this compile reproduces the same schedule: a simplex
+    #: solve always does, a cpsat one unless its budget ran out or its workers
+    #: raced (``SchedulerOptions.deterministic`` off).
+    deterministic: bool = True
 
     @classmethod
     def from_json(cls, d: dict) -> SolveReport:
@@ -71,6 +69,7 @@ class SolveReport:
             budget_exhausted=d.get("budget_exhausted", False),
             fallback=d.get("fallback", False),
             exhausted_at_ii=d.get("exhausted_at_ii"),
+            deterministic=d.get("deterministic", True),
         )
 
 
@@ -88,7 +87,8 @@ class CompilerReport:
     @property
     def deterministic(self) -> bool:
         """Whether re-running this compile reproduces every schedule; False
-        exactly when some region's solve ran out of budget."""
+        exactly when some region's solve ran out of budget or raced its
+        workers."""
         return all(s.deterministic for s in self.solves)
 
     @property

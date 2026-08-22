@@ -135,6 +135,9 @@ struct SolveReport {
   /// may ship a different schedule on the next run of the same compile.
   bool proven = false, budgetExhausted = false, fallback = false;
   std::optional<int64_t> exhaustedAtII;
+  /// Whether re-running the compile reproduces this solve's schedule: the
+  /// workers were interleaved and the budget held.
+  bool deterministic = true;
 };
 
 /// One kernel's schedule: an `allo.dcp.module` and the regions it holds.
